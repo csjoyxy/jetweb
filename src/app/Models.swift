@@ -11,6 +11,8 @@ enum JWConstants {
     static let defaultBand = 85
     static let defaultMaxMB = 450
     static let defaultBgNotifyMinutes = 15
+    static let defaultIdleHibernateMinutes = 30
+    static let allowedIdleHibernateMinutes = [0, 10, 20, 30, 60]
     static let minSiteBand = 30
     static let maxSiteBand = 92
 
@@ -118,6 +120,19 @@ enum JWURLHelper {
         let end = hex.suffix(8)
         return "\(start)...\(end)"
     }
+
+    static func sanitizePersistedURL(_ raw: String?) -> String {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty,
+              trimmed != "about:blank",
+              let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              let host = url.host, !host.isEmpty else {
+            return ""
+        }
+        return trimmed
+    }
 }
 
 enum JWPriorityHelper {
@@ -169,10 +184,14 @@ struct SiteItem: Identifiable, Equatable {
     var dataStoreId: String
     /// 0 = 跟随全局默认档位；30...92 = 单站点专属进程档位
     var customBand: Int
-    /// true = 已手动休眠释放内存（底栏保留标签与登录态，点击即唤醒）
+    /// true = 已休眠释放内存（底栏保留标签与登录态，点击即唤醒）
     var hibernated: Bool
     /// true = 接收该站点新对话/回复完成通知
     var notifyEnabled: Bool
+    /// true = 免自动休眠白名单（不受全局闲置倒计时影响）
+    var autoHibernateExempt: Bool
+    /// 持久化的上次停留对话/子页面地址（重启或休眠唤醒后精准恢复）
+    var lastKnownURL: String
 
     init(
         id: String = UUID().uuidString,
@@ -183,7 +202,9 @@ struct SiteItem: Identifiable, Equatable {
         dataStoreId: String = JWConstants.dataStoreDefault,
         customBand: Int = 0,
         hibernated: Bool = false,
-        notifyEnabled: Bool = true
+        notifyEnabled: Bool = true,
+        autoHibernateExempt: Bool = false,
+        lastKnownURL: String = ""
     ) {
         self.id = id
         self.title = title
@@ -194,6 +215,8 @@ struct SiteItem: Identifiable, Equatable {
         self.customBand = JWPriorityHelper.normalizeCustomBand(customBand)
         self.hibernated = hibernated
         self.notifyEnabled = notifyEnabled
+        self.autoHibernateExempt = autoHibernateExempt
+        self.lastKnownURL = JWURLHelper.sanitizePersistedURL(lastKnownURL)
     }
 
     var isIsolatedStore: Bool {
@@ -210,6 +233,8 @@ struct SiteItem: Identifiable, Equatable {
         let rawBand = (dict["customBand"] as? NSNumber)?.intValue ?? (dict["customBand"] as? Int) ?? 0
         let hibernated = (dict["hibernated"] as? NSNumber)?.boolValue ?? (dict["hibernated"] as? Bool) ?? false
         let notifyEnabled = (dict["notifyEnabled"] as? NSNumber)?.boolValue ?? (dict["notifyEnabled"] as? Bool) ?? true
+        let autoHibernateExempt = (dict["autoHibernateExempt"] as? NSNumber)?.boolValue ?? (dict["autoHibernateExempt"] as? Bool) ?? false
+        let lastKnownURL = JWURLHelper.sanitizePersistedURL(dict["lastKnownURL"] as? String)
         return SiteItem(
             id: sid,
             title: rawTitle.isEmpty ? url : rawTitle,
@@ -219,12 +244,14 @@ struct SiteItem: Identifiable, Equatable {
             dataStoreId: dsId,
             customBand: rawBand,
             hibernated: hibernated,
-            notifyEnabled: notifyEnabled
+            notifyEnabled: notifyEnabled,
+            autoHibernateExempt: autoHibernateExempt,
+            lastKnownURL: lastKnownURL
         )
     }
 
     func toDictionary() -> [String: Any] {
-        return [
+        var dict: [String: Any] = [
             "id": id.isEmpty ? UUID().uuidString : id,
             "title": title,
             "url": urlString,
@@ -233,8 +260,14 @@ struct SiteItem: Identifiable, Equatable {
             "dataStoreId": JWDataStoreHelper.normalize(dataStoreId),
             "customBand": JWPriorityHelper.normalizeCustomBand(customBand),
             "hibernated": hibernated,
-            "notifyEnabled": notifyEnabled
+            "notifyEnabled": notifyEnabled,
+            "autoHibernateExempt": autoHibernateExempt
         ]
+        let cleanLast = JWURLHelper.sanitizePersistedURL(lastKnownURL)
+        if !cleanLast.isEmpty {
+            dict["lastKnownURL"] = cleanLast
+        }
+        return dict
     }
 }
 
@@ -299,6 +332,8 @@ final class AppConfig: ObservableObject {
     @Published var bgNotifyGuardMinutes: Int = JWConstants.defaultBgNotifyMinutes
     /// 退后台期间收到新消息弹完通知后，缓冲约 1 分钟自动停止后台连线省电
     @Published var bgAutoSleepAfterNotify: Bool = true
+    /// 0 = 关闭自动休眠；10 / 20 / 30 / 60 = 后台标签静置超过该分钟数自动休眠释放内存
+    @Published var idleHibernateMinutes: Int = JWConstants.defaultIdleHibernateMinutes
 
     func hasAwakeNotifySite() -> Bool {
         guard notificationsEnabled else { return false }
@@ -434,6 +469,10 @@ final class AppConfig: ObservableObject {
         if let aslp = (root["bgAutoSleepAfterNotify"] as? NSNumber)?.boolValue ?? (root["bgAutoSleepAfterNotify"] as? Bool) {
             cfg.bgAutoSleepAfterNotify = aslp
         }
+        if let im = (root["idleHibernateMinutes"] as? NSNumber)?.intValue ?? (root["idleHibernateMinutes"] as? Int),
+           JWConstants.allowedIdleHibernateMinutes.contains(im) {
+            cfg.idleHibernateMinutes = im
+        }
         return cfg
     }
 
@@ -451,7 +490,8 @@ final class AppConfig: ObservableObject {
             "debugLoggingEnabled": debugLoggingEnabled,
             "notificationsEnabled": notificationsEnabled,
             "bgNotifyGuardMinutes": bgNotifyGuardMinutes,
-            "bgAutoSleepAfterNotify": bgAutoSleepAfterNotify
+            "bgAutoSleepAfterNotify": bgAutoSleepAfterNotify,
+            "idleHibernateMinutes": idleHibernateMinutes
         ]
         guard let json = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]) else {
             return false

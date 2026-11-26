@@ -281,7 +281,7 @@ final class SitePillControl: UIControl {
 
         haloView.isHidden = hibernated
         sleepIconView.isHidden = !hibernated
-        unreadCornerDot.isHidden = !(unread && !active && !hibernated)
+        unreadCornerDot.isHidden = !(unread && !active)
 
         applyColors()
     }
@@ -365,6 +365,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private var urlObservations: [String: NSKeyValueObservation] = [:]
     private var lastKnownURLBySiteId: [String: String] = [:]
     private var unreadSiteIds: Set<String> = []
+    private var lastSiteActiveAt: [String: Date] = [:]
+    private var lastSiteStreamingAt: [String: Date] = [:]
+    private var pendingURLPersistWorkItem: DispatchWorkItem?
 
     private var terminatedSiteIds: Set<String> = [] {
         didSet { runtime.terminatedSiteIds = terminatedSiteIds }
@@ -421,6 +424,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     deinit {
         fgProtectTimer?.invalidate()
+        pendingURLPersistWorkItem?.cancel()
         NotificationCenter.default.removeObserver(self)
         for sid in Array(webViews.keys) {
             teardownWebView(forSiteId: sid)
@@ -435,6 +439,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let ramMB = ProcessInfo.processInfo.physicalMemory / (1024 * 1024)
         JWLog("BOOT", "JetWeb v\(JWBridgeVersion()) (\(JWBridgeGitCommit())) Swift launched | iOS \(UIDevice.current.systemVersion) | RAM=\(ramMB)MB | hostPID=\(getpid()) | sites=\(config.sites.count)")
 
+        for s in config.sites {
+            let saved = JWURLHelper.sanitizePersistedURL(s.lastKnownURL)
+            if !saved.isEmpty {
+                lastKnownURLBySiteId[s.id] = saved
+            }
+        }
+
         writeBgEpochToken(bgEpoch)
         JWNotificationManager.shared.configure()
         JWNotificationManager.shared.onSelectSiteFromNotification = { [weak self] siteId in
@@ -446,6 +457,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             }
         }
         JWNotificationManager.shared.onBackgroundListenWillStopForSuspend = { [weak self] in
+            self?.evaluateIdleAutoHibernation(reason: "notify-guard-ending")
             self?.armDetachedJetsamGuardForBackgroundTransition(reason: "notify-guard-ending")
         }
         bindRuntimeCallbacks()
@@ -574,6 +586,15 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 JWNotificationManager.shared.requestPermissionIfNeeded()
             }
             self.rebuildTabPills()
+        }
+        runtime.onIdleHibernatePolicyChanged = { [weak self] in
+            guard let self = self else { return }
+            let now = Date()
+            for s in self.config.sites where s.autoHibernateExempt {
+                self.lastSiteActiveAt[s.id] = now
+            }
+            self.rebuildTabPills()
+            self.evaluateIdleAutoHibernation(reason: "policy-updated")
         }
         runtime.buildDiagnosticHeader = { [weak self] in
             self?.buildDiagnosticHeaderText() ?? ""
@@ -1149,7 +1170,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             floatingDotView.backgroundColor = .systemBlue
             return
         }
-        let hasOtherUnread = enabled.contains { $0.id != config.selectedSiteId && unreadSiteIds.contains($0.id) && !$0.hibernated }
+        let hasOtherUnread = enabled.contains { $0.id != config.selectedSiteId && unreadSiteIds.contains($0.id) }
         if let cur = site(forId: config.selectedSiteId) {
             floatingLabel.text = cur.title
             if hasOtherUnread {
@@ -1252,6 +1273,130 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         return created
     }
 
+    // MARK: - Persistent Sub-Page URL & Smart Idle Auto-Hibernation Engine
+
+    private func recordLastKnownURL(_ rawURL: String, forSiteId siteId: String, saveImmediately: Bool = false) {
+        let clean = JWURLHelper.sanitizePersistedURL(rawURL)
+        guard !siteId.isEmpty, !clean.isEmpty else { return }
+        lastKnownURLBySiteId[siteId] = clean
+        guard let idx = config.sites.firstIndex(where: { $0.id == siteId }) else { return }
+        guard config.sites[idx].lastKnownURL != clean else { return }
+        config.sites[idx].lastKnownURL = clean
+
+        pendingURLPersistWorkItem?.cancel()
+        if saveImmediately {
+            pendingURLPersistWorkItem = nil
+            config.save()
+        } else {
+            let item = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                self.pendingURLPersistWorkItem = nil
+                self.config.save()
+            }
+            pendingURLPersistWorkItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: item)
+        }
+    }
+
+    private func clearLastKnownURL(forSiteId siteId: String, saveImmediately: Bool = false) {
+        guard !siteId.isEmpty else { return }
+        lastKnownURLBySiteId.removeValue(forKey: siteId)
+        if let idx = config.sites.firstIndex(where: { $0.id == siteId }),
+           !config.sites[idx].lastKnownURL.isEmpty {
+            config.sites[idx].lastKnownURL = ""
+            if saveImmediately {
+                pendingURLPersistWorkItem?.cancel()
+                pendingURLPersistWorkItem = nil
+                config.save()
+            }
+        }
+    }
+
+    private func snapshotLiveURLBeforeHibernate(siteId: String) {
+        guard let wv = webViews[siteId],
+              let liveStr = wv.url?.absoluteString else { return }
+        let clean = JWURLHelper.sanitizePersistedURL(liveStr)
+        guard !clean.isEmpty else { return }
+        lastKnownURLBySiteId[siteId] = clean
+        if let idx = config.sites.firstIndex(where: { $0.id == siteId }) {
+            config.sites[idx].lastKnownURL = clean
+        }
+    }
+
+    private func touchSiteActivity(siteId: String, streaming: Bool = false) {
+        guard !siteId.isEmpty else { return }
+        let now = Date()
+        lastSiteActiveAt[siteId] = now
+        if streaming {
+            lastSiteStreamingAt[siteId] = now
+        }
+    }
+
+    private func evaluateIdleAutoHibernation(reason: String) {
+        let idleMinutes = config.idleHibernateMinutes
+        guard idleMinutes > 0 else { return }
+        let thresholdSec = TimeInterval(idleMinutes * 60)
+        let now = Date()
+
+        if !config.selectedSiteId.isEmpty {
+            lastSiteActiveAt[config.selectedSiteId] = now
+        }
+
+        var hibernatedSummary: [String] = []
+        var freedTotalMB = 0
+
+        for idx in config.sites.indices {
+            let s = config.sites[idx]
+            guard s.enabled, !s.hibernated else { continue }
+            // 1. Never auto-hibernate the currently selected foreground tab
+            if s.id == config.selectedSiteId { continue }
+            // 2. Respect per-site 📌 免自动休眠 whitelist
+            if s.autoHibernateExempt { continue }
+            // 3. Protect actively loading WebView
+            if let wv = webViews[s.id], wv.isLoading {
+                lastSiteActiveAt[s.id] = now
+                continue
+            }
+            // 4. Protect active AI streaming / recently submitted prompt (within 95s of last stream pulse)
+            if let streamAt = lastSiteStreamingAt[s.id] {
+                let sinceStream = now.timeIntervalSince(streamAt)
+                if sinceStream >= 0 && sinceStream < 95.0 {
+                    lastSiteActiveAt[s.id] = now
+                    continue
+                }
+            }
+
+            guard let lastTouch = lastSiteActiveAt[s.id] else {
+                lastSiteActiveAt[s.id] = now
+                continue
+            }
+            let elapsed = now.timeIntervalSince(lastTouch)
+            if elapsed < 0 {
+                lastSiteActiveAt[s.id] = now
+                continue
+            }
+            // 5. If tab has an unread reply dot, grant an extended grace window (at least 30m / 2x threshold)
+            let effectiveThreshold: TimeInterval = unreadSiteIds.contains(s.id)
+                ? max(thresholdSec * 2.0, 1800.0)
+                : thresholdSec
+            guard elapsed >= effectiveThreshold else { continue }
+
+            snapshotLiveURLBeforeHibernate(siteId: s.id)
+            let wpid = JWBridgeWebViewContentPID(webViews[s.id])
+            let mb = (wpid > 0) ? (lastProcStatuses[wpid]?.footprintMB ?? 0) : 0
+            freedTotalMB += max(0, mb)
+            config.sites[idx].hibernated = true
+            hibernatedSummary.append("\(s.title)(\(Int(elapsed / 60))m,\(mb)MB)")
+        }
+
+        guard !hibernatedSummary.isEmpty else { return }
+        pendingURLPersistWorkItem?.cancel()
+        pendingURLPersistWorkItem = nil
+        config.save()
+        JWLog("HIBERNATE", "Auto-hibernated \(hibernatedSummary.count) idle tab(s) [threshold=\(idleMinutes)m reason=\(reason) freed~\(freedTotalMB)MB]: \(hibernatedSummary.joined(separator: ", "))")
+        syncWebViewsWithConfig(preferredSelectId: config.selectedSiteId)
+    }
+
     private func createWebView(for site: SiteItem) -> WKWebView {
         let normStoreId = JWDataStoreHelper.normalize(site.dataStoreId)
         let cfg = WKWebViewConfiguration()
@@ -1275,6 +1420,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         wv.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1"
 
         let capturedId = site.id
+        touchSiteActivity(siteId: capturedId)
         progressObservations[capturedId] = wv.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
             guard let self = self, webView === self.webViews[self.config.selectedSiteId] else { return }
             let p = Float(webView.estimatedProgress)
@@ -1286,7 +1432,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                   let curURL = webView.url,
                   let scheme = curURL.scheme?.lowercased(),
                   (scheme == "http" || scheme == "https") else { return }
-            self.lastKnownURLBySiteId[capturedId] = curURL.absoluteString
+            self.recordLastKnownURL(curURL.absoluteString, forSiteId: capturedId)
         }
 
         webContainerView.insertSubview(wv, belowSubview: emptyStateView)
@@ -1320,7 +1466,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let effBand = config.effectiveSiteBand(for: site)
         JWLog("WEBKIT", "Create WebView site=\(site.title) store=\(shortStore) band=\(effBand) appearance=\(site.appearanceMode)")
 
-        let initialURLStr = lastKnownURLBySiteId[site.id] ?? site.urlString
+        let savedMem = JWURLHelper.sanitizePersistedURL(lastKnownURLBySiteId[site.id])
+        let savedCfg = JWURLHelper.sanitizePersistedURL(site.lastKnownURL)
+        let initialURLStr = !savedMem.isEmpty ? savedMem : (!savedCfg.isEmpty ? savedCfg : site.urlString)
         if let url = URL(string: initialURLStr) {
             wv.load(URLRequest(url: url))
         } else if let homeURL = URL(string: site.urlString) {
@@ -1343,7 +1491,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         webViewStoreIds.removeValue(forKey: siteId)
         errorOverlays.removeValue(forKey: siteId)
         terminatedSiteIds.remove(siteId)
-        unreadSiteIds.remove(siteId)
+        lastSiteActiveAt.removeValue(forKey: siteId)
+        lastSiteStreamingAt.removeValue(forKey: siteId)
         lastRejectedAuthBySiteId.removeValue(forKey: siteId)
     }
 
@@ -1371,6 +1520,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let allConfiguredIds = Set(config.sites.map { $0.id })
         for savedSid in Array(lastKnownURLBySiteId.keys) where !allConfiguredIds.contains(savedSid) {
             lastKnownURLBySiteId.removeValue(forKey: savedSid)
+            lastSiteActiveAt.removeValue(forKey: savedSid)
+            lastSiteStreamingAt.removeValue(forKey: savedSid)
         }
 
         var referencedIsoStores = Set<String>()
@@ -1383,13 +1534,17 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
 
         let enabled = enabledSites()
+        let enabledIds = Set(enabled.map { $0.id })
+        for unreadSid in Array(unreadSiteIds) where !enabledIds.contains(unreadSid) {
+            unreadSiteIds.remove(unreadSid)
+        }
         let awake = awakeSites()
         let awakeIds = Set(awake.map { $0.id })
 
         for s in awake {
             let desiredStoreId = JWDataStoreHelper.normalize(s.dataStoreId)
             if let currentStoreId = webViewStoreIds[s.id], currentStoreId != desiredStoreId {
-                lastKnownURLBySiteId.removeValue(forKey: s.id)
+                clearLastKnownURL(forSiteId: s.id)
                 teardownWebView(forSiteId: s.id)
             }
             if webViews[s.id] == nil {
@@ -1464,7 +1619,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private func reloadSiteFromHomeOrCurrent(siteId: String, forceHome: Bool) {
         guard !siteId.isEmpty else { return }
         if forceHome {
-            lastKnownURLBySiteId.removeValue(forKey: siteId)
+            clearLastKnownURL(forSiteId: siteId, saveImmediately: true)
         }
         if let cur = site(forId: siteId), cur.hibernated {
             setSiteHibernated(siteId: siteId, hibernated: false)
@@ -1473,10 +1628,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         guard let wv = webViews[siteId] else { return }
         let failedURL = errorOverlays[siteId]?.failedURLString ?? ""
         hideErrorOverlay(forSiteId: siteId)
+        touchSiteActivity(siteId: siteId)
 
         if !forceHome {
             let livePID = JWBridgeWebViewContentPID(wv)
-            let remembered = lastKnownURLBySiteId[siteId] ?? ""
+            let savedMem = JWURLHelper.sanitizePersistedURL(lastKnownURLBySiteId[siteId])
+            let savedCfg = JWURLHelper.sanitizePersistedURL(site(forId: siteId)?.lastKnownURL)
+            let remembered = !savedMem.isEmpty ? savedMem : savedCfg
             let curStr = wv.url?.absoluteString ?? ""
 
             /*
@@ -1519,6 +1677,12 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func selectSite(byId siteId: String, triggerWaves: Bool = true) {
         guard !siteId.isEmpty, let curSite = site(forId: siteId), curSite.enabled else { return }
+        let prevSelectedId = config.selectedSiteId
+        if !prevSelectedId.isEmpty && prevSelectedId != siteId {
+            // Start idle countdown cleanly from the moment user switches away from prevSelectedId
+            lastSiteActiveAt[prevSelectedId] = Date()
+        }
+        touchSiteActivity(siteId: siteId)
         config.selectedSiteId = siteId
         unreadSiteIds.remove(siteId)
         config.save()
@@ -1563,6 +1727,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private func setSiteHibernated(siteId: String, hibernated: Bool) {
         guard let idx = config.sites.firstIndex(where: { $0.id == siteId }) else { return }
         let title = config.sites[idx].title
+        unreadSiteIds.remove(siteId)
 
         if !hibernated {
             config.sites[idx].enabled = true
@@ -1574,6 +1739,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             applyDockCollapsedState(animated: false)
             return
         }
+
+        snapshotLiveURLBeforeHibernate(siteId: siteId)
+        pendingURLPersistWorkItem?.cancel()
+        pendingURLPersistWorkItem = nil
 
         let prevPID = JWBridgeWebViewContentPID(webViews[siteId])
         let prevMB = (prevPID > 0) ? (lastProcStatuses[prevPID]?.footprintMB ?? 0) : 0
@@ -1599,10 +1768,15 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             if config.sites[i].id == keepingSiteId {
                 config.sites[i].hibernated = false
             } else if !config.sites[i].hibernated {
+                let sid = config.sites[i].id
+                snapshotLiveURLBeforeHibernate(siteId: sid)
+                unreadSiteIds.remove(sid)
                 config.sites[i].hibernated = true
                 count += 1
             }
         }
+        pendingURLPersistWorkItem?.cancel()
+        pendingURLPersistWorkItem = nil
         config.selectedSiteId = keepingSiteId
         config.save()
         JWLog("HIBERNATE", "Hibernated \(count) other tab(s), keeping siteId=\(keepingSiteId)")
@@ -1612,9 +1786,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private func hibernateAllSites() {
         var count = 0
         for i in config.sites.indices where config.sites[i].enabled && !config.sites[i].hibernated {
+            let sid = config.sites[i].id
+            snapshotLiveURLBeforeHibernate(siteId: sid)
+            unreadSiteIds.remove(sid)
             config.sites[i].hibernated = true
             count += 1
         }
+        pendingURLPersistWorkItem?.cancel()
+        pendingURLPersistWorkItem = nil
         config.save()
         JWLog("HIBERNATE", "Hibernated ALL \(count) awake tab(s) to free WebContent memory")
         syncWebViewsWithConfig(preferredSelectId: config.selectedSiteId)
@@ -1724,6 +1903,23 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         rebuildTabPills()
     }
 
+    private func toggleSiteAutoHibernateExempt(siteId: String) {
+        guard let idx = config.sites.firstIndex(where: { $0.id == siteId }) else { return }
+        config.sites[idx].autoHibernateExempt.toggle()
+        let exempt = config.sites[idx].autoHibernateExempt
+        lastSiteActiveAt[siteId] = Date()
+        config.save()
+        JWLog("HIBERNATE", "Toggled site=\(config.sites[idx].title) autoHibernateExempt=\(exempt)")
+        rebuildTabPills()
+    }
+
+    private func autoHibernateTrailingText(for site: SiteItem) -> String {
+        if site.autoHibernateExempt {
+            return "已开启"
+        }
+        return config.idleHibernateMinutes > 0 ? "\(config.idleHibernateMinutes)分自动眠" : "全局已关"
+    }
+
     private func presentGlassSheet(_ sheet: JWGlassSheetController) {
         guard view.window != nil, presentedViewController == nil else { return }
         let globalMode = JWAppearanceHelper.normalizeGlobal(config.appearanceMode)
@@ -1752,6 +1948,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             chips.append(JWGlassChipItem(symbol: "lock.shield.fill", text: "独立空间", tint: .systemTeal))
         } else {
             chips.append(JWGlassChipItem(symbol: "person.2.fill", text: "共享空间", tint: .secondaryLabel))
+        }
+
+        if targetSite.autoHibernateExempt {
+            chips.append(JWGlassChipItem(symbol: "pin.fill", text: "免自动休眠", tint: .systemOrange))
+        } else if !targetSite.hibernated && config.idleHibernateMinutes > 0 && targetSite.id != config.selectedSiteId {
+            let idleMin = max(0, Int(Date().timeIntervalSince(lastSiteActiveAt[targetSite.id] ?? Date()) / 60.0))
+            chips.append(JWGlassChipItem(symbol: "clock", text: "闲置 \(idleMin)/\(config.idleHibernateMinutes)分", tint: .secondaryLabel))
         }
         return chips
     }
@@ -1824,6 +2027,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
 
         let configGroup: [JWGlassRowItem] = [
+            JWGlassRowItem(
+                symbol: targetSite.autoHibernateExempt ? "pin.fill" : "clock.arrow.circlepath",
+                tint: targetSite.autoHibernateExempt ? .systemOrange : .systemIndigo,
+                title: "免自动休眠（常驻白名单）",
+                trailingText: autoHibernateTrailingText(for: targetSite)
+            ) { [weak self] in
+                self?.toggleSiteAutoHibernateExempt(siteId: targetSite.id)
+            },
             JWGlassRowItem(
                 symbol: "bolt.shield.fill",
                 tint: .systemBlue,
@@ -2023,6 +2234,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 guard let self = self, !isIso,
                       let idx = self.config.sites.firstIndex(where: { $0.id == site.id }) else { return }
                 self.config.sites[idx].dataStoreId = UUID().uuidString
+                self.config.sites[idx].lastKnownURL = ""
+                self.lastKnownURLBySiteId.removeValue(forKey: site.id)
                 self.config.save()
                 JWLog("STORE", "Quick-switched site=\(site.title) to isolated store")
                 self.syncWebViewsWithConfig(preferredSelectId: site.id)
@@ -2037,6 +2250,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 guard let self = self, isIso,
                       let idx = self.config.sites.firstIndex(where: { $0.id == site.id }) else { return }
                 self.config.sites[idx].dataStoreId = JWConstants.dataStoreDefault
+                self.config.sites[idx].lastKnownURL = ""
+                self.lastKnownURLBySiteId.removeValue(forKey: site.id)
                 self.config.save()
                 JWLog("STORE", "Switched site=\(site.title) back to default store")
                 self.syncWebViewsWithConfig(preferredSelectId: site.id)
@@ -2054,6 +2269,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                     guard let self = self,
                           let idx = self.config.sites.firstIndex(where: { $0.id == site.id }) else { return }
                     self.config.sites[idx].dataStoreId = UUID().uuidString
+                    self.config.sites[idx].lastKnownURL = ""
+                    self.lastKnownURLBySiteId.removeValue(forKey: site.id)
                     self.config.save()
                     JWLog("STORE", "Rotated isolated store for site=\(site.title)")
                     self.syncWebViewsWithConfig(preferredSelectId: site.id)
@@ -2111,7 +2328,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 dataStoreId: UUID().uuidString,
                 customBand: site.customBand,
                 hibernated: false,
-                notifyEnabled: site.notifyEnabled
+                notifyEnabled: site.notifyEnabled,
+                autoHibernateExempt: site.autoHibernateExempt
             )
             self.config.sites.append(clone)
             self.config.selectedSiteId = clone.id
@@ -2191,6 +2409,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         ]
 
         let sitePolicyGroup: [JWGlassRowItem] = [
+            JWGlassRowItem(
+                symbol: curSite.autoHibernateExempt ? "pin.fill" : "clock.arrow.circlepath",
+                tint: curSite.autoHibernateExempt ? .systemOrange : .systemIndigo,
+                title: "免自动休眠（常驻白名单）",
+                trailingText: autoHibernateTrailingText(for: curSite)
+            ) { [weak self] in
+                self?.toggleSiteAutoHibernateExempt(siteId: siteId)
+            },
             JWGlassRowItem(
                 symbol: "bolt.shield.fill",
                 tint: .systemBlue,
@@ -2300,7 +2526,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         let siteRows: [JWGlassRowItem] = enabledSites().map { s in
             let isSel = (s.id == config.selectedSiteId)
-            let isUnread = unreadSiteIds.contains(s.id) && !isSel && !s.hibernated
+            let isUnread = unreadSiteIds.contains(s.id) && !isSel
             let effBand = config.effectiveSiteBand(for: s)
             let wpid = JWBridgeWebViewContentPID(webViews[s.id])
             let mb = (wpid > 0) ? (lastProcStatuses[wpid]?.footprintMB ?? 0) : 0
@@ -2308,14 +2534,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let symbol: String
             let tint: UIColor
             let trail: String
-            if s.hibernated {
+            if isUnread {
+                symbol = "bell.badge.fill"
+                tint = .systemRed
+                trail = s.hibernated ? "有新消息 · 休眠" : "有新消息"
+            } else if s.hibernated {
                 symbol = "moon.zzz.fill"
                 tint = .systemIndigo
                 trail = "休眠 · 0 MB"
-            } else if isUnread {
-                symbol = "bell.badge.fill"
-                tint = .systemRed
-                trail = "有新消息"
             } else {
                 symbol = "globe"
                 tint = isSel ? .systemBlue : .systemGreen
@@ -2443,7 +2669,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func clearDataForSite(siteId: String) {
         guard let targetSite = site(forId: siteId) else { return }
-        lastKnownURLBySiteId.removeValue(forKey: siteId)
+        clearLastKnownURL(forSiteId: siteId, saveImmediately: true)
         let shouldReload = !targetSite.hibernated
         let dsId = JWDataStoreHelper.normalize(targetSite.dataStoreId)
         clearBasicAuth(forStoreId: dsId)
@@ -2496,7 +2722,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func clearAllWebsiteData() {
         sessionBasicAuth.removeAll()
+        pendingURLPersistWorkItem?.cancel()
+        pendingURLPersistWorkItem = nil
         lastKnownURLBySiteId.removeAll()
+        for idx in config.sites.indices {
+            config.sites[idx].lastKnownURL = ""
+        }
+        config.save()
         let types = WKWebsiteDataStore.allWebsiteDataTypes()
         let since = Date(timeIntervalSince1970: 0)
         var stores: [WKWebsiteDataStore] = [.default()]
@@ -2535,11 +2767,12 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let notifySummary = config.notificationsEnabled
             ? "开启(护航\(config.bgNotifyGuardMinutes)m\(config.bgAutoSleepAfterNotify ? "/回完休眠" : ""))"
             : "关闭"
+        let idleSummary = config.idleHibernateMinutes > 0 ? "\(config.idleHibernateMinutes)m" : "关闭"
 
         var lines: [String] = []
         lines.append("=== JetWeb 诊断摘要 ===")
         lines.append("版本: v\(JWBridgeVersion()) (\(JWBridgeGitCommit())) | 系统: \(dev.systemName) \(dev.systemVersion) | 物理内存: \(ramMB) MB")
-        lines.append("策略: 全局默认 \(config.targetBand) 档 (网络压阵 \(guardian.auxBand) 档 / 主容器 \(guardian.hostBand) 档) | 单页上限 \(config.maxMemoryMB) MB | 通知: \(notifySummary) | 外观: \(config.appearanceMode) | 日志: \(config.debugLoggingEnabled ? "开启" : "关闭")")
+        lines.append("策略: 全局默认 \(config.targetBand) 档 (网络压阵 \(guardian.auxBand) 档 / 主容器 \(guardian.hostBand) 档) | 单页上限 \(config.maxMemoryMB) MB | 闲置休眠: \(idleSummary) | 通知: \(notifySummary) | 外观: \(config.appearanceMode) | 日志: \(config.debugLoggingEnabled ? "开启" : "关闭")")
         lines.append("主进程: PID \(selfPid) | 实测档位 \(hostSt?.band ?? -1) | 内存 \(hostSt?.footprintMB ?? 0) MB")
 
         for s in config.sites {
@@ -2552,8 +2785,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let effBand = config.effectiveSiteBand(for: s)
             let bandLabel = s.customBand > 0 ? "专属\(effBand)档" : "默认\(effBand)档"
             let notifyBadge = s.notifyEnabled ? "🔔" : "🔕"
+            let exemptBadge = s.autoHibernateExempt ? " 📌免眠" : ""
             let recMark = terminatedSiteIds.contains(s.id) ? " [曾被回收]" : ""
-            lines.append("站点[\(stateLabel)]: \(s.title) \(notifyBadge) | \(bandLabel) | \(JWDataStoreHelper.shortBadge(for: s.dataStoreId)) | WebPID=\(wpid) NetPID=\(npid) GPUPID=\(gpid) | 实测=\(st?.band ?? -1)档 内存=\(st?.footprintMB ?? 0)MB\(recMark)")
+            lines.append("站点[\(stateLabel)]: \(s.title) \(notifyBadge)\(exemptBadge) | \(bandLabel) | \(JWDataStoreHelper.shortBadge(for: s.dataStoreId)) | WebPID=\(wpid) NetPID=\(npid) GPUPID=\(gpid) | 实测=\(st?.band ?? -1)档 内存=\(st?.footprintMB ?? 0)MB\(recMark)")
         }
         lines.append("======================")
         return lines.joined(separator: "\n")
@@ -2639,6 +2873,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         stopForegroundProtectTimer()
         let timer = Timer.scheduledTimer(withTimeInterval: 25.0, repeats: true) { [weak self] _ in
             guard let self = self, UIApplication.shared.applicationState == .active else { return }
+            self.evaluateIdleAutoHibernation(reason: "fg-patrol")
             self.scheduleApplyProtectionAsync(completion: nil)
         }
         timer.tolerance = 5.0
@@ -2768,6 +3003,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     @objc private func appDidEnterBackground() {
         stopForegroundProtectTimer()
+        evaluateIdleAutoHibernation(reason: "enter-bg")
         syncAllWebViewHostStates(appActive: false)
 
         if config.hasAwakeNotifySite() && config.bgNotifyGuardMinutes > 0 {
@@ -2794,11 +3030,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         writeBgEpochToken(bgEpoch)
         endBackgroundGuardTask()
         unreadSiteIds.remove(config.selectedSiteId)
-        updateFloatingIslandVisuals()
         JWLog("FG", "WillEnterForeground newEpoch=\(bgEpoch) terminatedCount=\(terminatedSiteIds.count)")
         applyAppearanceStyles()
+        evaluateIdleAutoHibernation(reason: "enter-fg")
+        touchSiteActivity(siteId: config.selectedSiteId)
         recoverWebViewIfTerminated(siteId: config.selectedSiteId)
         syncAllWebViewHostStates(appActive: true)
+        updateFloatingIslandVisuals()
         rebuildTabPills()
         startForegroundProtectTimer()
         schedulePostStateChangeProtectionWaves()
@@ -3106,16 +3344,20 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                   let senderSite = site(forId: sid) else { return }
             let kind = (dict["k"] as? String) ?? ""
             if kind == "user_sent" {
+                touchSiteActivity(siteId: sid, streaming: true)
                 JWLog("NOTIFY", "User submitted message in site=\(senderSite.title)")
                 return
             }
             if kind == "streaming" {
+                touchSiteActivity(siteId: sid, streaming: true)
                 JWNotificationManager.shared.noteSiteStreamingActivity()
                 return
             }
             guard kind == "reply_done" || kind == "unread_dot" || kind == "web_api" || kind == "title_badge" else {
                 return
             }
+            lastSiteStreamingAt.removeValue(forKey: sid)
+            touchSiteActivity(siteId: sid, streaming: false)
             guard config.notificationsEnabled,
                   senderSite.notifyEnabled,
                   senderSite.enabled,

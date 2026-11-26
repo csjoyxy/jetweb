@@ -18,6 +18,7 @@ final class HubRuntimeState: ObservableObject {
     var onClearAllWebsiteData: (() -> Void)?
     var onSendTestNotification: (() -> Void)?
     var onNotificationPolicyChanged: (() -> Void)?
+    var onIdleHibernatePolicyChanged: (() -> Void)?
     var buildDiagnosticHeader: (() -> String)?
 }
 
@@ -593,6 +594,10 @@ struct SettingsDrawerView: View {
                                         } else if config.notificationsEnabled && site.notifyEnabled && site.enabled {
                                             miniTagPill(symbol: "bell.fill", text: "通知", role: .cobalt)
                                         }
+
+                                        if site.enabled && site.autoHibernateExempt {
+                                            miniTagPill(symbol: "pin.fill", text: "免休眠", role: .amber)
+                                        }
                                     }
                                 }
                             }
@@ -697,8 +702,8 @@ struct SettingsDrawerView: View {
 
     private var policyAndToolsSection: some View {
         Section(
-            header: Text("全局默认策略与诊断"),
-            footer: Text("JetWeb v\(JWBridgeVersion()) (\(JWBridgeGitCommit())) · Swift (UIKit + SwiftUI) + C Root Helper · 单标签超内存上限自动退回 30 档保护 4GB 内存")
+            header: Text("全局保活、自动休眠与诊断"),
+            footer: Text("闲置标签自动休眠仅针对后台未选中的标签生效；正在流式输出回复、刚收到新消息未读或开启「📌 免自动休眠」的标签会自动顺延或豁免。JetWeb v\(JWBridgeVersion()) (\(JWBridgeGitCommit()))")
         ) {
             Picker("全局外观模式", selection: Binding(
                 get: { JWAppearanceHelper.normalizeGlobal(config.appearanceMode) },
@@ -751,6 +756,21 @@ struct SettingsDrawerView: View {
                 Text("800 MB").tag(800)
             }
 
+            Picker("闲置标签自动休眠", selection: Binding(
+                get: { config.idleHibernateMinutes },
+                set: { newMin in
+                    config.idleHibernateMinutes = newMin
+                    config.save()
+                    runtime.onIdleHibernatePolicyChanged?()
+                }
+            )) {
+                Text("关闭（一直常驻）").tag(0)
+                Text("10 分钟未看自动休眠").tag(10)
+                Text("20 分钟未看自动休眠").tag(20)
+                Text("30 分钟（均衡推荐）").tag(30)
+                Text("60 分钟未看自动休眠").tag(60)
+            }
+
             NavigationLink(destination: DiagnosticLogView(config: config, runtime: runtime)) {
                 HStack {
                     Label("运行与诊断日志", systemImage: "doc.text.magnifyingglass")
@@ -783,6 +803,7 @@ struct AddSiteSheet: View {
     @State private var userTouchedStoreToggle: Bool = false
     @State private var customBand: Int = 0
     @State private var notifyEnabled: Bool = true
+    @State private var autoHibernateExempt: Bool = false
     @State private var appearanceMode: String = JWConstants.appearanceInherit
     @State private var showingInvalidURLAlert = false
 
@@ -828,8 +849,9 @@ struct AddSiteSheet: View {
                     ))
                 }
 
-                Section(header: Text("通知与单站点外观")) {
+                Section(header: Text("通知、免休眠与外观")) {
                     Toggle("🔔 接收此站点新消息通知", isOn: $notifyEnabled)
+                    Toggle("📌 免自动休眠（常驻白名单）", isOn: $autoHibernateExempt)
                     Picker("外观模式", selection: $appearanceMode) {
                         Text("跟随全局").tag(JWConstants.appearanceInherit)
                         Text("跟随系统").tag(JWConstants.appearanceSystem)
@@ -886,12 +908,13 @@ struct AddSiteSheet: View {
             dataStoreId: dsId,
             customBand: customBand,
             hibernated: false,
-            notifyEnabled: notifyEnabled
+            notifyEnabled: notifyEnabled,
+            autoHibernateExempt: autoHibernateExempt
         )
         config.sites.append(item)
         config.selectedSiteId = item.id
         config.save()
-        JWLog("STORE", "Added site=\(item.title) isolated=\(useIsolatedStore) customBand=\(item.customBand) notify=\(notifyEnabled)")
+        JWLog("STORE", "Added site=\(item.title) isolated=\(useIsolatedStore) customBand=\(item.customBand) notify=\(notifyEnabled) exempt=\(autoHibernateExempt)")
         runtime.onSyncStructure?(item.id)
         presentationMode.wrappedValue.dismiss()
     }
@@ -964,6 +987,7 @@ struct SiteDetailView: View {
                         Button("重置为全新独立账号空间（换登另一新号）") {
                             config.sites[idx].dataStoreId = UUID().uuidString
                             config.sites[idx].hibernated = false
+                            config.sites[idx].lastKnownURL = ""
                             config.save()
                             JWLog("STORE", "Rotated isolated store for site=\(site.title)")
                             runtime.onSyncStructure?(site.id)
@@ -972,6 +996,7 @@ struct SiteDetailView: View {
                         Button("切回默认共享空间") {
                             config.sites[idx].dataStoreId = JWConstants.dataStoreDefault
                             config.sites[idx].hibernated = false
+                            config.sites[idx].lastKnownURL = ""
                             config.save()
                             JWLog("STORE", "Switched site=\(site.title) to default store")
                             runtime.onSyncStructure?(site.id)
@@ -981,6 +1006,7 @@ struct SiteDetailView: View {
                         Button("切换为独立账号空间（不与原账号串号）") {
                             config.sites[idx].dataStoreId = UUID().uuidString
                             config.sites[idx].hibernated = false
+                            config.sites[idx].lastKnownURL = ""
                             config.save()
                             JWLog("STORE", "Switched site=\(site.title) to isolated store")
                             runtime.onSyncStructure?(site.id)
@@ -1005,7 +1031,7 @@ struct SiteDetailView: View {
 
                 Section(
                     header: Text("通知、内存释放与外观"),
-                    footer: Text("开启新消息通知后，切去其他标签或退后台限时护航期间会自动推送对话回复与未读提醒；休眠此标签时会自动暂停后台通知以节省内存与电量。")
+                    footer: Text("开启「免自动休眠」后，该标签不受全局闲置倒计时影响；其余后台标签在流式输出结束后静置超时会自动休眠降至 0 MB，唤醒时自动恢复休眠前的对话页面。")
                 ) {
                     Toggle("🔔 接收此站点新消息通知", isOn: Binding(
                         get: { config.sites[idx].notifyEnabled },
@@ -1013,6 +1039,15 @@ struct SiteDetailView: View {
                             config.sites[idx].notifyEnabled = newVal
                             config.save()
                             runtime.onNotificationPolicyChanged?()
+                        }
+                    ))
+
+                    Toggle("📌 免自动休眠（常驻白名单）", isOn: Binding(
+                        get: { config.sites[idx].autoHibernateExempt },
+                        set: { newVal in
+                            config.sites[idx].autoHibernateExempt = newVal
+                            config.save()
+                            runtime.onIdleHibernatePolicyChanged?()
                         }
                     ))
 
@@ -1090,6 +1125,9 @@ struct SiteDetailView: View {
         let urlChanged = (config.sites[idx].urlString != normURL)
         config.sites[idx].title = finalTitle
         config.sites[idx].urlString = normURL
+        if urlChanged {
+            config.sites[idx].lastKnownURL = ""
+        }
         config.save()
         runtime.onSyncStructure?(nil)
         if urlChanged {
@@ -1112,7 +1150,8 @@ struct SiteDetailView: View {
             dataStoreId: UUID().uuidString,
             customBand: site.customBand,
             hibernated: false,
-            notifyEnabled: site.notifyEnabled
+            notifyEnabled: site.notifyEnabled,
+            autoHibernateExempt: site.autoHibernateExempt
         )
         config.sites.append(clone)
         config.selectedSiteId = clone.id
@@ -1209,7 +1248,7 @@ enum LogFilterCategory: String, CaseIterable, Identifiable {
         case .all:
             return true
         case .jetsam:
-            return line.contains("[JETSAM]") || line.contains("[BG]") || line.contains("[BG-GUARD]") || line.contains("[FG]") || line.contains("[MEM-WARN]") || line.contains("[BOOT]")
+            return line.contains("[JETSAM]") || line.contains("[HIBERNATE]") || line.contains("[NOTIFY]") || line.contains("[BG]") || line.contains("[BG-GUARD]") || line.contains("[FG]") || line.contains("[MEM-WARN]") || line.contains("[BOOT]")
         case .web:
             return line.contains("[WEBKIT]") || line.contains("[NAV]") || line.contains("[NAV-FAIL]") || line.contains("[TERM]") || line.contains("[JS-ERR]")
         case .auth:
