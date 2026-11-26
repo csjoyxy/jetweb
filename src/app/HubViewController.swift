@@ -1460,7 +1460,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         sheet.addAction(UIAlertAction(title: "外观模式：\(JWAppearanceHelper.label(for: curSite.appearanceMode))", style: .default) { [weak self] _ in
             self?.showQuickAppearancePicker(for: curSite, sourceView: sourceView)
         })
-        sheet.addAction(UIAlertAction(title: "复制当前网址", style: .default) { _ in
+        sheet.addAction(UIAlertAction(title: "🧭 在自带浏览器中打开当前页", style: .default) { _ in
+            let urlStr = wv.url?.absoluteString ?? curSite.urlString
+            if let targetURL = URL(string: urlStr) {
+                UIApplication.shared.open(targetURL, options: [:], completionHandler: nil)
+            }
+        })
+        sheet.addAction(UIAlertAction(title: "📋 复制当前网址", style: .default) { _ in
             UIPasteboard.general.string = wv.url?.absoluteString ?? curSite.urlString
         })
         sheet.addAction(UIAlertAction(title: "查看运行与诊断日志", style: .default) { [weak self] _ in
@@ -2349,13 +2355,121 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
     }
 
+    private static func rootDomain(of url: URL?) -> String {
+        guard let host = url?.host?.lowercased(), !host.isEmpty else { return "" }
+        let parts = host.split(separator: ".").map(String.init)
+        guard parts.count >= 2 else { return host }
+        let twoPartSLDs: Set<String> = ["co", "com", "org", "net", "gov", "edu", "ac"]
+        if parts.count >= 3,
+           parts[parts.count - 1].count == 2,
+           twoPartSLDs.contains(parts[parts.count - 2]) {
+            return parts.suffix(3).joined(separator: ".")
+        }
+        return parts.suffix(2).joined(separator: ".")
+    }
+
+    private static func isLikelyOAuthFlow(_ url: URL) -> Bool {
+        let host = url.host?.lowercased() ?? ""
+        let authHosts: Set<String> = [
+            "accounts.google.com",
+            "appleid.apple.com",
+            "login.microsoftonline.com",
+            "login.live.com"
+        ]
+        if authHosts.contains(host) || host.contains("auth0.com") || host.contains("clerk.") {
+            return true
+        }
+        let pathAndQuery = ((url.path) + "?" + (url.query ?? "")).lowercased()
+        if pathAndQuery.contains("/oauth") ||
+            pathAndQuery.contains("client_id=") ||
+            pathAndQuery.contains("redirect_uri=") ||
+            pathAndQuery.contains("/sso/") {
+            return true
+        }
+        return false
+    }
+
+    private func shouldPromptExternalLink(url: URL, for webView: WKWebView) -> Bool {
+        guard let scheme = url.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https") else { return false }
+        let targetRoot = HubViewController.rootDomain(of: url)
+        guard !targetRoot.isEmpty else { return false }
+        if HubViewController.isLikelyOAuthFlow(url) {
+            return false
+        }
+        let curRoot = HubViewController.rootDomain(of: webView.url)
+        let configuredStr = siteId(for: webView).flatMap { site(forId: $0)?.urlString } ?? ""
+        let homeRoot = HubViewController.rootDomain(of: URL(string: configuredStr))
+
+        if !curRoot.isEmpty && targetRoot == curRoot {
+            return false
+        }
+        if !homeRoot.isEmpty && targetRoot == homeRoot {
+            return false
+        }
+        return !curRoot.isEmpty || !homeRoot.isEmpty
+    }
+
+    private func presentExternalLinkActionSheet(url: URL, for webView: WKWebView) {
+        guard view.window != nil, presentedViewController == nil else {
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            return
+        }
+        let hostLabel = url.host ?? "外部链接"
+        let sheet = UIAlertController(
+            title: "外部链接（\(hostLabel)）",
+            message: url.absoluteString,
+            preferredStyle: .actionSheet
+        )
+        sheet.addAction(UIAlertAction(title: "🧭 跳转自带浏览器打开（支持下载）", style: .default) { _ in
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+        })
+        sheet.addAction(UIAlertAction(title: "📋 拷贝链接地址", style: .default) { _ in
+            UIPasteboard.general.string = url.absoluteString
+        })
+        sheet.addAction(UIAlertAction(title: "📄 在当前标签内打开", style: .default) { [weak webView] _ in
+            webView?.load(URLRequest(url: url))
+        })
+        sheet.addAction(UIAlertAction(title: "📤 系统分享…", style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            let act = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+            if let pop = act.popoverPresentationController {
+                pop.sourceView = self.view
+                pop.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY, width: 1, height: 1)
+                pop.permittedArrowDirections = []
+            }
+            self.present(act, animated: true)
+        })
+        sheet.addAction(UIAlertAction(title: "取消", style: .cancel))
+        configureCenteredPopover(sheet, sourceView: nil)
+        present(sheet, animated: true)
+    }
+
     func webView(
         _ webView: WKWebView,
         createWebViewWith configuration: WKWebViewConfiguration,
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        if !(navigationAction.targetFrame?.isMainFrame ?? false), let url = navigationAction.request.url {
+        guard !(navigationAction.targetFrame?.isMainFrame ?? false),
+              let url = navigationAction.request.url,
+              let scheme = url.scheme?.lowercased(),
+              !scheme.isEmpty else {
+            return nil
+        }
+        if !["http", "https", "about", "blob", "data", "file"].contains(scheme) {
+            if UIApplication.shared.canOpenURL(url) {
+                UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            }
+            return nil
+        }
+        if (scheme == "http" || scheme == "https"),
+           webView === webViews[config.selectedSiteId],
+           shouldPromptExternalLink(url: url, for: webView) {
+            presentExternalLinkActionSheet(url: url, for: webView)
+            return nil
+        }
+        if scheme == "http" || scheme == "https" {
             webView.load(URLRequest(url: url))
         }
         return nil
@@ -2376,7 +2490,70 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             decisionHandler(.cancel)
             return
         }
+
+        if navigationAction.navigationType == .linkActivated,
+           (navigationAction.targetFrame?.isMainFrame ?? true),
+           webView === webViews[config.selectedSiteId],
+           let url = navigationAction.request.url,
+           shouldPromptExternalLink(url: url, for: webView) {
+            decisionHandler(.cancel)
+            DispatchQueue.main.async { [weak self, weak webView] in
+                guard let self = self, let webView = webView else { return }
+                self.presentExternalLinkActionSheet(url: url, for: webView)
+            }
+            return
+        }
+
         decisionHandler(.allow)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        contextMenuConfigurationForElement elementInfo: WKContextMenuElementInfo,
+        completionHandler: @escaping (UIContextMenuConfiguration?) -> Void
+    ) {
+        guard let linkURL = elementInfo.linkURL else {
+            completionHandler(nil)
+            return
+        }
+        let config = UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self, weak webView] _ in
+            let openSafari = UIAction(
+                title: "跳转自带浏览器打开",
+                image: UIImage(systemName: "safari")
+            ) { _ in
+                UIApplication.shared.open(linkURL, options: [:], completionHandler: nil)
+            }
+            let copyLink = UIAction(
+                title: "拷贝链接地址",
+                image: UIImage(systemName: "doc.on.doc")
+            ) { _ in
+                UIPasteboard.general.string = linkURL.absoluteString
+            }
+            let openInTab = UIAction(
+                title: "在当前标签内打开",
+                image: UIImage(systemName: "arrow.right.circle")
+            ) { _ in
+                webView?.load(URLRequest(url: linkURL))
+            }
+            let shareLink = UIAction(
+                title: "系统分享…",
+                image: UIImage(systemName: "square.and.arrow.up")
+            ) { _ in
+                guard let self = self else { return }
+                let act = UIActivityViewController(activityItems: [linkURL], applicationActivities: nil)
+                if let pop = act.popoverPresentationController {
+                    pop.sourceView = self.view
+                    pop.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY, width: 1, height: 1)
+                    pop.permittedArrowDirections = []
+                }
+                self.present(act, animated: true)
+            }
+            return UIMenu(
+                title: linkURL.absoluteString,
+                children: [openSafari, copyLink, openInTab, shareLink]
+            )
+        }
+        completionHandler(config)
     }
 
     private func canPresentJSDialog(for webView: WKWebView) -> Bool {
