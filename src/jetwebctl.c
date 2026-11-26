@@ -32,6 +32,7 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/resource.h>
 
 #define PROC_PIDPATHINFO_MAXSIZE (4 * 1024)
@@ -345,15 +346,70 @@ static int read_epoch_file(const char *path, unsigned long *out_epoch) {
     return parse_ulong_str(buf, out_epoch);
 }
 
-static void apply_protection_batch(int band, int max_mb, int pid_argc, char *pid_argv[], int quiet) {
+static int is_allowed_log_path(const char *path) {
+    if (!path || path[0] == '\0' || strcmp(path, "-") == 0) return 0;
+    if (strstr(path, "..") != NULL) return 0;
+    if (strncmp(path, "/var/mobile/Library/JetWeb/", 27) == 0 ||
+        strncmp(path, "/private/var/mobile/Library/JetWeb/", 35) == 0 ||
+        strncmp(path, "/var/mobile/Containers/Data/Application/", 40) == 0 ||
+        strncmp(path, "/private/var/mobile/Containers/Data/Application/", 48) == 0) {
+        return 1;
+    }
+#ifdef JW_TEST_BUILD
+    if (strncmp(path, "/tmp/", 5) == 0) return 1;
+#endif
+    return 0;
+}
+
+static void append_guard_log_line(const char *log_path, const char *msg) {
+    if (!is_allowed_log_path(log_path) || !msg || !*msg) return;
+    int fd = open(log_path, O_WRONLY | O_APPEND | O_NOFOLLOW);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size < (256 * 1024)) {
+        time_t now = time(NULL);
+        struct tm tm_now;
+        memset(&tm_now, 0, sizeof(tm_now));
+        localtime_r(&now, &tm_now);
+        char line[640];
+        int len = snprintf(line, sizeof(line), "%02d:%02d:%02d [BG-GUARD] %s\n",
+                           tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec, msg);
+        if (len > 0) {
+            size_t to_write = (size_t)len < sizeof(line) ? (size_t)len : (sizeof(line) - 1);
+            ssize_t wr = write(fd, line, to_write);
+            (void)wr;
+        }
+    }
+    close(fd);
+}
+
+static void append_summary_item(char *buf, size_t cap, size_t *off_io, const char *piece) {
+    if (!buf || !off_io || !piece || *off_io + 2 >= cap) return;
+    int n = snprintf(buf + *off_io, cap - *off_io, "%s%s", (*off_io > 0 ? " " : ""), piece);
+    if (n > 0) {
+        size_t adv = (size_t)n;
+        *off_io = (*off_io + adv < cap) ? (*off_io + adv) : (cap - 1);
+    }
+}
+
+static void apply_protection_batch(int band, int max_mb, int pid_argc, char *pid_argv[],
+                                   int quiet, char *summary_out, size_t summary_cap) {
+    size_t sum_off = 0;
+    if (summary_out && summary_cap > 0) summary_out[0] = '\0';
+
     for (int i = 0; i < pid_argc; i++) {
         int pid_i = 0;
         if (parse_positive_int(pid_argv[i], &pid_i) != 0) continue;
         pid_t pid = (pid_t)pid_i;
+        char item[64];
 
         char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
         if (proc_pidpath((int)pid, path, sizeof(path)) <= 0) {
             if (!quiet) printf("GONE pid=%d\n", pid_i);
+            if (summary_out) {
+                snprintf(item, sizeof(item), "%d:GONE", pid_i);
+                append_summary_item(summary_out, summary_cap, &sum_off, item);
+            }
             continue;
         }
         jw_target_kind_t kind = classify_allowed_path(path);
@@ -365,6 +421,10 @@ static void apply_protection_batch(int band, int max_mb, int pid_argc, char *pid
         int32_t cur = -1;
         if (read_priority(pid, &cur) != 0) {
             if (!quiet) printf("ERR_READ pid=%d errno=%d\n", pid_i, errno);
+            if (summary_out) {
+                snprintf(item, sizeof(item), "%d:ERR(%d)", pid_i, errno);
+                append_summary_item(summary_out, summary_cap, &sum_off, item);
+            }
             continue;
         }
         uint64_t fp = read_phys_footprint_mb(pid);
@@ -377,6 +437,10 @@ static void apply_protection_batch(int band, int max_mb, int pid_argc, char *pid
         if (cur >= JW_BAND_FOREGROUND) {
             set_elevated_inactive_floor(pid, over_mem ? 0 : 1);
             if (!quiet) printf("FG pid=%d cur=%d fp=%llu\n", pid_i, (int)cur, (unsigned long long)fp);
+            if (summary_out) {
+                snprintf(item, sizeof(item), "%d:FG(%d,%lluM)", pid_i, (int)cur, (unsigned long long)fp);
+                append_summary_item(summary_out, summary_cap, &sum_off, item);
+            }
             continue;
         }
 
@@ -391,6 +455,10 @@ static void apply_protection_batch(int band, int max_mb, int pid_argc, char *pid
                 printf("OVER_MEM pid=%d before=%d after=%d fp=%llu max=%d\n",
                        pid_i, (int)cur, (int)after, (unsigned long long)fp, max_mb);
             }
+            if (summary_out) {
+                snprintf(item, sizeof(item), "%d:OVER(%d->%d,%lluM)", pid_i, (int)cur, (int)after, (unsigned long long)fp);
+                append_summary_item(summary_out, summary_cap, &sum_off, item);
+            }
             continue;
         }
 
@@ -402,8 +470,16 @@ static void apply_protection_batch(int band, int max_mb, int pid_argc, char *pid
                 printf("OK pid=%d before=%d after=%d fp=%llu\n",
                        pid_i, (int)cur, (int)after, (unsigned long long)fp);
             }
+            if (summary_out) {
+                snprintf(item, sizeof(item), "%d:%d->%d(%lluM)", pid_i, (int)cur, (int)after, (unsigned long long)fp);
+                append_summary_item(summary_out, summary_cap, &sum_off, item);
+            }
         } else {
             if (!quiet) printf("ERR_SET pid=%d before=%d errno=%d\n", pid_i, (int)cur, errno);
+            if (summary_out) {
+                snprintf(item, sizeof(item), "%d:SET_ERR(%d)", pid_i, errno);
+                append_summary_item(summary_out, summary_cap, &sum_off, item);
+            }
         }
     }
 }
@@ -485,11 +561,11 @@ int main(int argc, char *argv[]) {
         if (parse_positive_int(argv[3], &max_mb) != 0) max_mb = 450;
         clamp_policy_params(&band, &max_mb);
 
-        apply_protection_batch(band, max_mb, argc - 4, &argv[4], 0);
+        apply_protection_batch(band, max_mb, argc - 4, &argv[4], 0, NULL, 0);
         return 0;
     }
 
-    if (argc >= 8 && strcmp(argv[1], "--bg-guard") == 0) {
+    if (argc >= 9 && strcmp(argv[1], "--bg-guard") == 0) {
         int band = 85;
         int max_mb = 450;
         if (parse_positive_int(argv[2], &band) != 0) band = 85;
@@ -503,26 +579,18 @@ int main(int argc, char *argv[]) {
         int host_pid_i = 0;
         if (parse_positive_int(argv[6], &host_pid_i) != 0) return 1;
         pid_t host_pid = (pid_t)host_pid_i;
+        const char *log_path = argv[7];
 
         /* Protect this short-lived guard process itself (~400KB RSS) until its 55s waves complete */
         (void)set_priority_band(getpid(), band, 1);
 
-        /*
-         * Cumulative offsets from spawn (~t+0.6s):
-         *   +0s  (0.6s) : immediate lock before UIBackgroundTask ends
-         *   +2s  (2.6s) : right after JetWeb ends UIBackgroundTask (~1.0s) & suspends
-         *   +4s  (6.6s) : after delayed WebKit hidden-view throttling
-         *   +8s  (14.6s): after XNU 10s applications_aging_band / system_procs_aging_band demotion
-         *   +12s (26.6s): after WebKit 20s ProcessThrottler prepareToSuspendTimeoutTimer
-         *   +12s (38.6s): after WebKit ~32s FinishTaskInterruptable RBSAssertion expiry
-         *   +17s (55.6s): after XNU's post-32s + 10s (~42s) aging demotion -> then exit cleanly!
-         */
 #ifdef JW_TEST_BUILD
         const int wave_delays[] = { 0, 1, 1 };
 #else
         const int wave_delays[] = { 0, 2, 4, 8, 12, 12, 17 };
 #endif
         int num_waves = (int)(sizeof(wave_delays) / sizeof(wave_delays[0]));
+        int completed_waves = 0;
         for (int w = 0; w < num_waves; w++) {
             if (wave_delays[w] > 0) {
                 if (!sleep_interruptible_seconds(wave_delays[w], epoch_file, expected_epoch, host_pid)) {
@@ -531,13 +599,27 @@ int main(int argc, char *argv[]) {
             } else if (!bg_guard_should_continue(epoch_file, expected_epoch, host_pid)) {
                 break;
             }
-            apply_protection_batch(band, max_mb, argc - 7, &argv[7], 1);
+            char sum[420];
+            apply_protection_batch(band, max_mb, argc - 8, &argv[8], 1, sum, sizeof(sum));
+            completed_waves = w + 1;
+            if (is_allowed_log_path(log_path)) {
+                char msg[512];
+                snprintf(msg, sizeof(msg), "wave=%d/%d ep=%lu [%s]", w + 1, num_waves, expected_epoch, sum);
+                append_guard_log_line(log_path, msg);
+            }
+        }
+        if (is_allowed_log_path(log_path)) {
+            char end_msg[128];
+            snprintf(end_msg, sizeof(end_msg), "exit waves=%d/%d ep=%lu (%s)",
+                     completed_waves, num_waves, expected_epoch,
+                     (completed_waves == num_waves ? "completed" : "cancelled_by_fg_or_exit"));
+            append_guard_log_line(log_path, end_msg);
         }
         return 0;
     }
 
     fprintf(stderr,
             "Usage: jetwebctl --probe | --query <pids...> | --apply <band> <max_mb> <pids...> | "
-            "--bg-guard <band> <max_mb> <epoch_file> <epoch> <host_pid> <pids...>\n");
+            "--bg-guard <band> <max_mb> <epoch_file> <epoch> <host_pid> <log_file|-> <pids...>\n");
     return 1;
 }

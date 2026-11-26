@@ -59,11 +59,16 @@ def verify_entitlements(ldid_bin: str, bin_path: str, expected_plist_path: str) 
             raise RuntimeError(f"{bin_path}: missing required IOKit entitlements: {sorted(missing)}")
 
 
-def extract_jw_version(main_m_path: str) -> str:
-    with open(main_m_path, "r", encoding="utf-8") as f:
-        src = f.read()
-    m = re.search(r'#define\s+JW_VERSION\s+"([^"]+)"', src)
-    return m.group(1) if m else ""
+def extract_jw_version(app_src_dir: str) -> str:
+    for candidate in ("JetWebBridge.h", "main.m"):
+        p = os.path.join(app_src_dir, candidate)
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8") as f:
+                src = f.read()
+            m = re.search(r'#define\s+JW_VERSION\s+"([^"]+)"', src)
+            if m:
+                return m.group(1)
+    return ""
 
 
 def main() -> int:
@@ -79,7 +84,7 @@ def main() -> int:
         print("[FAIL] ldid not found in PATH", file=sys.stderr)
         return 2
 
-    src_ver = extract_jw_version(os.path.join(src_dir, "app", "main.m"))
+    src_ver = extract_jw_version(os.path.join(src_dir, "app"))
 
     with tempfile.TemporaryDirectory() as tmp:
         with zipfile.ZipFile(tipa_path, "r") as zf:
