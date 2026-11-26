@@ -1463,5 +1463,48 @@ enum WebScripts {
             in: .defaultClient
         )
     }
+
+    /// SPA-safe page-level JS retention cleanup invoked right before WebKit/JSC memory pressure GC.
+    /// Clears PerformanceObserver/ResourceTiming/UserTiming buffers and retained console object graphs
+    /// without mutating virtual-DOM trees, scroll positions, draft inputs, or live WebSockets.
+    static func memoryReliefHelperScript() -> WKUserScript {
+        let js = #"""
+        (function(){
+        'use strict';
+        if(window.__jwMemReliefInstalled)return;
+        window.__jwMemReliefInstalled=true;
+        window.__jwTrimPageMemory=function(opts){
+          try{
+            var o=opts||{};
+            if(window.performance){
+              if(typeof performance.clearResourceTimings==='function')performance.clearResourceTimings();
+              if(o.aggressive){
+                if(typeof performance.clearMarks==='function')performance.clearMarks();
+                if(typeof performance.clearMeasures==='function')performance.clearMeasures();
+              }
+            }
+            if(o.aggressive&&typeof console!=='undefined'&&console&&typeof console.clear==='function'){
+              try{console.clear();}catch(_){}
+            }
+            if(o.hiddenTab&&window.getSelection){
+              var ae=document.activeElement;
+              var tag=ae&&ae.tagName?ae.tagName:'';
+              var editing=!!(ae&&(tag==='INPUT'||tag==='TEXTAREA'||ae.isContentEditable));
+              if(!editing){
+                var sel=window.getSelection();
+                if(sel&&sel.rangeCount>0&&sel.isCollapsed){sel.removeAllRanges();}
+              }
+            }
+          }catch(_){}
+        };
+        })();
+        """#
+        return WKUserScript(
+            source: js,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false,
+            in: .page
+        )
+    }
 }
 

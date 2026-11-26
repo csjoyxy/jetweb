@@ -11,6 +11,7 @@ enum JWConstants {
     static let defaultBand = 85
     static let defaultMaxMB = 450
     static let defaultBgNotifyMinutes = 15
+    static let defaultIdleDetachSeconds = 45
     static let defaultIdleHibernateMinutes = 30
     static let allowedIdleHibernateMinutes = [0, 10, 20, 30, 60]
     static let minSiteBand = 30
@@ -318,6 +319,42 @@ struct ProcStatus: Equatable {
     }
 }
 
+struct MemoryTrimSummary: Equatable {
+    var mode: String
+    var beforeMB: Int
+    var afterMB: Int
+    var savedMB: Int
+    var count: Int
+
+    static func parseHelperOutput(_ output: String) -> MemoryTrimSummary? {
+        guard !output.isEmpty else { return nil }
+        for line in output.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("TRIM_SUM ") else { continue }
+            var mode = "deep"
+            var before = 0
+            var after = 0
+            var saved = 0
+            var count = 0
+            for kv in trimmed.components(separatedBy: .whitespaces).dropFirst() {
+                if kv.hasPrefix("mode=") {
+                    mode = String(kv.dropFirst(5))
+                } else if kv.hasPrefix("before="), let v = Int(kv.dropFirst(7)) {
+                    before = v
+                } else if kv.hasPrefix("after="), let v = Int(kv.dropFirst(6)) {
+                    after = v
+                } else if kv.hasPrefix("saved="), let v = Int(kv.dropFirst(6)) {
+                    saved = v
+                } else if kv.hasPrefix("count="), let v = Int(kv.dropFirst(6)) {
+                    count = v
+                }
+            }
+            return MemoryTrimSummary(mode: mode, beforeMB: before, afterMB: after, savedMB: saved, count: count)
+        }
+        return nil
+    }
+}
+
 final class AppConfig: ObservableObject {
     @Published var sites: [SiteItem] = []
     @Published var selectedSiteId: String = ""
@@ -334,6 +371,12 @@ final class AppConfig: ObservableObject {
     @Published var bgAutoSleepAfterNotify: Bool = true
     /// 0 = 关闭自动休眠；10 / 20 / 30 / 60 = 后台标签静置超过该分钟数自动休眠释放内存
     @Published var idleHibernateMinutes: Int = JWConstants.defaultIdleHibernateMinutes
+    /// 开启后：单页超软水位、退后台前及内存告警时自动执行无损内存脱水（不重载网页）
+    @Published var autoMemoryTrimEnabled: Bool = true
+    /// 0 = 不摘除离屏视图；30 / 45 / 90 / 180 = 非当前标签闲置超该秒数临时移出窗口树释放合成显存并激活分档优先级
+    @Published var idleDetachSeconds: Int = JWConstants.defaultIdleDetachSeconds
+    /// 极端系统内存告警且无损脱水后仍超危时，按「低档位优先 → 最久未看」自动休眠次要非当前标签
+    @Published var autoHibernateOnCriticalMemory: Bool = true
 
     func hasAwakeNotifySite() -> Bool {
         guard notificationsEnabled else { return false }
@@ -473,6 +516,16 @@ final class AppConfig: ObservableObject {
            JWConstants.allowedIdleHibernateMinutes.contains(im) {
             cfg.idleHibernateMinutes = im
         }
+        if let amt = (root["autoMemoryTrimEnabled"] as? NSNumber)?.boolValue ?? (root["autoMemoryTrimEnabled"] as? Bool) {
+            cfg.autoMemoryTrimEnabled = amt
+        }
+        if let ids = (root["idleDetachSeconds"] as? NSNumber)?.intValue ?? (root["idleDetachSeconds"] as? Int),
+           [0, 30, 45, 90, 180].contains(ids) {
+            cfg.idleDetachSeconds = ids
+        }
+        if let ahc = (root["autoHibernateOnCriticalMemory"] as? NSNumber)?.boolValue ?? (root["autoHibernateOnCriticalMemory"] as? Bool) {
+            cfg.autoHibernateOnCriticalMemory = ahc
+        }
         return cfg
     }
 
@@ -491,7 +544,10 @@ final class AppConfig: ObservableObject {
             "notificationsEnabled": notificationsEnabled,
             "bgNotifyGuardMinutes": bgNotifyGuardMinutes,
             "bgAutoSleepAfterNotify": bgAutoSleepAfterNotify,
-            "idleHibernateMinutes": idleHibernateMinutes
+            "idleHibernateMinutes": idleHibernateMinutes,
+            "autoMemoryTrimEnabled": autoMemoryTrimEnabled,
+            "idleDetachSeconds": idleDetachSeconds,
+            "autoHibernateOnCriticalMemory": autoHibernateOnCriticalMemory
         ]
         guard let json = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]) else {
             return false
