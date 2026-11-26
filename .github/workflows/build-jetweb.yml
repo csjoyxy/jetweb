@@ -58,6 +58,7 @@ jobs:
             app/Logger.swift \
             app/NotificationManager.swift \
             app/WebScripts.swift \
+            app/GlassMenuSheet.swift \
             app/ErrorOverlayView.swift \
             app/SettingsDrawerView.swift \
             app/HubViewController.swift \

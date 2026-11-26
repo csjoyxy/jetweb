@@ -23,13 +23,14 @@
 ```
 src/
   app/AppMain.swift            # Swift 入口 (@main AppDelegate)
-  app/HubViewController.swift  # UIKit 多实例 WKWebView 容器、秒切底栏、悬浮胶囊、保活与认证调度
+  app/HubViewController.swift  # UIKit 多实例 WKWebView 容器、零遮挡毛玻璃胶囊坞、灵动悬浮岛与保活调度
+  app/GlassMenuSheet.swift     # iOS 控制中心风格毛玻璃底部面板、首字母徽标、快捷磁贴与高光描边组件
   app/NotificationManager.swift# iOS 原生通知投递、去重限频与限时省电后台静音监听调度
-  app/SettingsDrawerView.swift # SwiftUI 常驻工作台设置抽屉、通知策略、多账号空间、证书与诊断日志页
+  app/SettingsDrawerView.swift # SwiftUI 毛玻璃护航仪表盘、通知策略、多账号空间、证书与诊断日志页
   app/Models.swift             # 配置与进程状态模型 (兼容 config.json)
   app/Logger.swift             # 线程安全诊断日志器 (256KB 自动轮转 + URL 脱敏)
-  app/WebScripts.swift         # WebKit 兼容垫片、深色输入框修正、三合一新消息检测与前端报错采集
-  app/ErrorOverlayView.swift   # 导航/证书失败可读提示与重试视图
+  app/WebScripts.swift         # WebKit 兼容垫片、滚动锚定防跳、深色输入框修正与三合一新消息检测
+  app/ErrorOverlayView.swift   # 毛玻璃卡片式导航/证书异常提示与重试视图
   app/JetWebBridge.h/.m        # 精简 C/ObjC 桥接 (POSIX persona 提权拉起、WebKit 私有 PID 与独立存储 SPI)
   app/Info.plist               # App 信息 (com.lili.jetweb + 后台混音监听权限)
   app/Icon-*.png               # 应用图标

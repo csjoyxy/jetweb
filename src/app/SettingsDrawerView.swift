@@ -191,10 +191,29 @@ struct SettingsDrawerView: View {
 
     private let hostPid: Int32 = getpid()
 
+    private var totalLiveMemoryMB: Int {
+        var sum = max(0, runtime.liveStatuses[hostPid]?.footprintMB ?? 0)
+        for site in config.sites where site.enabled && !site.hibernated {
+            let pid = runtime.webPIDsBySiteId[site.id] ?? 0
+            if pid > 0, let st = runtime.liveStatuses[pid] {
+                sum += max(0, st.footprintMB)
+            }
+        }
+        return sum
+    }
+
+    private var awakeTabCount: Int {
+        config.sites.filter { $0.enabled && !$0.hibernated }.count
+    }
+
+    private var hibernatedTabCount: Int {
+        config.sites.filter { $0.enabled && $0.hibernated }.count
+    }
+
     var body: some View {
         NavigationView {
             List {
-                liveProcessSection
+                glassDashboardSection
                 sitesSection
                 notificationSection
                 policyAndToolsSection
@@ -217,7 +236,8 @@ struct SettingsDrawerView: View {
                             showingAddSheet = true
                         }
                     } label: {
-                        Image(systemName: "plus")
+                        Image(systemName: "plus.circle.fill")
+                            .font(.system(size: 18, weight: .semibold))
                     }
                     EditButton()
                 }
@@ -249,54 +269,207 @@ struct SettingsDrawerView: View {
         }
     }
 
-    private var liveProcessSection: some View {
+    private var glassDashboardSection: some View {
         let guardian = config.computedGuardianBands()
+        let hostSt = runtime.liveStatuses[hostPid]
+        let hostOK = (hostSt?.band ?? -1) >= guardian.hostBand || (hostSt?.band ?? -1) >= 100
+
         return Section(
-            header: Text("实时进程与保活档位"),
             footer: Text(
                 runtime.helperBannerText.isEmpty
-                ? "各标签按专属档位分级保活（主进程压阵 \(guardian.hostBand) 档 · 网络/GPU \(guardian.auxBand) 档）；底栏长按标签可随时「🌙 休眠释放内存」。"
+                ? "各标签按专属档位分级保活（主容器压阵 \(guardian.hostBand) 档 · 网络/GPU \(guardian.auxBand) 档）；底栏长按标签可打开毛玻璃面板一键休眠释放内存。"
                 : runtime.helperBannerText
             )
         ) {
-            HStack {
-                Text("JetWeb 主进程 (PID \(hostPid))")
-                    .font(.subheadline)
+            ZStack {
+                LinearGradient(
+                    gradient: Gradient(colors: [
+                        Color(red: 0.16, green: 0.48, blue: 0.96).opacity(0.18),
+                        Color(red: 0.36, green: 0.28, blue: 0.90).opacity(0.14),
+                        Color(red: 0.08, green: 0.66, blue: 0.62).opacity(0.12)
+                    ]),
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(spacing: 10) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .fill(
+                                    LinearGradient(
+                                        gradient: Gradient(colors: [
+                                            Color(red: 0.16, green: 0.50, blue: 0.98),
+                                            Color(red: 0.32, green: 0.28, blue: 0.90)
+                                        ]),
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    )
+                                )
+                                .frame(width: 38, height: 38)
+                            Image(systemName: "bolt.shield.fill")
+                                .font(.system(size: 17, weight: .bold))
+                                .foregroundColor(.white)
+                        }
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("JetWeb 护航仪表盘")
+                                .font(.system(size: 15.5, weight: .bold))
+                                .foregroundColor(.primary)
+                            if let st = hostSt, st.band >= 0 {
+                                Text("主容器 PID \(hostPid) · \(st.band >= 100 ? "前台活跃(目标\(guardian.hostBand)档)" : "实测 \(st.band) 档") · \(st.footprintMB) MB")
+                                    .font(.system(size: 11.5, weight: .medium).monospacedDigit())
+                                    .foregroundColor(hostOK ? .green : .secondary)
+                            } else {
+                                Text("读取内核状态中 / 需 TrollStore 安装")
+                                    .font(.system(size: 11.5))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+
+                        Spacer(minLength: 4)
+
+                        Button {
+                            runtime.onApplyProtectionNow?()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 11, weight: .bold))
+                                Text("提档")
+                                    .font(.system(size: 12, weight: .semibold))
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color.accentColor.opacity(0.16))
+                            .foregroundColor(.accentColor)
+                            .clipShape(Capsule())
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                    }
+
+                    HStack(spacing: 8) {
+                        dashboardMetricTile(
+                            symbol: "square.stack.3d.up.fill",
+                            tint: .blue,
+                            label: "标签状态",
+                            value: "\(awakeTabCount) 活 · \(hibernatedTabCount) 眠"
+                        )
+                        dashboardMetricTile(
+                            symbol: "memorychip",
+                            tint: totalLiveMemoryMB > 1100 ? .orange : .green,
+                            label: "总内存占用",
+                            value: "\(totalLiveMemoryMB) MB"
+                        )
+                        dashboardMetricTile(
+                            symbol: config.notificationsEnabled ? "bell.badge.fill" : "bell.slash.fill",
+                            tint: .teal,
+                            label: "后台等信",
+                            value: !config.notificationsEnabled
+                                ? "已关闭"
+                                : (config.bgNotifyGuardMinutes == 0 ? "仅前台" : "\(config.bgNotifyGuardMinutes) 分钟")
+                        )
+                    }
+
+                    if !config.sites.isEmpty {
+                        VStack(spacing: 8) {
+                            ForEach(config.sites) { site in
+                                dashboardSiteTelemetryRow(for: site)
+                            }
+                        }
+                        .padding(10)
+                        .background(Color(UIColor.systemBackground).opacity(0.46))
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    }
+                }
+                .padding(15)
+                .background(.ultraThinMaterial)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(Color.white.opacity(0.32), lineWidth: 0.8)
+            )
+            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+            .listRowBackground(Color.clear)
+        }
+    }
+
+    private func dashboardMetricTile(symbol: String, tint: Color, label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Image(systemName: symbol)
+                    .font(.system(size: 10.5, weight: .bold))
+                    .foregroundColor(tint)
+                Text(label)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            Text(value)
+                .font(.system(size: 13, weight: .bold).monospacedDigit())
+                .foregroundColor(.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 8)
+        .background(Color(UIColor.systemBackground).opacity(0.50))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func dashboardSiteTelemetryRow(for site: SiteItem) -> some View {
+        let effBand = config.effectiveSiteBand(for: site)
+        let wpid = runtime.webPIDsBySiteId[site.id] ?? 0
+        let st = (wpid > 0) ? runtime.liveStatuses[wpid] : nil
+        let mb = st?.footprintMB ?? 0
+        let ratio = min(1.0, max(0.0, Double(mb) / Double(max(200, config.maxMemoryMB))))
+
+        VStack(spacing: 5) {
+            HStack(spacing: 8) {
+                siteSquircleBadge(title: site.title, size: 22, fontSize: 10.5, dimmed: !site.enabled || site.hibernated)
+                Text(site.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(site.enabled ? .primary : .secondary)
+                    .lineLimit(1)
                 Spacer()
-                if let st = runtime.liveStatuses[hostPid], st.band >= 0 {
-                    let ok = (st.band >= guardian.hostBand || st.band >= 100)
-                    let note = st.band >= 100 ? " (前台·目标\(guardian.hostBand))" : (ok ? " (已保活)" : "")
-                    Text("档位 \(st.band)\(note) · \(st.footprintMB) MB")
-                        .font(.footnote.monospacedDigit())
-                        .foregroundColor(ok ? .green : .secondary)
-                } else {
-                    Text("读取中 / 需 TrollStore 安装")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                }
+                siteStatusView(for: site)
             }
 
-            ForEach(config.sites) { site in
-                HStack {
-                    Text("\(site.title) · 渲染进程")
-                        .font(.subheadline)
-                        .lineLimit(1)
-                    Spacer()
-                    siteStatusView(for: site)
+            if site.enabled && !site.hibernated && mb > 0 {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.secondary.opacity(0.14))
+                            .frame(height: 4)
+                        Capsule()
+                            .fill(mb > config.maxMemoryMB ? Color.orange : (effBand >= 85 ? Color.blue : Color.green))
+                            .frame(width: max(6, geo.size.width * CGFloat(ratio)), height: 4)
+                    }
                 }
-            }
-
-            Button {
-                runtime.onApplyProtectionNow?()
-            } label: {
-                HStack {
-                    Spacer()
-                    Label("立即刷新并重设保活档位", systemImage: "bolt.shield")
-                        .font(.subheadline.weight(.medium))
-                    Spacer()
-                }
+                .frame(height: 4)
             }
         }
+    }
+
+    private func siteSquircleBadge(title: String, size: CGFloat, fontSize: CGFloat, dimmed: Bool) -> some View {
+        let pair = JWSitePalette.gradientPair(for: title)
+        return ZStack {
+            RoundedRectangle(cornerRadius: size * 0.29, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        gradient: Gradient(colors: [Color(pair.top), Color(pair.bottom)]),
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+            Text(JWSitePalette.initialText(for: title))
+                .font(.system(size: fontSize, weight: .bold))
+                .foregroundColor(.white)
+        }
+        .frame(width: size, height: size)
+        .opacity(dimmed ? 0.55 : 1.0)
     }
 
     @ViewBuilder
@@ -305,20 +478,24 @@ struct SettingsDrawerView: View {
         let wpid = runtime.webPIDsBySiteId[site.id] ?? 0
         if !site.enabled {
             Text("已隐藏")
-                .font(.footnote)
+                .font(.system(size: 11, weight: .medium))
                 .foregroundColor(Color(UIColor.tertiaryLabel))
         } else if site.hibernated {
-            Text("🌙 已休眠 · 0 MB")
-                .font(.footnote)
-                .foregroundColor(.purple)
+            HStack(spacing: 3) {
+                Image(systemName: "moon.zzz.fill")
+                    .font(.system(size: 9.5, weight: .bold))
+                Text("休眠 · 0 MB")
+                    .font(.system(size: 11, weight: .semibold).monospacedDigit())
+            }
+            .foregroundColor(.indigo)
         } else if wpid <= 0 {
             if runtime.terminatedSiteIds.contains(site.id) {
-                Text("已被回收（切回自动恢复）")
-                    .font(.footnote)
+                Text("待恢复")
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.orange)
             } else {
-                Text("待加载 (目标\(effBand)档)")
-                    .font(.footnote)
+                Text("目标 \(effBand) 档")
+                    .font(.system(size: 11, weight: .medium).monospacedDigit())
                     .foregroundColor(.secondary)
             }
         } else if let st = runtime.liveStatuses[wpid], st.band >= 0 {
@@ -326,29 +503,29 @@ struct SettingsDrawerView: View {
             let overMem = (badge == "OVER_MEM")
             let summaryText: String = {
                 if overMem {
-                    return "PID \(wpid) · 档位 \(st.band) (超限) · \(st.footprintMB) MB"
+                    return "\(st.band)档(超限) · \(st.footprintMB) MB"
                 }
                 if st.band >= 100 {
-                    return "PID \(wpid) · 100档(前台/目标\(effBand)) · \(st.footprintMB) MB"
+                    return "前台(目标\(effBand)) · \(st.footprintMB) MB"
                 }
                 if st.band >= effBand {
-                    return "PID \(wpid) · \(st.band)档(已保活) · \(st.footprintMB) MB"
+                    return "\(st.band)档(保活) · \(st.footprintMB) MB"
                 }
-                return "PID \(wpid) · \(st.band)/\(effBand)档 · \(st.footprintMB) MB"
+                return "\(st.band)/\(effBand)档 · \(st.footprintMB) MB"
             }()
             Text(summaryText)
-                .font(.footnote.monospacedDigit())
+                .font(.system(size: 11, weight: .semibold).monospacedDigit())
                 .foregroundColor(overMem ? .orange : (badge == "OK" ? .green : .secondary))
         } else {
             Text("PID \(wpid)")
-                .font(.footnote.monospacedDigit())
+                .font(.system(size: 11).monospacedDigit())
                 .foregroundColor(.secondary)
         }
     }
 
     private func bandBadgeColor(for effBand: Int) -> Color {
         if effBand >= 86 { return .orange }
-        if effBand >= 75 { return .green }
+        if effBand >= 75 { return .blue }
         return .secondary
     }
 
@@ -371,7 +548,7 @@ struct SettingsDrawerView: View {
                 ForEach(config.sites) { site in
                     let effBand = config.effectiveSiteBand(for: site)
                     let bColor = bandBadgeColor(for: effBand)
-                    HStack(spacing: 10) {
+                    HStack(spacing: 11) {
                         NavigationLink(
                             destination: SiteDetailView(
                                 siteId: site.id,
@@ -379,63 +556,41 @@ struct SettingsDrawerView: View {
                                 runtime: runtime
                             )
                         ) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(site.title)
-                                    .font(.body.weight(.medium))
-                                    .foregroundColor(.primary)
-                                Text(site.urlString)
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(1)
-                                HStack(spacing: 6) {
-                                    Text(JWPriorityHelper.shortBadge(customBand: site.customBand, globalBand: config.targetBand))
-                                        .font(.system(size: 10.5, weight: .semibold))
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(bColor.opacity(0.15))
-                                        .foregroundColor(bColor)
-                                        .cornerRadius(4)
+                            HStack(spacing: 11) {
+                                siteSquircleBadge(
+                                    title: site.title,
+                                    size: 36,
+                                    fontSize: 15,
+                                    dimmed: !site.enabled || site.hibernated
+                                )
 
-                                    Text(site.isIsolatedStore ? "独立账号" : "默认共享")
-                                        .font(.system(size: 10.5, weight: .semibold))
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(
-                                            (site.isIsolatedStore ? Color.blue : Color.secondary)
-                                                .opacity(0.15)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(site.title)
+                                        .font(.system(size: 15.5, weight: .semibold))
+                                        .foregroundColor(.primary)
+                                    Text(site.urlString)
+                                        .font(.system(size: 11.5))
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+
+                                    HStack(spacing: 5) {
+                                        miniTagPill(
+                                            symbol: "bolt.shield.fill",
+                                            text: JWPriorityHelper.shortBadge(customBand: site.customBand, globalBand: config.targetBand),
+                                            color: bColor
                                         )
-                                        .foregroundColor(site.isIsolatedStore ? .blue : .secondary)
-                                        .cornerRadius(4)
 
-                                    if site.enabled && site.hibernated {
-                                        Text("🌙 休眠中")
-                                            .font(.system(size: 10.5, weight: .medium))
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(Color.purple.opacity(0.14))
-                                            .foregroundColor(.purple)
-                                            .cornerRadius(4)
-                                    }
+                                        miniTagPill(
+                                            symbol: site.isIsolatedStore ? "lock.fill" : "person.2.fill",
+                                            text: site.isIsolatedStore ? "独立空间" : "共享",
+                                            color: site.isIsolatedStore ? .teal : .secondary
+                                        )
 
-                                    if config.notificationsEnabled && site.notifyEnabled && site.enabled && !site.hibernated {
-                                        Text("🔔 通知")
-                                            .font(.system(size: 10.5, weight: .medium))
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(Color.teal.opacity(0.15))
-                                            .foregroundColor(.teal)
-                                            .cornerRadius(4)
-                                    }
-
-                                    let mode = JWAppearanceHelper.normalizeSite(site.appearanceMode)
-                                    if mode != JWConstants.appearanceInherit {
-                                        Text(JWAppearanceHelper.label(for: mode))
-                                            .font(.system(size: 10.5, weight: .medium))
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(Color.purple.opacity(0.14))
-                                            .foregroundColor(.purple)
-                                            .cornerRadius(4)
+                                        if site.enabled && site.hibernated {
+                                            miniTagPill(symbol: "moon.zzz.fill", text: "已休眠", color: .indigo)
+                                        } else if config.notificationsEnabled && site.notifyEnabled && site.enabled {
+                                            miniTagPill(symbol: "bell.fill", text: "通知", color: .blue)
+                                        }
                                     }
                                 }
                             }
@@ -458,6 +613,7 @@ struct SettingsDrawerView: View {
                         ))
                         .labelsHidden()
                     }
+                    .padding(.vertical, 2)
                 }
                 .onMove { source, destination in
                     config.sites.move(fromOffsets: source, toOffset: destination)
@@ -471,6 +627,20 @@ struct SettingsDrawerView: View {
                 }
             }
         }
+    }
+
+    private func miniTagPill(symbol: String, text: String, color: Color) -> some View {
+        HStack(spacing: 2.5) {
+            Image(systemName: symbol)
+                .font(.system(size: 8.5, weight: .bold))
+            Text(text)
+                .font(.system(size: 10, weight: .semibold))
+        }
+        .padding(.horizontal, 5.5)
+        .padding(.vertical, 2)
+        .background(color.opacity(0.14))
+        .foregroundColor(color)
+        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
     }
 
     private var notificationSection: some View {

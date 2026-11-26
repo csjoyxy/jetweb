@@ -99,50 +99,152 @@ private final class PendingBasicAuthItem {
     }
 }
 
-// MARK: - Bottom Dock Tab Pill Control
+// MARK: - Bottom Dock Tab Pill Control (Frosted Glass & Specular Capsule)
 
 final class SitePillControl: UIControl {
     var siteId: String = ""
     var onLongPress: ((SitePillControl) -> Void)?
+
+    private let activeGradient = CAGradientLayer()
+    private let haloView = UIView()
     private let dotView = UIView()
+    private let sleepIconView = UIImageView()
     private let titleLabel = UILabel()
+    private let metaBadge = UIView()
+    private let metaLabel = UILabel()
+    private let unreadCornerDot = UIView()
+
+    private var isTabActive: Bool = false
+    private var isTabHibernated: Bool = false
+    private var lastAliveState: String = ""
+    private var hasUnread: Bool = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         translatesAutoresizingMaskIntoConstraints = false
-        layer.cornerRadius = 15
+        layer.cornerRadius = 17
         layer.cornerCurve = .continuous
 
+        activeGradient.startPoint = CGPoint(x: 0.0, y: 0.0)
+        activeGradient.endPoint = CGPoint(x: 1.0, y: 1.0)
+        activeGradient.cornerRadius = 17
+        activeGradient.cornerCurve = .continuous
+        activeGradient.isHidden = true
+        layer.insertSublayer(activeGradient, at: 0)
+
+        haloView.translatesAutoresizingMaskIntoConstraints = false
+        haloView.layer.cornerRadius = 6
+        haloView.isUserInteractionEnabled = false
+        addSubview(haloView)
+
         dotView.translatesAutoresizingMaskIntoConstraints = false
-        dotView.layer.cornerRadius = 3.5
+        dotView.layer.cornerRadius = 3.25
         dotView.isUserInteractionEnabled = false
-        addSubview(dotView)
+        haloView.addSubview(dotView)
+
+        sleepIconView.translatesAutoresizingMaskIntoConstraints = false
+        let moonCfg = UIImage.SymbolConfiguration(pointSize: 10.5, weight: .bold)
+        sleepIconView.image = UIImage(systemName: "moon.zzz.fill", withConfiguration: moonCfg)
+        sleepIconView.contentMode = .scaleAspectFit
+        sleepIconView.isHidden = true
+        sleepIconView.isUserInteractionEnabled = false
+        addSubview(sleepIconView)
 
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.isUserInteractionEnabled = false
-        addSubview(titleLabel)
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        metaBadge.translatesAutoresizingMaskIntoConstraints = false
+        metaBadge.layer.cornerRadius = 5.5
+        metaBadge.layer.cornerCurve = .continuous
+        metaBadge.isUserInteractionEnabled = false
+
+        metaLabel.translatesAutoresizingMaskIntoConstraints = false
+        metaLabel.font = .monospacedDigitSystemFont(ofSize: 9.5, weight: .bold)
+        metaLabel.isUserInteractionEnabled = false
+        metaLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        metaBadge.addSubview(metaLabel)
+
+        let rowStack = UIStackView(arrangedSubviews: [titleLabel, metaBadge])
+        rowStack.translatesAutoresizingMaskIntoConstraints = false
+        rowStack.axis = .horizontal
+        rowStack.alignment = .center
+        rowStack.spacing = 5
+        rowStack.isUserInteractionEnabled = false
+        addSubview(rowStack)
+
+        unreadCornerDot.translatesAutoresizingMaskIntoConstraints = false
+        unreadCornerDot.backgroundColor = .systemRed
+        unreadCornerDot.layer.cornerRadius = 4.25
+        unreadCornerDot.layer.borderWidth = 1.5
+        unreadCornerDot.isHidden = true
+        unreadCornerDot.isUserInteractionEnabled = false
+        addSubview(unreadCornerDot)
 
         let lp = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
         lp.minimumPressDuration = 0.42
         addGestureRecognizer(lp)
 
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 30),
-            widthAnchor.constraint(lessThanOrEqualToConstant: 176),
-            dotView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            dotView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            dotView.widthAnchor.constraint(equalToConstant: 7),
-            dotView.heightAnchor.constraint(equalToConstant: 7),
-            titleLabel.leadingAnchor.constraint(equalTo: dotView.trailingAnchor, constant: 6),
-            titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -11),
-            titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
+            heightAnchor.constraint(equalToConstant: 34),
+            widthAnchor.constraint(lessThanOrEqualToConstant: 186),
+
+            haloView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 9),
+            haloView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            haloView.widthAnchor.constraint(equalToConstant: 12),
+            haloView.heightAnchor.constraint(equalToConstant: 12),
+
+            dotView.centerXAnchor.constraint(equalTo: haloView.centerXAnchor),
+            dotView.centerYAnchor.constraint(equalTo: haloView.centerYAnchor),
+            dotView.widthAnchor.constraint(equalToConstant: 6.5),
+            dotView.heightAnchor.constraint(equalToConstant: 6.5),
+
+            sleepIconView.centerXAnchor.constraint(equalTo: haloView.centerXAnchor),
+            sleepIconView.centerYAnchor.constraint(equalTo: haloView.centerYAnchor),
+            sleepIconView.widthAnchor.constraint(equalToConstant: 13),
+            sleepIconView.heightAnchor.constraint(equalToConstant: 13),
+
+            rowStack.leadingAnchor.constraint(equalTo: haloView.trailingAnchor, constant: 5.5),
+            rowStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -11),
+            rowStack.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            metaBadge.heightAnchor.constraint(equalToConstant: 16),
+            metaLabel.leadingAnchor.constraint(equalTo: metaBadge.leadingAnchor, constant: 4.5),
+            metaLabel.trailingAnchor.constraint(equalTo: metaBadge.trailingAnchor, constant: -4.5),
+            metaLabel.centerYAnchor.constraint(equalTo: metaBadge.centerYAnchor),
+
+            unreadCornerDot.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            unreadCornerDot.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
+            unreadCornerDot.widthAnchor.constraint(equalToConstant: 8.5),
+            unreadCornerDot.heightAnchor.constraint(equalToConstant: 8.5)
         ])
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        activeGradient.frame = bounds
+        CATransaction.commit()
+    }
+
+    override var isHighlighted: Bool {
+        didSet {
+            UIView.animate(withDuration: 0.13, delay: 0, options: [.allowUserInteraction, .curveEaseOut]) {
+                self.transform = self.isHighlighted ? CGAffineTransform(scaleX: 0.95, y: 0.95) : .identity
+            }
+        }
+    }
+
+    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        applyColors()
     }
 
     @objc private func handleLongPress(_ gr: UILongPressGestureRecognizer) {
@@ -160,48 +262,90 @@ final class SitePillControl: UIControl {
         customBand: Int = 0,
         unread: Bool = false
     ) {
-        let baseTitle = title.isEmpty ? "网页" : title
-        var display: String
-        if hibernated {
-            display = "🌙 \(baseTitle)"
-        } else if unread && !active {
-            display = "🔴 \(baseTitle)"
-        } else {
-            display = baseTitle
-        }
-        if isolated {
-            display += " · 独"
-        }
-        if customBand > 0 {
-            display += " · \(customBand)"
-        }
-        titleLabel.text = display
-        alpha = hibernated ? (active ? 0.92 : 0.65) : 1.0
+        isTabActive = active
+        isTabHibernated = hibernated
+        lastAliveState = aliveState
+        hasUnread = unread
 
-        if active {
-            backgroundColor = hibernated ? .systemIndigo : .systemBlue
+        titleLabel.text = title.isEmpty ? "网页" : title
+
+        var tags: [String] = []
+        if isolated { tags.append("独") }
+        if customBand > 0 { tags.append("\(customBand)") }
+        if tags.isEmpty {
+            metaBadge.isHidden = true
+        } else {
+            metaLabel.text = tags.joined(separator: "·")
+            metaBadge.isHidden = false
+        }
+
+        haloView.isHidden = hibernated
+        sleepIconView.isHidden = !hibernated
+        unreadCornerDot.isHidden = !(unread && !active && !hibernated)
+
+        applyColors()
+    }
+
+    private func applyColors() {
+        let isDark = (traitCollection.userInterfaceStyle == .dark)
+        let hairline = 1.0 / UIScreen.main.scale
+        layer.borderWidth = hairline
+        unreadCornerDot.layer.borderColor = (isDark ? UIColor.black : UIColor.white).cgColor
+
+        if isTabActive {
+            activeGradient.isHidden = false
+            backgroundColor = .clear
+            if isTabHibernated {
+                activeGradient.colors = [
+                    UIColor(red: 0.42, green: 0.36, blue: 0.94, alpha: 1.0).cgColor,
+                    UIColor(red: 0.31, green: 0.24, blue: 0.80, alpha: 1.0).cgColor
+                ]
+            } else {
+                activeGradient.colors = [
+                    UIColor(red: 0.16, green: 0.48, blue: 0.98, alpha: 1.0).cgColor,
+                    UIColor(red: 0.29, green: 0.31, blue: 0.91, alpha: 1.0).cgColor
+                ]
+            }
+            layer.borderColor = UIColor.white.withAlphaComponent(0.36).cgColor
             titleLabel.textColor = .white
+            metaBadge.backgroundColor = UIColor.white.withAlphaComponent(0.22)
+            metaLabel.textColor = .white
+            sleepIconView.tintColor = UIColor(red: 0.88, green: 0.84, blue: 1.0, alpha: 1.0)
+            alpha = 1.0
         } else {
-            backgroundColor = UIColor.secondarySystemFill.withAlphaComponent(0.85)
-            titleLabel.textColor = hibernated ? .secondaryLabel : .label
+            activeGradient.isHidden = true
+            if isTabHibernated {
+                backgroundColor = UIColor.systemIndigo.withAlphaComponent(isDark ? 0.16 : 0.09)
+                layer.borderColor = UIColor.systemIndigo.withAlphaComponent(isDark ? 0.28 : 0.18).cgColor
+                titleLabel.textColor = .secondaryLabel
+                sleepIconView.tintColor = .systemIndigo
+                alpha = 0.88
+            } else {
+                backgroundColor = UIColor.systemBackground.withAlphaComponent(isDark ? 0.48 : 0.84)
+                layer.borderColor = UIColor.white.withAlphaComponent(isDark ? 0.10 : 0.65).cgColor
+                titleLabel.textColor = .label
+                alpha = 1.0
+            }
+            metaBadge.backgroundColor = UIColor.tertiarySystemFill.withAlphaComponent(0.85)
+            metaLabel.textColor = .secondaryLabel
         }
 
-        if unread && !active && !hibernated {
+        if hasUnread && !isTabActive && !isTabHibernated {
             dotView.backgroundColor = .systemRed
-        } else if hibernated {
-            dotView.backgroundColor = active
-                ? UIColor(red: 0.85, green: 0.78, blue: 1.0, alpha: 1.0)
-                : .systemIndigo
-        } else if aliveState == "OK" || aliveState == "FG" {
-            dotView.backgroundColor = active
-                ? UIColor(red: 0.35, green: 1.0, blue: 0.55, alpha: 1.0)
-                : .systemGreen
-        } else if aliveState == "OVER_MEM" {
+            haloView.backgroundColor = UIColor.systemRed.withAlphaComponent(0.20)
+        } else if lastAliveState == "OK" || lastAliveState == "FG" {
+            let emerald = isTabActive
+                ? UIColor(red: 0.36, green: 1.0, blue: 0.60, alpha: 1.0)
+                : UIColor.systemGreen
+            dotView.backgroundColor = emerald
+            haloView.backgroundColor = emerald.withAlphaComponent(isTabActive ? 0.26 : 0.18)
+        } else if lastAliveState == "OVER_MEM" {
             dotView.backgroundColor = .systemOrange
+            haloView.backgroundColor = UIColor.systemOrange.withAlphaComponent(0.22)
         } else {
-            dotView.backgroundColor = active
-                ? UIColor(white: 1.0, alpha: 0.65)
-                : .tertiaryLabel
+            let neutral = isTabActive ? UIColor(white: 1.0, alpha: 0.72) : UIColor.tertiaryLabel
+            dotView.backgroundColor = neutral
+            haloView.backgroundColor = neutral.withAlphaComponent(0.15)
         }
     }
 }
@@ -247,18 +391,30 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private let webContainerView = UIView()
     private let progressView = UIProgressView(progressViewStyle: .bar)
+
     private let emptyStateView = UIView()
+    private let emptyShadowWrap = UIView()
+    private let emptyGlassCard = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
+
     private let hibernatedStateView = UIView()
+    private let hibernatedShadowWrap = UIView()
+    private let hibernatedGlassCard = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
     private let hibernatedTitleLabel = UILabel()
     private let hibernatedSubLabel = UILabel()
 
+    private let dockAmbientTintView = UIView()
     private var dockBar: UIVisualEffectView!
+    private let dockTopHighlight = UIView()
+    private let tabsTrayView = UIView()
+    private let toolsCapsuleView = UIView()
     private let tabsScrollView = UIScrollView()
     private let tabsStackView = UIStackView()
     private var webBottomToDockConstraint: NSLayoutConstraint!
     private var webBottomToViewConstraint: NSLayoutConstraint!
 
+    private let floatingShadowWrap = UIView()
     private var floatingPill: UIVisualEffectView!
+    private let floatingDotView = UIView()
     private let floatingLabel = UILabel()
     private var floatingTrailingConstraint: NSLayoutConstraint!
     private var floatingBottomConstraint: NSLayoutConstraint!
@@ -334,6 +490,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
         super.traitCollectionDidChange(previousTraitCollection)
+        updateGlassChromeMaterials()
         if let prev = previousTraitCollection,
            traitCollection.hasDifferentColorAppearance(comparedTo: prev) {
             applyAppearanceStyles()
@@ -343,6 +500,24 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         clampFloatingPillPosition()
+        if floatingShadowWrap.bounds.width > 0 {
+            floatingShadowWrap.layer.shadowPath = UIBezierPath(
+                roundedRect: floatingShadowWrap.bounds,
+                cornerRadius: 19
+            ).cgPath
+        }
+        if emptyShadowWrap.bounds.width > 0 {
+            emptyShadowWrap.layer.shadowPath = UIBezierPath(
+                roundedRect: emptyShadowWrap.bounds,
+                cornerRadius: 28
+            ).cgPath
+        }
+        if hibernatedShadowWrap.bounds.width > 0 {
+            hibernatedShadowWrap.layer.shadowPath = UIBezierPath(
+                roundedRect: hibernatedShadowWrap.bounds,
+                cornerRadius: 28
+            ).cgPath
+        }
     }
 
     private func bindRuntimeCallbacks() {
@@ -360,6 +535,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
         runtime.onUpdateAppearance = { [weak self] in
             self?.applyAppearanceStyles()
+            self?.updateGlassChromeMaterials()
             self?.rebuildTabPills()
         }
         runtime.onUpdateTrustedCerts = { [weak self] in
@@ -433,18 +609,18 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
     }
 
-    // MARK: - UIKit Layout (Instant-Switch Web Container + Blur Dock + Floating Pill)
+    // MARK: - UIKit Layout (Instant-Switch Web Container + Sculpted Glass Capsule Dock + Floating Island)
 
     private func makeIconButton(symbol: String, action: Selector) -> UIButton {
         let btn = UIButton(type: .system)
         btn.translatesAutoresizingMaskIntoConstraints = false
-        let cfg = UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+        let cfg = UIImage.SymbolConfiguration(pointSize: 13.5, weight: .semibold)
         btn.setImage(UIImage(systemName: symbol, withConfiguration: cfg), for: .normal)
         btn.tintColor = .label
         btn.addTarget(self, action: action, for: .touchUpInside)
         NSLayoutConstraint.activate([
-            btn.widthAnchor.constraint(equalToConstant: 36),
-            btn.heightAnchor.constraint(equalToConstant: 36)
+            btn.widthAnchor.constraint(equalToConstant: 33),
+            btn.heightAnchor.constraint(equalToConstant: 33)
         ])
         return btn
     }
@@ -459,44 +635,61 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         progressView.isHidden = true
         view.addSubview(progressView)
 
-        dockBar = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterial))
+        dockAmbientTintView.translatesAutoresizingMaskIntoConstraints = false
+        dockAmbientTintView.isUserInteractionEnabled = false
+        view.addSubview(dockAmbientTintView)
+
+        dockBar = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
         dockBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(dockBar)
 
-        let topLine = UIView()
-        topLine.translatesAutoresizingMaskIntoConstraints = false
-        topLine.backgroundColor = .separator
-        dockBar.contentView.addSubview(topLine)
+        dockTopHighlight.translatesAutoresizingMaskIntoConstraints = false
+        dockTopHighlight.isUserInteractionEnabled = false
+        dockBar.contentView.addSubview(dockTopHighlight)
 
         let barRow = UIView()
         barRow.translatesAutoresizingMaskIntoConstraints = false
         dockBar.contentView.addSubview(barRow)
 
+        tabsTrayView.translatesAutoresizingMaskIntoConstraints = false
+        tabsTrayView.layer.cornerRadius = 20
+        tabsTrayView.layer.cornerCurve = .continuous
+        tabsTrayView.clipsToBounds = true
+        barRow.addSubview(tabsTrayView)
+
         tabsScrollView.translatesAutoresizingMaskIntoConstraints = false
         tabsScrollView.showsHorizontalScrollIndicator = false
         tabsScrollView.showsVerticalScrollIndicator = false
         tabsScrollView.contentInsetAdjustmentBehavior = .never
-        barRow.addSubview(tabsScrollView)
+        tabsScrollView.contentInset = UIEdgeInsets(top: 0, left: 3, bottom: 0, right: 3)
+        tabsTrayView.addSubview(tabsScrollView)
 
         tabsStackView.translatesAutoresizingMaskIntoConstraints = false
         tabsStackView.axis = .horizontal
-        tabsStackView.spacing = 8
+        tabsStackView.spacing = 6
         tabsStackView.alignment = .center
         tabsScrollView.addSubview(tabsStackView)
 
+        toolsCapsuleView.translatesAutoresizingMaskIntoConstraints = false
+        toolsCapsuleView.layer.cornerRadius = 19
+        toolsCapsuleView.layer.cornerCurve = .continuous
+        barRow.addSubview(toolsCapsuleView)
+
         let reloadBtn = makeIconButton(symbol: "arrow.clockwise", action: #selector(reloadCurrentSite))
         let settingsBtn = makeIconButton(symbol: "slider.horizontal.3", action: #selector(openManageSheet))
-        let collapseBtn = makeIconButton(symbol: "arrow.down.right.and.arrow.up.left", action: #selector(collapseDockTapped))
+        let collapseBtn = makeIconButton(symbol: "chevron.down", action: #selector(collapseDockTapped))
 
         let rightTools = UIStackView(arrangedSubviews: [reloadBtn, settingsBtn, collapseBtn])
         rightTools.translatesAutoresizingMaskIntoConstraints = false
         rightTools.axis = .horizontal
-        rightTools.spacing = 2
+        rightTools.spacing = 0
         rightTools.alignment = .center
-        barRow.addSubview(rightTools)
+        toolsCapsuleView.addSubview(rightTools)
 
         webBottomToDockConstraint = webContainerView.bottomAnchor.constraint(equalTo: dockBar.topAnchor)
         webBottomToViewConstraint = webContainerView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+
+        let hairline = 1.0 / UIScreen.main.scale
 
         NSLayoutConstraint.activate([
             webContainerView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
@@ -513,24 +706,39 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             dockBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             dockBar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-            topLine.topAnchor.constraint(equalTo: dockBar.contentView.topAnchor),
-            topLine.leadingAnchor.constraint(equalTo: dockBar.contentView.leadingAnchor),
-            topLine.trailingAnchor.constraint(equalTo: dockBar.contentView.trailingAnchor),
-            topLine.heightAnchor.constraint(equalToConstant: 0.5),
+            dockAmbientTintView.topAnchor.constraint(equalTo: dockBar.topAnchor),
+            dockAmbientTintView.leadingAnchor.constraint(equalTo: dockBar.leadingAnchor),
+            dockAmbientTintView.trailingAnchor.constraint(equalTo: dockBar.trailingAnchor),
+            dockAmbientTintView.bottomAnchor.constraint(equalTo: dockBar.bottomAnchor),
 
-            barRow.topAnchor.constraint(equalTo: dockBar.contentView.topAnchor),
+            dockTopHighlight.topAnchor.constraint(equalTo: dockBar.contentView.topAnchor),
+            dockTopHighlight.leadingAnchor.constraint(equalTo: dockBar.contentView.leadingAnchor),
+            dockTopHighlight.trailingAnchor.constraint(equalTo: dockBar.contentView.trailingAnchor),
+            dockTopHighlight.heightAnchor.constraint(equalToConstant: hairline),
+
+            barRow.topAnchor.constraint(equalTo: dockBar.contentView.topAnchor, constant: 4),
             barRow.leadingAnchor.constraint(equalTo: dockBar.contentView.leadingAnchor, constant: 10),
-            barRow.trailingAnchor.constraint(equalTo: dockBar.contentView.trailingAnchor, constant: -8),
-            barRow.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            barRow.trailingAnchor.constraint(equalTo: dockBar.contentView.trailingAnchor, constant: -10),
+            barRow.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -2),
             barRow.heightAnchor.constraint(equalToConstant: 44),
 
-            rightTools.trailingAnchor.constraint(equalTo: barRow.trailingAnchor),
-            rightTools.centerYAnchor.constraint(equalTo: barRow.centerYAnchor),
+            toolsCapsuleView.trailingAnchor.constraint(equalTo: barRow.trailingAnchor),
+            toolsCapsuleView.centerYAnchor.constraint(equalTo: barRow.centerYAnchor),
+            toolsCapsuleView.heightAnchor.constraint(equalToConstant: 38),
 
-            tabsScrollView.leadingAnchor.constraint(equalTo: barRow.leadingAnchor),
-            tabsScrollView.trailingAnchor.constraint(equalTo: rightTools.leadingAnchor, constant: -6),
-            tabsScrollView.topAnchor.constraint(equalTo: barRow.topAnchor),
-            tabsScrollView.bottomAnchor.constraint(equalTo: barRow.bottomAnchor),
+            rightTools.leadingAnchor.constraint(equalTo: toolsCapsuleView.leadingAnchor, constant: 3),
+            rightTools.trailingAnchor.constraint(equalTo: toolsCapsuleView.trailingAnchor, constant: -3),
+            rightTools.centerYAnchor.constraint(equalTo: toolsCapsuleView.centerYAnchor),
+
+            tabsTrayView.leadingAnchor.constraint(equalTo: barRow.leadingAnchor),
+            tabsTrayView.trailingAnchor.constraint(equalTo: toolsCapsuleView.leadingAnchor, constant: -8),
+            tabsTrayView.centerYAnchor.constraint(equalTo: barRow.centerYAnchor),
+            tabsTrayView.heightAnchor.constraint(equalToConstant: 40),
+
+            tabsScrollView.leadingAnchor.constraint(equalTo: tabsTrayView.leadingAnchor),
+            tabsScrollView.trailingAnchor.constraint(equalTo: tabsTrayView.trailingAnchor),
+            tabsScrollView.topAnchor.constraint(equalTo: tabsTrayView.topAnchor),
+            tabsScrollView.bottomAnchor.constraint(equalTo: tabsTrayView.bottomAnchor),
 
             tabsStackView.leadingAnchor.constraint(equalTo: tabsScrollView.contentLayoutGuide.leadingAnchor),
             tabsStackView.trailingAnchor.constraint(equalTo: tabsScrollView.contentLayoutGuide.trailingAnchor),
@@ -539,141 +747,343 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             tabsStackView.heightAnchor.constraint(equalTo: tabsScrollView.frameLayoutGuide.heightAnchor)
         ])
 
+        setupEmptyGlassStateView()
+        setupHibernatedGlassStateView()
+        setupFloatingGlassIsland()
+        updateGlassChromeMaterials()
+    }
+
+    private func setupEmptyGlassStateView() {
         emptyStateView.translatesAutoresizingMaskIntoConstraints = false
+        emptyStateView.backgroundColor = .secondarySystemBackground
         webContainerView.addSubview(emptyStateView)
+
+        let orbA = UIView()
+        orbA.translatesAutoresizingMaskIntoConstraints = false
+        orbA.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.11)
+        orbA.layer.cornerRadius = 100
+        orbA.isUserInteractionEnabled = false
+        emptyStateView.addSubview(orbA)
+
+        let orbB = UIView()
+        orbB.translatesAutoresizingMaskIntoConstraints = false
+        orbB.backgroundColor = UIColor.systemIndigo.withAlphaComponent(0.10)
+        orbB.layer.cornerRadius = 115
+        orbB.isUserInteractionEnabled = false
+        emptyStateView.addSubview(orbB)
+
+        emptyShadowWrap.translatesAutoresizingMaskIntoConstraints = false
+        emptyShadowWrap.layer.shadowColor = UIColor.black.cgColor
+        emptyShadowWrap.layer.shadowOpacity = 0.10
+        emptyShadowWrap.layer.shadowRadius = 24
+        emptyShadowWrap.layer.shadowOffset = CGSize(width: 0, height: 8)
+        emptyStateView.addSubview(emptyShadowWrap)
+
+        emptyGlassCard.translatesAutoresizingMaskIntoConstraints = false
+        emptyGlassCard.layer.cornerRadius = 28
+        emptyGlassCard.layer.cornerCurve = .continuous
+        emptyGlassCard.clipsToBounds = true
+        emptyShadowWrap.addSubview(emptyGlassCard)
+
+        let medallion = JWSquircleAvatarView(frame: .zero)
+        medallion.configureWithSymbol(
+            "square.stack.3d.up.fill",
+            topColor: UIColor(red: 0.16, green: 0.49, blue: 0.98, alpha: 1.0),
+            bottomColor: UIColor(red: 0.32, green: 0.28, blue: 0.90, alpha: 1.0),
+            pointSize: 25
+        )
+        emptyGlassCard.contentView.addSubview(medallion)
 
         let emptyTitle = UILabel()
         emptyTitle.translatesAutoresizingMaskIntoConstraints = false
-        emptyTitle.text = "JetWeb 多合一常驻容器"
+        emptyTitle.text = "JetWeb 常驻工作台"
         emptyTitle.font = .systemFont(ofSize: 20, weight: .bold)
         emptyTitle.textAlignment = .center
-        emptyStateView.addSubview(emptyTitle)
+        emptyGlassCard.contentView.addSubview(emptyTitle)
 
         let emptySub = UILabel()
         emptySub.translatesAutoresizingMaskIntoConstraints = false
-        emptySub.text = "把常用的桌面级 WebApp 放进同一容器：\n秒切不白屏、同站多账号独立空间、分档保活与一键休眠"
-        emptySub.font = .systemFont(ofSize: 14)
+        emptySub.text = "将常用桌面级 WebApp 放进同一容器：\n0ms 秒切不白屏 · 独立多账号空间 · 分档保活与休眠"
+        emptySub.font = .systemFont(ofSize: 13.5)
         emptySub.textColor = .secondaryLabel
         emptySub.numberOfLines = 0
         emptySub.textAlignment = .center
-        emptyStateView.addSubview(emptySub)
+        emptyGlassCard.contentView.addSubview(emptySub)
 
         let addFirstBtn = UIButton(type: .system)
         addFirstBtn.translatesAutoresizingMaskIntoConstraints = false
         var btnCfg = UIButton.Configuration.filled()
         btnCfg.title = "添加第一个常驻 WebApp"
+        btnCfg.image = UIImage(systemName: "plus.circle.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .bold))
+        btnCfg.imagePadding = 6
         btnCfg.cornerStyle = .capsule
-        btnCfg.contentInsets = NSDirectionalEdgeInsets(top: 11, leading: 22, bottom: 11, trailing: 22)
+        btnCfg.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 24, bottom: 12, trailing: 24)
         addFirstBtn.configuration = btnCfg
         addFirstBtn.addTarget(self, action: #selector(openManageSheet), for: .touchUpInside)
-        emptyStateView.addSubview(addFirstBtn)
+        emptyGlassCard.contentView.addSubview(addFirstBtn)
 
         NSLayoutConstraint.activate([
-            emptyStateView.centerXAnchor.constraint(equalTo: webContainerView.centerXAnchor),
-            emptyStateView.centerYAnchor.constraint(equalTo: webContainerView.centerYAnchor),
-            emptyStateView.leadingAnchor.constraint(greaterThanOrEqualTo: webContainerView.leadingAnchor, constant: 28),
-            emptyStateView.trailingAnchor.constraint(lessThanOrEqualTo: webContainerView.trailingAnchor, constant: -28),
+            emptyStateView.topAnchor.constraint(equalTo: webContainerView.topAnchor),
+            emptyStateView.leadingAnchor.constraint(equalTo: webContainerView.leadingAnchor),
+            emptyStateView.trailingAnchor.constraint(equalTo: webContainerView.trailingAnchor),
+            emptyStateView.bottomAnchor.constraint(equalTo: webContainerView.bottomAnchor),
 
-            emptyTitle.topAnchor.constraint(equalTo: emptyStateView.topAnchor),
-            emptyTitle.leadingAnchor.constraint(equalTo: emptyStateView.leadingAnchor),
-            emptyTitle.trailingAnchor.constraint(equalTo: emptyStateView.trailingAnchor),
+            orbA.widthAnchor.constraint(equalToConstant: 200),
+            orbA.heightAnchor.constraint(equalToConstant: 200),
+            orbA.centerXAnchor.constraint(equalTo: emptyStateView.centerXAnchor, constant: -75),
+            orbA.centerYAnchor.constraint(equalTo: emptyStateView.centerYAnchor, constant: -95),
 
-            emptySub.topAnchor.constraint(equalTo: emptyTitle.bottomAnchor, constant: 10),
-            emptySub.leadingAnchor.constraint(equalTo: emptyStateView.leadingAnchor),
-            emptySub.trailingAnchor.constraint(equalTo: emptyStateView.trailingAnchor),
+            orbB.widthAnchor.constraint(equalToConstant: 230),
+            orbB.heightAnchor.constraint(equalToConstant: 230),
+            orbB.centerXAnchor.constraint(equalTo: emptyStateView.centerXAnchor, constant: 80),
+            orbB.centerYAnchor.constraint(equalTo: emptyStateView.centerYAnchor, constant: 95),
 
-            addFirstBtn.topAnchor.constraint(equalTo: emptySub.bottomAnchor, constant: 20),
-            addFirstBtn.centerXAnchor.constraint(equalTo: emptyStateView.centerXAnchor),
-            addFirstBtn.bottomAnchor.constraint(equalTo: emptyStateView.bottomAnchor)
+            emptyShadowWrap.centerXAnchor.constraint(equalTo: emptyStateView.centerXAnchor),
+            emptyShadowWrap.centerYAnchor.constraint(equalTo: emptyStateView.centerYAnchor),
+            emptyShadowWrap.leadingAnchor.constraint(greaterThanOrEqualTo: emptyStateView.leadingAnchor, constant: 24),
+            emptyShadowWrap.trailingAnchor.constraint(lessThanOrEqualTo: emptyStateView.trailingAnchor, constant: -24),
+            emptyShadowWrap.widthAnchor.constraint(lessThanOrEqualToConstant: 390),
+
+            emptyGlassCard.topAnchor.constraint(equalTo: emptyShadowWrap.topAnchor),
+            emptyGlassCard.leadingAnchor.constraint(equalTo: emptyShadowWrap.leadingAnchor),
+            emptyGlassCard.trailingAnchor.constraint(equalTo: emptyShadowWrap.trailingAnchor),
+            emptyGlassCard.bottomAnchor.constraint(equalTo: emptyShadowWrap.bottomAnchor),
+
+            medallion.topAnchor.constraint(equalTo: emptyGlassCard.contentView.topAnchor, constant: 28),
+            medallion.centerXAnchor.constraint(equalTo: emptyGlassCard.contentView.centerXAnchor),
+            medallion.widthAnchor.constraint(equalToConstant: 58),
+            medallion.heightAnchor.constraint(equalToConstant: 58),
+
+            emptyTitle.topAnchor.constraint(equalTo: medallion.bottomAnchor, constant: 16),
+            emptyTitle.leadingAnchor.constraint(equalTo: emptyGlassCard.contentView.leadingAnchor, constant: 22),
+            emptyTitle.trailingAnchor.constraint(equalTo: emptyGlassCard.contentView.trailingAnchor, constant: -22),
+
+            emptySub.topAnchor.constraint(equalTo: emptyTitle.bottomAnchor, constant: 9),
+            emptySub.leadingAnchor.constraint(equalTo: emptyGlassCard.contentView.leadingAnchor, constant: 22),
+            emptySub.trailingAnchor.constraint(equalTo: emptyGlassCard.contentView.trailingAnchor, constant: -22),
+
+            addFirstBtn.topAnchor.constraint(equalTo: emptySub.bottomAnchor, constant: 22),
+            addFirstBtn.centerXAnchor.constraint(equalTo: emptyGlassCard.contentView.centerXAnchor),
+            addFirstBtn.bottomAnchor.constraint(equalTo: emptyGlassCard.contentView.bottomAnchor, constant: -26)
         ])
+    }
 
+    private func setupHibernatedGlassStateView() {
         hibernatedStateView.translatesAutoresizingMaskIntoConstraints = false
+        hibernatedStateView.backgroundColor = .secondarySystemBackground
         hibernatedStateView.isHidden = true
         webContainerView.addSubview(hibernatedStateView)
 
+        let orbA = UIView()
+        orbA.translatesAutoresizingMaskIntoConstraints = false
+        orbA.backgroundColor = UIColor.systemIndigo.withAlphaComponent(0.12)
+        orbA.layer.cornerRadius = 105
+        orbA.isUserInteractionEnabled = false
+        hibernatedStateView.addSubview(orbA)
+
+        let orbB = UIView()
+        orbB.translatesAutoresizingMaskIntoConstraints = false
+        orbB.backgroundColor = UIColor.systemTeal.withAlphaComponent(0.09)
+        orbB.layer.cornerRadius = 115
+        orbB.isUserInteractionEnabled = false
+        hibernatedStateView.addSubview(orbB)
+
+        hibernatedShadowWrap.translatesAutoresizingMaskIntoConstraints = false
+        hibernatedShadowWrap.layer.shadowColor = UIColor.black.cgColor
+        hibernatedShadowWrap.layer.shadowOpacity = 0.10
+        hibernatedShadowWrap.layer.shadowRadius = 24
+        hibernatedShadowWrap.layer.shadowOffset = CGSize(width: 0, height: 8)
+        hibernatedStateView.addSubview(hibernatedShadowWrap)
+
+        hibernatedGlassCard.translatesAutoresizingMaskIntoConstraints = false
+        hibernatedGlassCard.layer.cornerRadius = 28
+        hibernatedGlassCard.layer.cornerCurve = .continuous
+        hibernatedGlassCard.clipsToBounds = true
+        hibernatedShadowWrap.addSubview(hibernatedGlassCard)
+
+        let medallion = JWSquircleAvatarView(frame: .zero)
+        medallion.configureWithSymbol(
+            "moon.zzz.fill",
+            topColor: UIColor(red: 0.42, green: 0.35, blue: 0.95, alpha: 1.0),
+            bottomColor: UIColor(red: 0.28, green: 0.22, blue: 0.78, alpha: 1.0),
+            pointSize: 25
+        )
+        hibernatedGlassCard.contentView.addSubview(medallion)
+
+        let zeroMemPill = UIView()
+        zeroMemPill.translatesAutoresizingMaskIntoConstraints = false
+        zeroMemPill.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.14)
+        zeroMemPill.layer.cornerRadius = 10
+        zeroMemPill.layer.cornerCurve = .continuous
+        hibernatedGlassCard.contentView.addSubview(zeroMemPill)
+
+        let zeroMemLabel = UILabel()
+        zeroMemLabel.translatesAutoresizingMaskIntoConstraints = false
+        zeroMemLabel.text = "✓ 已释放网页内存 · 当前占用 0 MB"
+        zeroMemLabel.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
+        zeroMemLabel.textColor = .systemGreen
+        zeroMemPill.addSubview(zeroMemLabel)
+
         hibernatedTitleLabel.translatesAutoresizingMaskIntoConstraints = false
-        hibernatedTitleLabel.text = "🌙 标签已休眠"
+        hibernatedTitleLabel.text = "标签已休眠"
         hibernatedTitleLabel.font = .systemFont(ofSize: 20, weight: .bold)
         hibernatedTitleLabel.numberOfLines = 2
         hibernatedTitleLabel.textAlignment = .center
-        hibernatedStateView.addSubview(hibernatedTitleLabel)
+        hibernatedGlassCard.contentView.addSubview(hibernatedTitleLabel)
 
         hibernatedSubLabel.translatesAutoresizingMaskIntoConstraints = false
-        hibernatedSubLabel.text = "已销毁该标签的网页进程并释放全部运行内存（0 MB）。\n账号 Cookie 与本地登录态完整保留，随时可一键唤醒。"
-        hibernatedSubLabel.font = .systemFont(ofSize: 14)
+        hibernatedSubLabel.text = "已销毁该标签渲染进程并释放全部运行内存。\nCookie 与本地登录态完整保留，随时一键唤醒。"
+        hibernatedSubLabel.font = .systemFont(ofSize: 13.5)
         hibernatedSubLabel.textColor = .secondaryLabel
         hibernatedSubLabel.numberOfLines = 0
         hibernatedSubLabel.textAlignment = .center
-        hibernatedStateView.addSubview(hibernatedSubLabel)
+        hibernatedGlassCard.contentView.addSubview(hibernatedSubLabel)
 
         let wakeBtn = UIButton(type: .system)
         wakeBtn.translatesAutoresizingMaskIntoConstraints = false
         var wakeCfg = UIButton.Configuration.filled()
-        wakeCfg.title = "⚡️ 立即唤醒并加载网页"
+        wakeCfg.title = "立即唤醒并打开网页"
+        wakeCfg.image = UIImage(systemName: "bolt.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .bold))
+        wakeCfg.imagePadding = 6
         wakeCfg.baseBackgroundColor = .systemIndigo
         wakeCfg.cornerStyle = .capsule
-        wakeCfg.contentInsets = NSDirectionalEdgeInsets(top: 11, leading: 24, bottom: 11, trailing: 24)
+        wakeCfg.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 24, bottom: 12, trailing: 24)
         wakeBtn.configuration = wakeCfg
         wakeBtn.addTarget(self, action: #selector(wakeSelectedSiteTapped), for: .touchUpInside)
-        hibernatedStateView.addSubview(wakeBtn)
+        hibernatedGlassCard.contentView.addSubview(wakeBtn)
 
         let hibManageBtn = UIButton(type: .system)
         hibManageBtn.translatesAutoresizingMaskIntoConstraints = false
-        hibManageBtn.setTitle("打开工作台设置", for: .normal)
-        hibManageBtn.titleLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+        var manageCfg = UIButton.Configuration.tinted()
+        manageCfg.title = "打开工作台设置"
+        manageCfg.baseBackgroundColor = .secondaryLabel
+        manageCfg.baseForegroundColor = .label
+        manageCfg.cornerStyle = .capsule
+        manageCfg.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 18, bottom: 8, trailing: 18)
+        hibManageBtn.configuration = manageCfg
         hibManageBtn.addTarget(self, action: #selector(openManageSheet), for: .touchUpInside)
-        hibernatedStateView.addSubview(hibManageBtn)
+        hibernatedGlassCard.contentView.addSubview(hibManageBtn)
 
         NSLayoutConstraint.activate([
-            hibernatedStateView.centerXAnchor.constraint(equalTo: webContainerView.centerXAnchor),
-            hibernatedStateView.centerYAnchor.constraint(equalTo: webContainerView.centerYAnchor),
-            hibernatedStateView.leadingAnchor.constraint(greaterThanOrEqualTo: webContainerView.leadingAnchor, constant: 28),
-            hibernatedStateView.trailingAnchor.constraint(lessThanOrEqualTo: webContainerView.trailingAnchor, constant: -28),
+            hibernatedStateView.topAnchor.constraint(equalTo: webContainerView.topAnchor),
+            hibernatedStateView.leadingAnchor.constraint(equalTo: webContainerView.leadingAnchor),
+            hibernatedStateView.trailingAnchor.constraint(equalTo: webContainerView.trailingAnchor),
+            hibernatedStateView.bottomAnchor.constraint(equalTo: webContainerView.bottomAnchor),
 
-            hibernatedTitleLabel.topAnchor.constraint(equalTo: hibernatedStateView.topAnchor),
-            hibernatedTitleLabel.leadingAnchor.constraint(equalTo: hibernatedStateView.leadingAnchor),
-            hibernatedTitleLabel.trailingAnchor.constraint(equalTo: hibernatedStateView.trailingAnchor),
+            orbA.widthAnchor.constraint(equalToConstant: 210),
+            orbA.heightAnchor.constraint(equalToConstant: 210),
+            orbA.centerXAnchor.constraint(equalTo: hibernatedStateView.centerXAnchor, constant: -75),
+            orbA.centerYAnchor.constraint(equalTo: hibernatedStateView.centerYAnchor, constant: -95),
 
-            hibernatedSubLabel.topAnchor.constraint(equalTo: hibernatedTitleLabel.bottomAnchor, constant: 10),
-            hibernatedSubLabel.leadingAnchor.constraint(equalTo: hibernatedStateView.leadingAnchor),
-            hibernatedSubLabel.trailingAnchor.constraint(equalTo: hibernatedStateView.trailingAnchor),
+            orbB.widthAnchor.constraint(equalToConstant: 230),
+            orbB.heightAnchor.constraint(equalToConstant: 230),
+            orbB.centerXAnchor.constraint(equalTo: hibernatedStateView.centerXAnchor, constant: 80),
+            orbB.centerYAnchor.constraint(equalTo: hibernatedStateView.centerYAnchor, constant: 95),
+
+            hibernatedShadowWrap.centerXAnchor.constraint(equalTo: hibernatedStateView.centerXAnchor),
+            hibernatedShadowWrap.centerYAnchor.constraint(equalTo: hibernatedStateView.centerYAnchor),
+            hibernatedShadowWrap.leadingAnchor.constraint(greaterThanOrEqualTo: hibernatedStateView.leadingAnchor, constant: 24),
+            hibernatedShadowWrap.trailingAnchor.constraint(lessThanOrEqualTo: hibernatedStateView.trailingAnchor, constant: -24),
+            hibernatedShadowWrap.widthAnchor.constraint(lessThanOrEqualToConstant: 396),
+
+            hibernatedGlassCard.topAnchor.constraint(equalTo: hibernatedShadowWrap.topAnchor),
+            hibernatedGlassCard.leadingAnchor.constraint(equalTo: hibernatedShadowWrap.leadingAnchor),
+            hibernatedGlassCard.trailingAnchor.constraint(equalTo: hibernatedShadowWrap.trailingAnchor),
+            hibernatedGlassCard.bottomAnchor.constraint(equalTo: hibernatedShadowWrap.bottomAnchor),
+
+            medallion.topAnchor.constraint(equalTo: hibernatedGlassCard.contentView.topAnchor, constant: 26),
+            medallion.centerXAnchor.constraint(equalTo: hibernatedGlassCard.contentView.centerXAnchor),
+            medallion.widthAnchor.constraint(equalToConstant: 58),
+            medallion.heightAnchor.constraint(equalToConstant: 58),
+
+            zeroMemPill.topAnchor.constraint(equalTo: medallion.bottomAnchor, constant: 13),
+            zeroMemPill.centerXAnchor.constraint(equalTo: hibernatedGlassCard.contentView.centerXAnchor),
+            zeroMemLabel.topAnchor.constraint(equalTo: zeroMemPill.topAnchor, constant: 4),
+            zeroMemLabel.bottomAnchor.constraint(equalTo: zeroMemPill.bottomAnchor, constant: -4),
+            zeroMemLabel.leadingAnchor.constraint(equalTo: zeroMemPill.leadingAnchor, constant: 10),
+            zeroMemLabel.trailingAnchor.constraint(equalTo: zeroMemPill.trailingAnchor, constant: -10),
+
+            hibernatedTitleLabel.topAnchor.constraint(equalTo: zeroMemPill.bottomAnchor, constant: 11),
+            hibernatedTitleLabel.leadingAnchor.constraint(equalTo: hibernatedGlassCard.contentView.leadingAnchor, constant: 22),
+            hibernatedTitleLabel.trailingAnchor.constraint(equalTo: hibernatedGlassCard.contentView.trailingAnchor, constant: -22),
+
+            hibernatedSubLabel.topAnchor.constraint(equalTo: hibernatedTitleLabel.bottomAnchor, constant: 8),
+            hibernatedSubLabel.leadingAnchor.constraint(equalTo: hibernatedGlassCard.contentView.leadingAnchor, constant: 22),
+            hibernatedSubLabel.trailingAnchor.constraint(equalTo: hibernatedGlassCard.contentView.trailingAnchor, constant: -22),
 
             wakeBtn.topAnchor.constraint(equalTo: hibernatedSubLabel.bottomAnchor, constant: 20),
-            wakeBtn.centerXAnchor.constraint(equalTo: hibernatedStateView.centerXAnchor),
+            wakeBtn.centerXAnchor.constraint(equalTo: hibernatedGlassCard.contentView.centerXAnchor),
 
-            hibManageBtn.topAnchor.constraint(equalTo: wakeBtn.bottomAnchor, constant: 12),
-            hibManageBtn.centerXAnchor.constraint(equalTo: hibernatedStateView.centerXAnchor),
-            hibManageBtn.bottomAnchor.constraint(equalTo: hibernatedStateView.bottomAnchor)
+            hibManageBtn.topAnchor.constraint(equalTo: wakeBtn.bottomAnchor, constant: 10),
+            hibManageBtn.centerXAnchor.constraint(equalTo: hibernatedGlassCard.contentView.centerXAnchor),
+            hibManageBtn.bottomAnchor.constraint(equalTo: hibernatedGlassCard.contentView.bottomAnchor, constant: -24)
         ])
+    }
 
-        floatingPill = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
+    private func setupFloatingGlassIsland() {
+        floatingShadowWrap.translatesAutoresizingMaskIntoConstraints = false
+        floatingShadowWrap.layer.shadowColor = UIColor.black.cgColor
+        floatingShadowWrap.layer.shadowOpacity = 0.16
+        floatingShadowWrap.layer.shadowRadius = 14
+        floatingShadowWrap.layer.shadowOffset = CGSize(width: 0, height: 5)
+        floatingShadowWrap.isHidden = true
+        view.addSubview(floatingShadowWrap)
+
+        floatingPill = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterial))
         floatingPill.translatesAutoresizingMaskIntoConstraints = false
-        floatingPill.layer.cornerRadius = 17
+        floatingPill.layer.cornerRadius = 19
         floatingPill.layer.cornerCurve = .continuous
         floatingPill.clipsToBounds = true
-        floatingPill.layer.borderWidth = 0.5
-        floatingPill.layer.borderColor = UIColor.separator.withAlphaComponent(0.5).cgColor
-        floatingPill.isHidden = true
-        view.addSubview(floatingPill)
+        floatingShadowWrap.addSubview(floatingPill)
+
+        floatingDotView.translatesAutoresizingMaskIntoConstraints = false
+        floatingDotView.layer.cornerRadius = 3.75
+        floatingDotView.backgroundColor = .systemGreen
+        floatingDotView.isUserInteractionEnabled = false
 
         floatingLabel.translatesAutoresizingMaskIntoConstraints = false
-        floatingLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        floatingLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
         floatingLabel.textColor = .label
         floatingLabel.lineBreakMode = .byTruncatingTail
-        floatingLabel.text = "◉ 展开"
-        floatingPill.contentView.addSubview(floatingLabel)
+        floatingLabel.text = "展开底栏"
 
-        floatingTrailingConstraint = floatingPill.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -14)
-        floatingBottomConstraint = floatingPill.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -18)
+        let expandChevron = UIImageView(
+            image: UIImage(
+                systemName: "chevron.up",
+                withConfiguration: UIImage.SymbolConfiguration(pointSize: 10.5, weight: .bold)
+            )
+        )
+        expandChevron.tintColor = .secondaryLabel
+        expandChevron.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let pillStack = UIStackView(arrangedSubviews: [floatingDotView, floatingLabel, expandChevron])
+        pillStack.translatesAutoresizingMaskIntoConstraints = false
+        pillStack.axis = .horizontal
+        pillStack.alignment = .center
+        pillStack.spacing = 6.5
+        pillStack.isUserInteractionEnabled = false
+        floatingPill.contentView.addSubview(pillStack)
+
+        floatingTrailingConstraint = floatingShadowWrap.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -14)
+        floatingBottomConstraint = floatingShadowWrap.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -18)
 
         NSLayoutConstraint.activate([
             floatingTrailingConstraint,
             floatingBottomConstraint,
-            floatingPill.heightAnchor.constraint(equalToConstant: 34),
-            floatingPill.widthAnchor.constraint(lessThanOrEqualToConstant: 180),
-            floatingLabel.leadingAnchor.constraint(equalTo: floatingPill.contentView.leadingAnchor, constant: 12),
-            floatingLabel.trailingAnchor.constraint(equalTo: floatingPill.contentView.trailingAnchor, constant: -12),
-            floatingLabel.centerYAnchor.constraint(equalTo: floatingPill.contentView.centerYAnchor)
+            floatingShadowWrap.heightAnchor.constraint(equalToConstant: 38),
+            floatingShadowWrap.widthAnchor.constraint(lessThanOrEqualToConstant: 196),
+
+            floatingPill.topAnchor.constraint(equalTo: floatingShadowWrap.topAnchor),
+            floatingPill.leadingAnchor.constraint(equalTo: floatingShadowWrap.leadingAnchor),
+            floatingPill.trailingAnchor.constraint(equalTo: floatingShadowWrap.trailingAnchor),
+            floatingPill.bottomAnchor.constraint(equalTo: floatingShadowWrap.bottomAnchor),
+
+            floatingDotView.widthAnchor.constraint(equalToConstant: 7.5),
+            floatingDotView.heightAnchor.constraint(equalToConstant: 7.5),
+
+            pillStack.leadingAnchor.constraint(equalTo: floatingPill.contentView.leadingAnchor, constant: 13),
+            pillStack.trailingAnchor.constraint(equalTo: floatingPill.contentView.trailingAnchor, constant: -12),
+            pillStack.centerYAnchor.constraint(equalTo: floatingPill.contentView.centerYAnchor)
         ])
 
         let tapExpand = UITapGestureRecognizer(target: self, action: #selector(expandDockTapped))
@@ -685,6 +1095,72 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         let pan = UIPanGestureRecognizer(target: self, action: #selector(floatingPillPanned(_:)))
         floatingPill.addGestureRecognizer(pan)
+    }
+
+    private func updateGlassChromeMaterials() {
+        let effTrait = view.window?.traitCollection ?? traitCollection
+        let isDark = (overrideUserInterfaceStyle == .dark)
+            || (overrideUserInterfaceStyle == .unspecified && effTrait.userInterfaceStyle == .dark)
+        let hairline = 1.0 / UIScreen.main.scale
+
+        dockAmbientTintView.backgroundColor = isDark
+            ? UIColor(red: 0.08, green: 0.10, blue: 0.18, alpha: 0.45)
+            : UIColor(red: 0.90, green: 0.93, blue: 0.99, alpha: 0.65)
+        dockTopHighlight.backgroundColor = isDark
+            ? UIColor.white.withAlphaComponent(0.12)
+            : UIColor.white.withAlphaComponent(0.75)
+
+        tabsTrayView.backgroundColor = isDark
+            ? UIColor.white.withAlphaComponent(0.06)
+            : UIColor.black.withAlphaComponent(0.045)
+        tabsTrayView.layer.borderWidth = hairline
+        tabsTrayView.layer.borderColor = (isDark
+            ? UIColor.white.withAlphaComponent(0.10)
+            : UIColor.white.withAlphaComponent(0.65)).cgColor
+
+        toolsCapsuleView.backgroundColor = isDark
+            ? UIColor.white.withAlphaComponent(0.08)
+            : UIColor.white.withAlphaComponent(0.70)
+        toolsCapsuleView.layer.borderWidth = hairline
+        toolsCapsuleView.layer.borderColor = (isDark
+            ? UIColor.white.withAlphaComponent(0.12)
+            : UIColor.white.withAlphaComponent(0.72)).cgColor
+
+        let cardBorder = (isDark
+            ? UIColor.white.withAlphaComponent(0.16)
+            : UIColor.white.withAlphaComponent(0.68)).cgColor
+        emptyGlassCard.layer.borderWidth = hairline
+        emptyGlassCard.layer.borderColor = cardBorder
+        hibernatedGlassCard.layer.borderWidth = hairline
+        hibernatedGlassCard.layer.borderColor = cardBorder
+
+        floatingPill.layer.borderWidth = hairline
+        floatingPill.layer.borderColor = (isDark
+            ? UIColor.white.withAlphaComponent(0.20)
+            : UIColor.white.withAlphaComponent(0.75)).cgColor
+    }
+
+    private func updateFloatingIslandVisuals() {
+        let enabled = enabledSites()
+        guard !enabled.isEmpty else {
+            floatingLabel.text = "展开底栏"
+            floatingDotView.backgroundColor = .systemBlue
+            return
+        }
+        let hasOtherUnread = enabled.contains { $0.id != config.selectedSiteId && unreadSiteIds.contains($0.id) && !$0.hibernated }
+        if let cur = site(forId: config.selectedSiteId) {
+            floatingLabel.text = cur.title
+            if hasOtherUnread {
+                floatingDotView.backgroundColor = .systemRed
+            } else if cur.hibernated {
+                floatingDotView.backgroundColor = .systemIndigo
+            } else {
+                floatingDotView.backgroundColor = .systemGreen
+            }
+        } else {
+            floatingLabel.text = "展开底栏"
+            floatingDotView.backgroundColor = hasOtherUnread ? .systemRed : .systemGreen
+        }
     }
 
     private func clampFloatingPillPosition() {
@@ -936,7 +1412,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             emptyStateView.isHidden = false
             hibernatedStateView.isHidden = true
             progressView.isHidden = true
-            floatingLabel.text = "◉ 展开"
+            updateFloatingIslandVisuals()
         } else {
             emptyStateView.isHidden = true
             if let preferred = preferredSelectId, enabled.contains(where: { $0.id == preferred }) {
@@ -1057,7 +1533,6 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             progressView.isHidden = (!targetWV.isLoading || p >= 1.0 || p <= 0.01)
             progressView.setProgress(p, animated: false)
             recoverWebViewIfTerminated(siteId: siteId)
-            floatingLabel.text = "◉ \(curSite.title)"
         } else {
             for (_, wv) in webViews {
                 wv.isHidden = true
@@ -1066,12 +1541,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             progressView.isHidden = true
             let spaceLabel = JWDataStoreHelper.label(for: curSite.dataStoreId)
             let tierText = JWPriorityHelper.tierDescription(customBand: curSite.customBand, globalBand: config.targetBand)
-            hibernatedTitleLabel.text = "🌙 \(curSite.title) 已休眠"
-            hibernatedSubLabel.text = "已销毁该标签的网页进程并释放全部运行内存（0 MB）。\n登录空间（\(spaceLabel)）与保活预设（\(tierText)）完整保留。"
+            hibernatedTitleLabel.text = "\(curSite.title) 已休眠"
+            hibernatedSubLabel.text = "已销毁该标签渲染进程并释放全部运行内存。\n登录空间（\(spaceLabel)）与保活预设（\(tierText)）完整保留。"
             hibernatedStateView.isHidden = false
             webContainerView.bringSubviewToFront(hibernatedStateView)
-            floatingLabel.text = "🌙 \(curSite.title)"
         }
+
+        updateFloatingIslandVisuals()
 
         let isAppActive = (UIApplication.shared.applicationState == .active)
         syncAllWebViewHostStates(appActive: isAppActive)
@@ -1246,94 +1722,175 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         rebuildTabPills()
     }
 
-    private func configureCenteredPopover(_ sheet: UIAlertController, sourceView: UIView?) {
-        guard let pop = sheet.popoverPresentationController else { return }
-        if let sourceView = sourceView {
-            pop.sourceView = sourceView
-            pop.sourceRect = sourceView.bounds
-        } else {
-            pop.sourceView = view
-            pop.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
-            pop.permittedArrowDirections = []
-        }
+    private func presentGlassSheet(_ sheet: JWGlassSheetController) {
+        guard view.window != nil, presentedViewController == nil else { return }
+        let globalMode = JWAppearanceHelper.normalizeGlobal(config.appearanceMode)
+        sheet.overrideUserInterfaceStyle = JWAppearanceHelper.uiStyle(for: globalMode, fallback: .unspecified)
+        present(sheet, animated: false)
     }
 
-    private func showTabLongPressMenu(for targetSite: SiteItem, sourceView: UIView?) {
-        let spaceLabel = JWDataStoreHelper.label(for: targetSite.dataStoreId)
-        let tierText = JWPriorityHelper.tierDescription(customBand: targetSite.customBand, globalBand: config.targetBand)
+    private func buildSiteStatusChips(for targetSite: SiteItem) -> [JWGlassChipItem] {
+        var chips: [JWGlassChipItem] = []
+        let effBand = config.effectiveSiteBand(for: targetSite)
         let wpid = JWBridgeWebViewContentPID(webViews[targetSite.id])
         let st = (wpid > 0) ? lastProcStatuses[wpid] : nil
 
-        let statusDesc: String
         if targetSite.hibernated {
-            statusDesc = "状态：🌙 已休眠（占用 0 MB · 登录态已保留）\n保活等级：\(tierText) · \(spaceLabel)"
+            chips.append(JWGlassChipItem(symbol: "moon.zzz.fill", text: "已休眠 · 0 MB", tint: .systemIndigo))
         } else if let st = st {
-            statusDesc = "运行占用：\(st.footprintMB) MB（当前 \(st.band) 档）\n保活等级：\(tierText) · \(spaceLabel)"
-        } else {
-            statusDesc = "保活等级：\(tierText) · \(spaceLabel)"
+            let memTint: UIColor = st.footprintMB > config.maxMemoryMB ? .systemOrange : .systemGreen
+            chips.append(JWGlassChipItem(symbol: "memorychip", text: "\(st.footprintMB) MB", tint: memTint))
         }
 
-        let sheet = UIAlertController(
-            title: targetSite.title,
-            message: statusDesc,
-            preferredStyle: .actionSheet
-        )
+        let bandTint: UIColor = effBand >= 86 ? .systemOrange : .systemBlue
+        let bandText = targetSite.customBand > 0 ? "专属 \(effBand) 档" : "默认 \(effBand) 档"
+        chips.append(JWGlassChipItem(symbol: "bolt.shield.fill", text: bandText, tint: bandTint))
 
+        if targetSite.isIsolatedStore {
+            chips.append(JWGlassChipItem(symbol: "lock.shield.fill", text: "独立空间", tint: .systemTeal))
+        } else {
+            chips.append(JWGlassChipItem(symbol: "person.2.fill", text: "共享空间", tint: .secondaryLabel))
+        }
+        return chips
+    }
+
+    private func showTabLongPressMenu(for targetSite: SiteItem, sourceView: UIView?) {
+        let effBand = config.effectiveSiteBand(for: targetSite)
+        let tierText = JWPriorityHelper.tierDescription(customBand: targetSite.customBand, globalBand: config.targetBand)
+        let notifyOn = config.notificationsEnabled && targetSite.notifyEnabled
+
+        let tiles: [JWGlassTileItem] = [
+            JWGlassTileItem(
+                symbol: targetSite.hibernated ? "bolt.fill" : "moon.zzz.fill",
+                title: targetSite.hibernated ? "立即唤醒" : "休眠释放",
+                subtitle: targetSite.hibernated ? "恢复加载" : "降至 0 MB",
+                tint: .systemIndigo,
+                isActive: targetSite.hibernated
+            ) { [weak self] in
+                self?.setSiteHibernated(siteId: targetSite.id, hibernated: !targetSite.hibernated)
+            },
+            JWGlassTileItem(
+                symbol: "bolt.shield.fill",
+                title: "保活 \(effBand) 档",
+                subtitle: targetSite.customBand > 0 ? "专属档位" : "跟随全局",
+                tint: .systemBlue,
+                isActive: targetSite.customBand > 0
+            ) { [weak self] in
+                self?.showQuickPriorityPicker(for: targetSite, sourceView: sourceView)
+            },
+            JWGlassTileItem(
+                symbol: notifyOn ? "bell.badge.fill" : "bell.slash.fill",
+                title: notifyOn ? "通知已开" : "通知已关",
+                subtitle: "点击切换",
+                tint: .systemTeal,
+                isActive: notifyOn
+            ) { [weak self] in
+                self?.toggleSiteNotify(siteId: targetSite.id)
+            },
+            JWGlassTileItem(
+                symbol: "person.crop.circle.badge.plus",
+                title: "账号分身",
+                subtitle: "独立登录",
+                tint: .systemPurple,
+                isActive: false
+            ) { [weak self] in
+                self?.promptCloneIsolatedSite(from: targetSite)
+            }
+        ]
+
+        var hibGroup: [JWGlassRowItem] = []
         if targetSite.hibernated {
-            sheet.addAction(UIAlertAction(title: "⚡️ 唤醒并打开此标签", style: .default) { [weak self] _ in
+            hibGroup.append(JWGlassRowItem(
+                symbol: "bolt.fill",
+                tint: .systemIndigo,
+                title: "唤醒并打开此标签",
+                trailingText: "恢复网页"
+            ) { [weak self] in
                 self?.setSiteHibernated(siteId: targetSite.id, hibernated: false)
             })
         } else {
-            sheet.addAction(UIAlertAction(title: "🌙 休眠此标签（释放内存，保留登录态）", style: .default) { [weak self] _ in
+            hibGroup.append(JWGlassRowItem(
+                symbol: "moon.zzz.fill",
+                tint: .systemIndigo,
+                title: "休眠此标签（释放内存）",
+                trailingText: "保留登录态"
+            ) { [weak self] in
                 self?.setSiteHibernated(siteId: targetSite.id, hibernated: true)
             })
         }
 
         let otherAwakeCount = awakeSites().filter { $0.id != targetSite.id }.count
         if otherAwakeCount > 0 {
-            sheet.addAction(UIAlertAction(title: "🧹 休眠其他 \(otherAwakeCount) 个标签（仅留此标签）", style: .default) { [weak self] _ in
+            hibGroup.append(JWGlassRowItem(
+                symbol: "sparkles",
+                tint: .systemBlue,
+                title: "休眠其他 \(otherAwakeCount) 个标签",
+                trailingText: "仅留此页"
+            ) { [weak self] in
                 self?.hibernateOtherSites(keepingSiteId: targetSite.id)
             })
         }
-
         if awakeSites().count >= 2 {
-            sheet.addAction(UIAlertAction(title: "💤 全部标签休眠（释放全部网页内存）", style: .default) { [weak self] _ in
+            hibGroup.append(JWGlassRowItem(
+                symbol: "powersleep",
+                tint: .systemPurple,
+                title: "全部标签一键休眠",
+                trailingText: "清空网页内存"
+            ) { [weak self] in
                 self?.hibernateAllSites()
             })
         }
 
-        sheet.addAction(UIAlertAction(title: "🎯 保活等级：\(tierText)", style: .default) { [weak self] _ in
-            self?.showQuickPriorityPicker(for: targetSite, sourceView: sourceView)
-        })
+        let configGroup: [JWGlassRowItem] = [
+            JWGlassRowItem(
+                symbol: "bolt.shield.fill",
+                tint: .systemBlue,
+                title: "进程保活等级",
+                trailingText: tierText,
+                showsChevron: true
+            ) { [weak self] in
+                self?.showQuickPriorityPicker(for: targetSite, sourceView: sourceView)
+            },
+            JWGlassRowItem(
+                symbol: "lock.shield.fill",
+                tint: .systemTeal,
+                title: "账号存储空间",
+                trailingText: targetSite.isIsolatedStore ? "独立空间" : "默认共享",
+                showsChevron: true
+            ) { [weak self] in
+                self?.showQuickAccountSpacePicker(for: targetSite, sourceView: sourceView)
+            },
+            JWGlassRowItem(
+                symbol: "eye.slash",
+                tint: .secondaryLabel,
+                title: "从底栏暂时隐藏",
+                trailingText: "设置可恢复"
+            ) { [weak self] in
+                guard let self = self,
+                      let idx = self.config.sites.firstIndex(where: { $0.id == targetSite.id }) else { return }
+                self.config.sites[idx].enabled = false
+                self.config.save()
+                JWLog("SITE", "Hid site from dock site=\(targetSite.title)")
+                self.syncWebViewsWithConfig(preferredSelectId: nil)
+                self.applyDockCollapsedState(animated: false)
+            },
+            JWGlassRowItem(
+                symbol: "trash",
+                title: "彻底删除此站点…",
+                isDestructive: true
+            ) { [weak self] in
+                self?.confirmDeleteSite(targetSite)
+            }
+        ]
 
-        let notifyTitle = (config.notificationsEnabled && targetSite.notifyEnabled)
-            ? "🔔 新消息通知：已开启（点击关闭）"
-            : "🔕 新消息通知：已关闭（点击开启）"
-        sheet.addAction(UIAlertAction(title: notifyTitle, style: .default) { [weak self] _ in
-            self?.toggleSiteNotify(siteId: targetSite.id)
-        })
-
-        sheet.addAction(UIAlertAction(title: "复制为独立新账号分身", style: .default) { [weak self] _ in
-            self?.promptCloneIsolatedSite(from: targetSite)
-        })
-
-        sheet.addAction(UIAlertAction(title: "隐藏此标签（移出底栏，设置可恢复）", style: .default) { [weak self] _ in
-            guard let self = self,
-                  let idx = self.config.sites.firstIndex(where: { $0.id == targetSite.id }) else { return }
-            self.config.sites[idx].enabled = false
-            self.config.save()
-            JWLog("SITE", "Hid site from dock site=\(targetSite.title)")
-            self.syncWebViewsWithConfig(preferredSelectId: nil)
-            self.applyDockCollapsedState(animated: false)
-        })
-
-        sheet.addAction(UIAlertAction(title: "彻底删除此站点…", style: .destructive) { [weak self] _ in
-            self?.confirmDeleteSite(targetSite)
-        })
-
-        sheet.addAction(UIAlertAction(title: "取消", style: .cancel))
-        configureCenteredPopover(sheet, sourceView: sourceView)
-        present(sheet, animated: true)
+        let sheet = JWGlassSheetController(
+            icon: .siteTitle(targetSite.title),
+            title: targetSite.title,
+            chips: buildSiteStatusChips(for: targetSite),
+            tiles: tiles,
+            sections: [hibGroup, configGroup]
+        )
+        presentGlassSheet(sheet)
     }
 
     private func applyUpdatedSiteCustomBand(siteId: String, newCustomBand: Int) {
@@ -1353,40 +1910,50 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private func showQuickPriorityPicker(for site: SiteItem, sourceView: UIView?) {
         let curNorm = JWPriorityHelper.normalizeCustomBand(site.customBand)
         let clampedGlobal = JWPriorityHelper.clampSiteBand(config.targetBand)
-        let sheet = UIAlertController(
-            title: "\(site.title) · 进程保活等级",
-            message: "iOS 内存吃紧时按档位从低到高依次回收（范围 30~92 档；网络与主进程自动压阵在最高标签之上 +1/+2 档）。",
-            preferredStyle: .actionSheet
-        )
 
-        let presets: [(band: Int, title: String)] = [
-            (0, "跟随全局默认（\(clampedGlobal) 档）"),
-            (JWConstants.bandPresetCore, "🔥 核心常驻（88 档 · 最后回收）"),
-            (JWConstants.bandPresetFrequent, "⭐️ 常用保活（80 档 · 高优常驻）"),
-            (JWConstants.bandPresetSecondary, "📌 次要备选（70 档 · 优先让路）"),
-            (JWConstants.bandPresetDisposable, "🍃 随用随清（35 档 · 内存紧先清）")
+        let presets: [(band: Int, symbol: String, tint: UIColor, title: String, sub: String)] = [
+            (0, "bolt.shield.fill", .systemBlue, "跟随全局默认", "\(clampedGlobal) 档"),
+            (JWConstants.bandPresetCore, "flame.fill", .systemOrange, "核心常驻（最后回收）", "88 档"),
+            (JWConstants.bandPresetFrequent, "star.fill", .systemYellow, "常用保活（高优常驻）", "80 档"),
+            (JWConstants.bandPresetSecondary, "pin.fill", .systemTeal, "次要备选（优先让路）", "70 档"),
+            (JWConstants.bandPresetDisposable, "leaf.fill", .systemGreen, "随用随清（内存紧先清）", "35 档")
         ]
 
-        for preset in presets {
-            let prefix = (curNorm == preset.band) ? "✓ " : ""
-            sheet.addAction(UIAlertAction(title: prefix + preset.title, style: .default) { [weak self] _ in
-                self?.applyUpdatedSiteCustomBand(siteId: site.id, newCustomBand: preset.band)
-            })
+        let presetRows: [JWGlassRowItem] = presets.map { p in
+            JWGlassRowItem(
+                symbol: p.symbol,
+                tint: p.tint,
+                title: p.title,
+                trailingText: p.sub,
+                isSelected: curNorm == p.band
+            ) { [weak self] in
+                self?.applyUpdatedSiteCustomBand(siteId: site.id, newCustomBand: p.band)
+            }
         }
 
         let isCustomOther = curNorm > 0 && !presets.contains(where: { $0.band == curNorm })
-        let customPrefix = isCustomOther ? "✓ " : ""
-        let customLabel = isCustomOther
-            ? "🎛 自定义精确档位（当前 \(curNorm) 档，点击修改）"
-            : "🎛 手动输入精确档位 (30 ~ 92)…"
-
-        sheet.addAction(UIAlertAction(title: customPrefix + customLabel, style: .default) { [weak self] _ in
+        let customRow = JWGlassRowItem(
+            symbol: "slider.horizontal.3",
+            tint: .systemIndigo,
+            title: isCustomOther ? "自定义精确档位（点击修改）" : "手动输入精确档位 (30~92)…",
+            trailingText: isCustomOther ? "\(curNorm) 档" : "",
+            isSelected: isCustomOther,
+            showsChevron: !isCustomOther
+        ) { [weak self] in
             self?.promptCustomBandInput(for: site)
-        })
+        }
 
-        sheet.addAction(UIAlertAction(title: "取消", style: .cancel))
-        configureCenteredPopover(sheet, sourceView: sourceView)
-        present(sheet, animated: true)
+        let sheet = JWGlassSheetController(
+            icon: .symbol(
+                name: "bolt.shield.fill",
+                top: UIColor(red: 0.16, green: 0.49, blue: 0.98, alpha: 1.0),
+                bottom: UIColor(red: 0.30, green: 0.28, blue: 0.90, alpha: 1.0)
+            ),
+            title: "\(site.title) · 保活等级",
+            subtitle: "内存吃紧按档位从低到高回收 · 网络与主进程自动 +1/+2 压阵",
+            sections: [presetRows, [customRow]]
+        )
+        presentGlassSheet(sheet)
     }
 
     private func promptCustomBandInput(for site: SiteItem) {
@@ -1415,73 +1982,105 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     }
 
     private func showQuickAppearancePicker(for site: SiteItem, sourceView: UIView?) {
-        let sheet = UIAlertController(
-            title: "\(site.title) · 外观模式",
-            message: "遇到深色模式下输入框白底白字时，可切换为「强制浅色」立即生效。",
-            preferredStyle: .actionSheet
-        )
-        let modes = [JWConstants.appearanceInherit, JWConstants.appearanceSystem, JWConstants.appearanceLight, JWConstants.appearanceDark]
         let cur = JWAppearanceHelper.normalizeSite(site.appearanceMode)
-        for m in modes {
-            let prefix = (m == cur) ? "✓ " : ""
-            sheet.addAction(UIAlertAction(title: prefix + JWAppearanceHelper.label(for: m), style: .default) { [weak self] _ in
+        let options: [(mode: String, symbol: String, tint: UIColor)] = [
+            (JWConstants.appearanceInherit, "sparkles", .systemBlue),
+            (JWConstants.appearanceSystem, "circle.lefthalf.filled", .systemTeal),
+            (JWConstants.appearanceLight, "sun.max.fill", .systemOrange),
+            (JWConstants.appearanceDark, "moon.stars.fill", .systemIndigo)
+        ]
+
+        let rows: [JWGlassRowItem] = options.map { opt in
+            JWGlassRowItem(
+                symbol: opt.symbol,
+                tint: opt.tint,
+                title: JWAppearanceHelper.label(for: opt.mode),
+                isSelected: opt.mode == cur
+            ) { [weak self] in
                 guard let self = self,
                       let idx = self.config.sites.firstIndex(where: { $0.id == site.id }) else { return }
-                self.config.sites[idx].appearanceMode = m
+                self.config.sites[idx].appearanceMode = opt.mode
                 self.config.save()
                 self.applyAppearanceStyles()
-            })
+                self.updateGlassChromeMaterials()
+            }
         }
-        sheet.addAction(UIAlertAction(title: "取消", style: .cancel))
-        configureCenteredPopover(sheet, sourceView: sourceView)
-        present(sheet, animated: true)
+
+        let sheet = JWGlassSheetController(
+            icon: .symbol(
+                name: "circle.lefthalf.filled",
+                top: UIColor(red: 0.42, green: 0.35, blue: 0.95, alpha: 1.0),
+                bottom: UIColor(red: 0.18, green: 0.52, blue: 0.94, alpha: 1.0)
+            ),
+            title: "\(site.title) · 外观模式",
+            subtitle: "遇到深色模式下输入框对比度异常时，可切换为「强制浅色」立即生效",
+            sections: [rows]
+        )
+        presentGlassSheet(sheet)
     }
 
     private func showQuickAccountSpacePicker(for site: SiteItem, sourceView: UIView?) {
         let isIso = site.isIsolatedStore
-        let sheet = UIAlertController(
-            title: "\(site.title) · 账号空间",
-            message: "切换为「独立账号空间」后，该标签拥有完全独立的 Cookie 与缓存，可同网站登录另一账号互不串号。",
-            preferredStyle: .actionSheet
-        )
-        sheet.addAction(UIAlertAction(
-            title: isIso ? "✓ 独立账号空间（当前使用）" : "切换为独立账号空间（可登录新账号）",
-            style: .default
-        ) { [weak self] _ in
-            guard let self = self, !isIso,
-                  let idx = self.config.sites.firstIndex(where: { $0.id == site.id }) else { return }
-            self.config.sites[idx].dataStoreId = UUID().uuidString
-            self.config.save()
-            JWLog("STORE", "Quick-switched site=\(site.title) to isolated store")
-            self.syncWebViewsWithConfig(preferredSelectId: site.id)
-        })
-
-        if isIso {
-            sheet.addAction(UIAlertAction(title: "重置为全新独立账号空间（换另一新号）", style: .destructive) { [weak self] _ in
-                guard let self = self,
+        let mainRows: [JWGlassRowItem] = [
+            JWGlassRowItem(
+                symbol: "lock.shield.fill",
+                tint: .systemTeal,
+                title: "独立账号空间",
+                trailingText: isIso ? "当前使用" : "可登录新账号",
+                isSelected: isIso
+            ) { [weak self] in
+                guard let self = self, !isIso,
                       let idx = self.config.sites.firstIndex(where: { $0.id == site.id }) else { return }
                 self.config.sites[idx].dataStoreId = UUID().uuidString
                 self.config.save()
-                JWLog("STORE", "Rotated isolated store for site=\(site.title)")
+                JWLog("STORE", "Quick-switched site=\(site.title) to isolated store")
                 self.syncWebViewsWithConfig(preferredSelectId: site.id)
-            })
+            },
+            JWGlassRowItem(
+                symbol: "person.2.fill",
+                tint: .systemBlue,
+                title: "默认共享空间",
+                trailingText: !isIso ? "当前使用" : "共用默认登录态",
+                isSelected: !isIso
+            ) { [weak self] in
+                guard let self = self, isIso,
+                      let idx = self.config.sites.firstIndex(where: { $0.id == site.id }) else { return }
+                self.config.sites[idx].dataStoreId = JWConstants.dataStoreDefault
+                self.config.save()
+                JWLog("STORE", "Switched site=\(site.title) back to default store")
+                self.syncWebViewsWithConfig(preferredSelectId: site.id)
+            }
+        ]
+
+        var sections: [[JWGlassRowItem]] = [mainRows]
+        if isIso {
+            sections.append([
+                JWGlassRowItem(
+                    symbol: "arrow.triangle.2.circlepath",
+                    title: "重置为全新独立账号空间（换另一新号）",
+                    isDestructive: true
+                ) { [weak self] in
+                    guard let self = self,
+                          let idx = self.config.sites.firstIndex(where: { $0.id == site.id }) else { return }
+                    self.config.sites[idx].dataStoreId = UUID().uuidString
+                    self.config.save()
+                    JWLog("STORE", "Rotated isolated store for site=\(site.title)")
+                    self.syncWebViewsWithConfig(preferredSelectId: site.id)
+                }
+            ])
         }
 
-        sheet.addAction(UIAlertAction(
-            title: !isIso ? "✓ 默认共享空间（当前使用）" : "切回默认共享空间（共用默认登录态）",
-            style: .default
-        ) { [weak self] _ in
-            guard let self = self, isIso,
-                  let idx = self.config.sites.firstIndex(where: { $0.id == site.id }) else { return }
-            self.config.sites[idx].dataStoreId = JWConstants.dataStoreDefault
-            self.config.save()
-            JWLog("STORE", "Switched site=\(site.title) back to default store")
-            self.syncWebViewsWithConfig(preferredSelectId: site.id)
-        })
-
-        sheet.addAction(UIAlertAction(title: "取消", style: .cancel))
-        configureCenteredPopover(sheet, sourceView: sourceView)
-        present(sheet, animated: true)
+        let sheet = JWGlassSheetController(
+            icon: .symbol(
+                name: "lock.shield.fill",
+                top: UIColor(red: 0.08, green: 0.68, blue: 0.62, alpha: 1.0),
+                bottom: UIColor(red: 0.06, green: 0.46, blue: 0.68, alpha: 1.0)
+            ),
+            title: "\(site.title) · 账号空间",
+            subtitle: "独立账号空间拥有专属 Cookie 与缓存，同网站登录多号互不串号",
+            sections: sections
+        )
+        presentGlassSheet(sheet)
     }
 
     private func promptCloneIsolatedSite(from site: SiteItem) {
@@ -1537,64 +2136,140 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         guard let wv = webViews[config.selectedSiteId],
               let curSite = site(forId: config.selectedSiteId) else { return }
         let siteId = curSite.id
-        let spaceLabel = JWDataStoreHelper.label(for: curSite.dataStoreId)
+        let spaceLabel = curSite.isIsolatedStore ? "独立空间" : "默认共享"
         let tierText = JWPriorityHelper.tierDescription(customBand: curSite.customBand, globalBand: config.targetBand)
-        let sheet = UIAlertController(
-            title: "\(curSite.title)（\(spaceLabel)）",
-            message: wv.url?.absoluteString ?? curSite.urlString,
-            preferredStyle: .actionSheet
-        )
-        if wv.canGoBack {
-            sheet.addAction(UIAlertAction(title: "后退", style: .default) { _ in wv.goBack() })
-        }
-        if wv.canGoForward {
-            sheet.addAction(UIAlertAction(title: "前进", style: .default) { _ in wv.goForward() })
-        }
-        sheet.addAction(UIAlertAction(title: "刷新当前页", style: .default) { [weak self] _ in
-            self?.reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: false)
-        })
-        sheet.addAction(UIAlertAction(title: "回到初始首页", style: .default) { [weak self] _ in
-            self?.reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: true)
-        })
-        sheet.addAction(UIAlertAction(title: "🌙 休眠此标签（释放内存，保留登录态）", style: .default) { [weak self] _ in
-            self?.setSiteHibernated(siteId: siteId, hibernated: true)
-        })
-        sheet.addAction(UIAlertAction(title: "🎯 保活等级：\(tierText)", style: .default) { [weak self] _ in
-            self?.showQuickPriorityPicker(for: curSite, sourceView: sourceView)
-        })
-        let curNotifyTitle = (config.notificationsEnabled && curSite.notifyEnabled)
-            ? "🔔 新消息通知：已开启（点击关闭）"
-            : "🔕 新消息通知：已关闭（点击开启）"
-        sheet.addAction(UIAlertAction(title: curNotifyTitle, style: .default) { [weak self] _ in
-            self?.toggleSiteNotify(siteId: siteId)
-        })
-        sheet.addAction(UIAlertAction(title: "复制为独立新账号分身", style: .default) { [weak self] _ in
-            self?.promptCloneIsolatedSite(from: curSite)
-        })
-        sheet.addAction(UIAlertAction(title: "账号空间：\(spaceLabel)", style: .default) { [weak self] _ in
-            self?.showQuickAccountSpacePicker(for: curSite, sourceView: sourceView)
-        })
-        sheet.addAction(UIAlertAction(title: "外观模式：\(JWAppearanceHelper.label(for: curSite.appearanceMode))", style: .default) { [weak self] _ in
-            self?.showQuickAppearancePicker(for: curSite, sourceView: sourceView)
-        })
-        sheet.addAction(UIAlertAction(title: "🧭 在自带浏览器中打开当前页", style: .default) { _ in
-            let urlStr = wv.url?.absoluteString ?? curSite.urlString
-            if let targetURL = URL(string: urlStr) {
-                UIApplication.shared.open(targetURL, options: [:], completionHandler: nil)
+        let curURLStr = wv.url?.absoluteString ?? curSite.urlString
+        let notifyOn = config.notificationsEnabled && curSite.notifyEnabled
+
+        let navTiles: [JWGlassTileItem] = [
+            JWGlassTileItem(
+                symbol: "chevron.backward",
+                title: "后退",
+                isEnabled: wv.canGoBack
+            ) { [weak wv] in
+                wv?.goBack()
+            },
+            JWGlassTileItem(
+                symbol: "chevron.forward",
+                title: "前进",
+                isEnabled: wv.canGoForward
+            ) { [weak wv] in
+                wv?.goForward()
+            },
+            JWGlassTileItem(
+                symbol: "arrow.clockwise",
+                title: "刷新页面",
+                tint: .systemBlue
+            ) { [weak self] in
+                self?.reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: false)
+            },
+            JWGlassTileItem(
+                symbol: "safari.fill",
+                title: "浏览器打开",
+                tint: .systemTeal
+            ) {
+                if let targetURL = URL(string: curURLStr) {
+                    UIApplication.shared.open(targetURL, options: [:], completionHandler: nil)
+                }
             }
-        })
-        sheet.addAction(UIAlertAction(title: "📋 复制当前网址", style: .default) { _ in
-            UIPasteboard.general.string = wv.url?.absoluteString ?? curSite.urlString
-        })
-        sheet.addAction(UIAlertAction(title: "查看运行与诊断日志", style: .default) { [weak self] _ in
-            self?.openLogViewerSheet()
-        })
-        sheet.addAction(UIAlertAction(title: "退出并清理此标签登录态", style: .destructive) { [weak self] _ in
-            self?.clearDataForSite(siteId: siteId)
-        })
-        sheet.addAction(UIAlertAction(title: "取消", style: .cancel))
-        configureCenteredPopover(sheet, sourceView: sourceView)
-        present(sheet, animated: true)
+        ]
+
+        let pageGroup: [JWGlassRowItem] = [
+            JWGlassRowItem(
+                symbol: "house.fill",
+                tint: .systemBlue,
+                title: "回到站点初始首页"
+            ) { [weak self] in
+                self?.reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: true)
+            },
+            JWGlassRowItem(
+                symbol: "doc.on.doc",
+                tint: .systemTeal,
+                title: "复制当前页面网址"
+            ) {
+                UIPasteboard.general.string = curURLStr
+            },
+            JWGlassRowItem(
+                symbol: "moon.zzz.fill",
+                tint: .systemIndigo,
+                title: "休眠此标签（释放内存）",
+                trailingText: "保留登录态"
+            ) { [weak self] in
+                self?.setSiteHibernated(siteId: siteId, hibernated: true)
+            }
+        ]
+
+        let sitePolicyGroup: [JWGlassRowItem] = [
+            JWGlassRowItem(
+                symbol: "bolt.shield.fill",
+                tint: .systemBlue,
+                title: "进程保活等级",
+                trailingText: tierText,
+                showsChevron: true
+            ) { [weak self] in
+                self?.showQuickPriorityPicker(for: curSite, sourceView: sourceView)
+            },
+            JWGlassRowItem(
+                symbol: notifyOn ? "bell.badge.fill" : "bell.slash.fill",
+                tint: notifyOn ? .systemTeal : .secondaryLabel,
+                title: "新消息系统通知",
+                trailingText: notifyOn ? "已开启" : "已关闭"
+            ) { [weak self] in
+                self?.toggleSiteNotify(siteId: siteId)
+            },
+            JWGlassRowItem(
+                symbol: "lock.shield.fill",
+                tint: .systemTeal,
+                title: "账号存储空间",
+                trailingText: spaceLabel,
+                showsChevron: true
+            ) { [weak self] in
+                self?.showQuickAccountSpacePicker(for: curSite, sourceView: sourceView)
+            },
+            JWGlassRowItem(
+                symbol: "person.crop.circle.badge.plus",
+                tint: .systemPurple,
+                title: "复制为独立新账号分身"
+            ) { [weak self] in
+                self?.promptCloneIsolatedSite(from: curSite)
+            },
+            JWGlassRowItem(
+                symbol: "circle.lefthalf.filled",
+                tint: .systemIndigo,
+                title: "外观模式",
+                trailingText: JWAppearanceHelper.label(for: curSite.appearanceMode),
+                showsChevron: true
+            ) { [weak self] in
+                self?.showQuickAppearancePicker(for: curSite, sourceView: sourceView)
+            }
+        ]
+
+        let diagGroup: [JWGlassRowItem] = [
+            JWGlassRowItem(
+                symbol: "doc.text.magnifyingglass",
+                tint: .secondaryLabel,
+                title: "查看运行与诊断日志"
+            ) { [weak self] in
+                self?.openLogViewerSheet()
+            },
+            JWGlassRowItem(
+                symbol: "trash",
+                title: "退出并清理此标签登录态",
+                isDestructive: true
+            ) { [weak self] in
+                self?.clearDataForSite(siteId: siteId)
+            }
+        ]
+
+        let sheet = JWGlassSheetController(
+            icon: .siteTitle(curSite.title),
+            title: curSite.title,
+            subtitle: curURLStr,
+            chips: buildSiteStatusChips(for: curSite),
+            tiles: navTiles,
+            sections: [pageGroup, sitePolicyGroup, diagGroup]
+        )
+        presentGlassSheet(sheet)
     }
 
     @objc private func collapseDockTapped() {
@@ -1619,9 +2294,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             webBottomToDockConstraint.isActive = true
         }
         dockBar.isHidden = collapsed
-        floatingPill.isHidden = !collapsed
+        dockAmbientTintView.isHidden = collapsed
+        floatingShadowWrap.isHidden = !collapsed
+        updateFloatingIslandVisuals()
         if animated {
-            UIView.animate(withDuration: 0.2) {
+            UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseOut]) {
                 self.view.layoutIfNeeded()
             }
         }
@@ -1629,33 +2306,94 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     @objc private func floatingPillLongPressed(_ gr: UILongPressGestureRecognizer) {
         guard gr.state == .began else { return }
-        let sheet = UIAlertController(title: "快速切换常驻 WebApp", message: nil, preferredStyle: .actionSheet)
-        for s in enabledSites() {
-            let selPrefix = (s.id == config.selectedSiteId) ? "✓ " : ""
-            let hibPrefix = s.hibernated ? "🌙 " : (unreadSiteIds.contains(s.id) && s.id != config.selectedSiteId ? "🔴 " : "")
-            let bandSuffix = s.customBand > 0 ? " (\(s.customBand)档)" : ""
-            sheet.addAction(UIAlertAction(title: "\(selPrefix)\(hibPrefix)\(s.title)\(bandSuffix)", style: .default) { [weak self] _ in
+
+        let siteRows: [JWGlassRowItem] = enabledSites().map { s in
+            let isSel = (s.id == config.selectedSiteId)
+            let isUnread = unreadSiteIds.contains(s.id) && !isSel && !s.hibernated
+            let effBand = config.effectiveSiteBand(for: s)
+            let wpid = JWBridgeWebViewContentPID(webViews[s.id])
+            let mb = (wpid > 0) ? (lastProcStatuses[wpid]?.footprintMB ?? 0) : 0
+
+            let symbol: String
+            let tint: UIColor
+            let trail: String
+            if s.hibernated {
+                symbol = "moon.zzz.fill"
+                tint = .systemIndigo
+                trail = "休眠 · 0 MB"
+            } else if isUnread {
+                symbol = "bell.badge.fill"
+                tint = .systemRed
+                trail = "有新消息"
+            } else {
+                symbol = "globe"
+                tint = isSel ? .systemBlue : .systemGreen
+                trail = mb > 0 ? "\(mb) MB · \(effBand)档" : "\(effBand) 档"
+            }
+
+            return JWGlassRowItem(
+                symbol: symbol,
+                tint: tint,
+                title: s.title,
+                trailingText: trail,
+                isSelected: isSel
+            ) { [weak self] in
                 if s.hibernated {
                     self?.setSiteHibernated(siteId: s.id, hibernated: false)
                 } else {
                     self?.selectSite(byId: s.id)
                 }
-            })
+            }
         }
+
+        var toolTiles: [JWGlassTileItem] = [
+            JWGlassTileItem(
+                symbol: "chevron.up",
+                title: "展开底栏",
+                tint: .systemBlue
+            ) { [weak self] in
+                self?.expandDockTapped()
+            },
+            JWGlassTileItem(
+                symbol: "slider.horizontal.3",
+                title: "工作台设置",
+                tint: .systemTeal
+            ) { [weak self] in
+                self?.openManageSheet()
+            },
+            JWGlassTileItem(
+                symbol: "doc.text.magnifyingglass",
+                title: "诊断日志",
+                tint: .secondaryLabel
+            ) { [weak self] in
+                self?.openLogViewerSheet()
+            }
+        ]
         if let cur = site(forId: config.selectedSiteId), cur.enabled && !cur.hibernated {
-            sheet.addAction(UIAlertAction(title: "🌙 休眠当前标签（释放内存）", style: .default) { [weak self] _ in
-                self?.setSiteHibernated(siteId: cur.id, hibernated: true)
-            })
+            toolTiles.insert(
+                JWGlassTileItem(
+                    symbol: "moon.zzz.fill",
+                    title: "休眠当前",
+                    tint: .systemIndigo
+                ) { [weak self] in
+                    self?.setSiteHibernated(siteId: cur.id, hibernated: true)
+                },
+                at: 1
+            )
         }
-        sheet.addAction(UIAlertAction(title: "工作台设置", style: .default) { [weak self] _ in
-            self?.openManageSheet()
-        })
-        sheet.addAction(UIAlertAction(title: "运行与诊断日志", style: .default) { [weak self] _ in
-            self?.openLogViewerSheet()
-        })
-        sheet.addAction(UIAlertAction(title: "取消", style: .cancel))
-        configureCenteredPopover(sheet, sourceView: floatingPill)
-        present(sheet, animated: true)
+
+        let sheet = JWGlassSheetController(
+            icon: .symbol(
+                name: "square.stack.3d.up.fill",
+                top: UIColor(red: 0.16, green: 0.49, blue: 0.98, alpha: 1.0),
+                bottom: UIColor(red: 0.32, green: 0.28, blue: 0.90, alpha: 1.0)
+            ),
+            title: "快速切换常驻 WebApp",
+            subtitle: "点击秒切 · 唤醒休眠标签",
+            tiles: toolTiles,
+            sections: [siteRows]
+        )
+        presentGlassSheet(sheet)
     }
 
     @objc private func floatingPillPanned(_ pan: UIPanGestureRecognizer) {
@@ -2065,9 +2803,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         writeBgEpochToken(bgEpoch)
         endBackgroundGuardTask()
         unreadSiteIds.remove(config.selectedSiteId)
-        if let cur = site(forId: config.selectedSiteId), config.dockCollapsed, !cur.hibernated {
-            floatingLabel.text = "◉ \(cur.title)"
-        }
+        updateFloatingIslandVisuals()
         JWLog("FG", "WillEnterForeground newEpoch=\(bgEpoch) terminatedCount=\(terminatedSiteIds.count)")
         applyAppearanceStyles()
         recoverWebViewIfTerminated(siteId: config.selectedSiteId)
@@ -2403,9 +3139,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             if sid != config.selectedSiteId {
                 unreadSiteIds.insert(sid)
                 rebuildTabPills()
-                if config.dockCollapsed {
-                    floatingLabel.text = "🔴 \(senderSite.title)"
-                }
+                updateFloatingIslandVisuals()
             }
 
             JWNotificationManager.shared.postSiteNotification(
@@ -2601,33 +3335,71 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             return
         }
         let hostLabel = url.host ?? "外部链接"
-        let sheet = UIAlertController(
-            title: "外部链接（\(hostLabel)）",
-            message: url.absoluteString,
-            preferredStyle: .actionSheet
-        )
-        sheet.addAction(UIAlertAction(title: "🧭 跳转自带浏览器打开（支持下载）", style: .default) { _ in
-            UIApplication.shared.open(url, options: [:], completionHandler: nil)
-        })
-        sheet.addAction(UIAlertAction(title: "📋 拷贝链接地址", style: .default) { _ in
-            UIPasteboard.general.string = url.absoluteString
-        })
-        sheet.addAction(UIAlertAction(title: "📄 在当前标签内打开", style: .default) { [weak webView] _ in
-            webView?.load(URLRequest(url: url))
-        })
-        sheet.addAction(UIAlertAction(title: "📤 系统分享…", style: .default) { [weak self] _ in
-            guard let self = self else { return }
-            let act = UIActivityViewController(activityItems: [url], applicationActivities: nil)
-            if let pop = act.popoverPresentationController {
-                pop.sourceView = self.view
-                pop.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY, width: 1, height: 1)
-                pop.permittedArrowDirections = []
+
+        let tiles: [JWGlassTileItem] = [
+            JWGlassTileItem(
+                symbol: "safari.fill",
+                title: "浏览器打开",
+                subtitle: "支持下载",
+                tint: .systemBlue,
+                isActive: true
+            ) {
+                UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            },
+            JWGlassTileItem(
+                symbol: "doc.on.doc",
+                title: "拷贝链接",
+                subtitle: "粘贴访问",
+                tint: .systemTeal
+            ) {
+                UIPasteboard.general.string = url.absoluteString
+            },
+            JWGlassTileItem(
+                symbol: "square.and.arrow.up",
+                title: "系统分享",
+                subtitle: "发送到其他",
+                tint: .systemIndigo
+            ) { [weak self] in
+                guard let self = self else { return }
+                let act = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+                if let pop = act.popoverPresentationController {
+                    pop.sourceView = self.view
+                    pop.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY, width: 1, height: 1)
+                    pop.permittedArrowDirections = []
+                }
+                self.present(act, animated: true)
             }
-            self.present(act, animated: true)
-        })
-        sheet.addAction(UIAlertAction(title: "取消", style: .cancel))
-        configureCenteredPopover(sheet, sourceView: nil)
-        present(sheet, animated: true)
+        ]
+
+        let rows: [JWGlassRowItem] = [
+            JWGlassRowItem(
+                symbol: "safari.fill",
+                tint: .systemBlue,
+                title: "跳转自带浏览器打开（支持下载安装）"
+            ) {
+                UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            },
+            JWGlassRowItem(
+                symbol: "globe",
+                tint: .systemTeal,
+                title: "在当前标签页内直接打开"
+            ) { [weak webView] in
+                webView?.load(URLRequest(url: url))
+            }
+        ]
+
+        let sheet = JWGlassSheetController(
+            icon: .symbol(
+                name: "safari.fill",
+                top: UIColor(red: 0.14, green: 0.56, blue: 0.98, alpha: 1.0),
+                bottom: UIColor(red: 0.18, green: 0.36, blue: 0.88, alpha: 1.0)
+            ),
+            title: "外部链接 · \(hostLabel)",
+            subtitle: url.absoluteString,
+            tiles: tiles,
+            sections: [rows]
+        )
+        presentGlassSheet(sheet)
     }
 
     func webView(
