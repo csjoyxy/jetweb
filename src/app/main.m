@@ -4,9 +4,10 @@
  * 核心设计：
  *   1. 多站点单容器多实例常驻：每个启用站点拥有独立存活的 WKWebView 实例，切换标签 0ms 秒切不重载；
  *      非当前显示标签置 hidden=YES 让 WebKit 自动节流定时器省电，同时由 root 助手 jetwebctl
- *      将其对应的 WebContent / Networking / GPU 进程抬升至保护档位（默认 85，上限 95），防止系统回收白屏。
- *   2. 退后台多段重申：进入后台后开启短时后台任务，在 +0.8s/+3s/+8s/+18s 覆盖系统降档窗口，
- *      将主进程与各标签渲染进程锁回目标保护档位，20s 内结束后台任务实现零持续耗电。
+ *      以断言级优先级 (ASSERTION) 与非致命非活跃内存上限 (memlimit_inactive) 将 WebContent / Networking / GPU
+ *      锁入目标保护档位（默认 85，上限 95），防止 XPC 空闲回收与 HWM 强杀白屏。
+ *   2. 退后台独立短时护航：进入后台后 +1s 内释放 UIBackgroundTask 让主进程干净挂起零耗电，
+ *      同时拉起短时独立 --bg-guard 覆盖主进程挂起、XNU 10s 老化与 WebKit ~32s 断言到期降档窗口，完成后自退。
  *   3. 单标签内存安全阀：超过阈值（默认 450MB）自动放弃保活并退回 30 档，保护 iPhone 11 4GB 内存。
  *   4. 全本地隐私配置：站点名称与 URL 仅保存在手机本地 /var/mobile/Library/JetWeb/config.json。
  */
@@ -372,8 +373,7 @@ static BOOL JWIsSSLError(NSError *error) {
         (maxMB > 0 && self.footprintMB > (NSUInteger)maxMB)) {
         return @"OVER_MEM";
     }
-    if ([self.stateTag isEqualToString:@"OK"] ||
-        [self.stateTag isEqualToString:@"FG"] ||
+    if ([self.stateTag isEqualToString:@"FG"] ||
         self.band >= targetBand ||
         self.band >= 100) {
         return @"OK";
@@ -390,6 +390,7 @@ static BOOL JWIsSSLError(NSError *error) {
 @property (nonatomic, assign) BOOL dockCollapsed;
 @property (nonatomic, copy) NSString *appearanceMode; // system / light / dark
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *trustedCerts; // host -> SHA256 hex
++ (NSString *)effectiveBgEpochPath;
 + (instancetype)loadConfig;
 - (BOOL)saveConfig;
 - (NSString *)effectiveAppearanceModeForSite:(JWSiteItem *)site;
@@ -434,6 +435,10 @@ static BOOL JWIsSSLError(NSError *error) {
     NSString *dir = [self effectiveDir];
     if ([dir isEqualToString:kJWDataDir]) return kJWConfigPath;
     return [dir stringByAppendingPathComponent:@"config.json"];
+}
+
++ (NSString *)effectiveBgEpochPath {
+    return [[self effectiveDir] stringByAppendingPathComponent:@"bg_epoch.txt"];
 }
 
 + (instancetype)loadConfig {
@@ -518,8 +523,14 @@ static pid_t JWCallPIDSelector(id target, NSString *selName) {
     return 0;
 }
 
+static pid_t JWWebViewProvisionalContentPID(WKWebView *webView) {
+    return JWCallPIDSelector(webView, @"_provisionalWebProcessIdentifier");
+}
+
 static pid_t JWWebViewContentPID(WKWebView *webView) {
-    return JWCallPIDSelector(webView, @"_webProcessIdentifier");
+    pid_t pid = JWCallPIDSelector(webView, @"_webProcessIdentifier");
+    if (pid > 0) return pid;
+    return JWWebViewProvisionalContentPID(webView);
 }
 
 static pid_t JWWebViewNetworkingPID(WKWebView *webView) {
@@ -658,6 +669,74 @@ static NSString *JWRunJetWebCtl(NSArray<NSString *> *args, int *exitCodeOut) {
     }
     NSString *text = [[NSString alloc] initWithData:outData encoding:NSUTF8StringEncoding];
     return text ?: @"";
+}
+
+static void JWWriteBgEpochToken(NSUInteger epoch) {
+    NSString *path = [JWAppConfig effectiveBgEpochPath];
+    if (path.length == 0) return;
+    NSString *token = [NSString stringWithFormat:@"%lu\n", (unsigned long)epoch];
+    [token writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void JWSpawnDetachedBgGuard(NSInteger band,
+                                   NSInteger maxMB,
+                                   NSString *epochPath,
+                                   NSUInteger epoch,
+                                   NSArray<NSString *> *pidArgs) {
+    if (pidArgs.count == 0 || epochPath.length == 0) return;
+    NSString *binPath = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"jetwebctl"];
+    const char *cbin = binPath.fileSystemRepresentation;
+    if (!cbin || access(cbin, X_OK) != 0) return;
+
+    NSMutableArray<NSString *> *args = [NSMutableArray arrayWithObjects:
+                                        @"--bg-guard",
+                                        [NSString stringWithFormat:@"%ld", (long)band],
+                                        [NSString stringWithFormat:@"%ld", (long)maxMB],
+                                        epochPath,
+                                        [NSString stringWithFormat:@"%lu", (unsigned long)epoch],
+                                        [NSString stringWithFormat:@"%d", (int)getpid()],
+                                        nil];
+    [args addObjectsFromArray:pidArgs];
+
+    NSUInteger argc = args.count + 1;
+    char **argv = (char **)calloc(argc + 1, sizeof(char *));
+    if (!argv) return;
+    argv[0] = strdup(cbin);
+    for (NSUInteger i = 0; i < args.count; i++) {
+        argv[i + 1] = strdup([args[i] UTF8String] ?: "");
+    }
+    argv[argc] = NULL;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+    posix_spawnattr_set_persona_uid_np(&attr, 0);
+    posix_spawnattr_set_persona_gid_np(&attr, 0);
+
+    pid_t child = 0;
+    int rc = posix_spawn(&child, cbin, &actions, &attr, argv, environ);
+
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+    for (NSUInteger i = 0; i < argc; i++) {
+        free(argv[i]);
+    }
+    free(argv);
+
+    if (rc == 0 && child > 0) {
+        /* Reap short-lived guard child asynchronously on utility queue so zero zombies accumulate */
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            int status = 0;
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+        });
+    }
 }
 
 static NSDictionary<NSNumber *, JWProcStatus *> *JWParseHelperOutput(NSString *output) {
@@ -1187,6 +1266,7 @@ static WKUserScript *JWInputContrastFixScript(void) {
 
 @protocol JWManageViewControllerDelegate <NSObject>
 - (NSDictionary<NSString *, NSNumber *> *)manageCurrentWebPIDsBySiteId;
+- (BOOL)manageIsSiteTerminated:(NSString *)siteId;
 - (void)manageQueryLiveStatusesAsync:(void (^)(NSDictionary<NSNumber *, JWProcStatus *> *statuses))completion;
 - (void)manageDidUpdateConfigAndReloadSites:(BOOL)structureChanged selectedSiteId:(NSString *)siteId;
 - (void)manageDidUpdateAppearanceConfig;
@@ -1226,7 +1306,13 @@ static WKUserScript *JWInputContrastFixScript(void) {
                                                                             target:self
                                                                             action:@selector(addSiteTapped)];
     self.navigationItem.rightBarButtonItems = @[addBtn, self.editButtonItem];
-    [self refreshLiveStatus];
+    __weak typeof(self) weakSelf = self;
+    [self.delegate manageDidRequestApplyProtectionNow:^(NSString *summary) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        self.helperBannerText = summary;
+        [self refreshLiveStatus];
+    }];
 }
 
 - (void)closeTapped {
@@ -1486,8 +1572,12 @@ static WKUserScript *JWInputContrastFixScript(void) {
             JWProcStatus *st = self.liveStatuses[@(selfPid)];
             cell.textLabel.text = [NSString stringWithFormat:@"JetWeb 主进程 (PID %d)", (int)selfPid];
             if (st && st.band >= 0) {
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"档位 %ld · %lu MB", (long)st.band, (unsigned long)st.footprintMB];
-                cell.detailTextLabel.textColor = (st.band >= self.config.targetBand || st.band >= 100) ? UIColor.systemGreenColor : UIColor.secondaryLabelColor;
+                NSString *stateNote = (st.band >= 100) ? @" (前台)" : ((st.band >= self.config.targetBand) ? @" (已保活)" : @"");
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"档位 %ld%@ · %lu MB",
+                                             (long)st.band, stateNote, (unsigned long)st.footprintMB];
+                cell.detailTextLabel.textColor = (st.band >= self.config.targetBand || st.band >= 100)
+                    ? UIColor.systemGreenColor
+                    : UIColor.secondaryLabelColor;
             } else {
                 cell.detailTextLabel.text = @"读取中 / 需 TrollStore 安装";
                 cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
@@ -1503,16 +1593,28 @@ static WKUserScript *JWInputContrastFixScript(void) {
             cell.detailTextLabel.text = @"已暂停";
             cell.detailTextLabel.textColor = UIColor.tertiaryLabelColor;
         } else if (wpid <= 0) {
-            cell.detailTextLabel.text = @"待加载";
-            cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+            if ([self.delegate manageIsSiteTerminated:site.siteId]) {
+                cell.detailTextLabel.text = @"已被回收（切回自动恢复）";
+                cell.detailTextLabel.textColor = UIColor.systemOrangeColor;
+            } else {
+                cell.detailTextLabel.text = @"待加载";
+                cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+            }
         } else {
             JWProcStatus *st = self.liveStatuses[@(wpid)];
             if (st && st.band >= 0) {
                 NSString *badge = [st displayBadgeForWebContentWithTargetBand:self.config.targetBand maxMB:self.config.maxMemoryMB];
                 BOOL overMem = [badge isEqualToString:@"OVER_MEM"];
-                NSString *warn = overMem ? @" (超内存限额)" : @"";
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"PID %d · 档位 %ld · %lu MB%@",
-                                             (int)wpid, (long)st.band, (unsigned long)st.footprintMB, warn];
+                NSString *note = @"";
+                if (overMem) {
+                    note = @" (超内存限额)";
+                } else if (st.band >= 100) {
+                    note = @" (前台)";
+                } else if (st.band >= self.config.targetBand) {
+                    note = @" (已保活)";
+                }
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"PID %d · 档位 %ld%@ · %lu MB",
+                                             (int)wpid, (long)st.band, note, (unsigned long)st.footprintMB];
                 if (overMem) {
                     cell.detailTextLabel.textColor = UIColor.systemOrangeColor;
                 } else if ([badge isEqualToString:@"OK"]) {
@@ -1736,6 +1838,8 @@ static WKUserScript *JWInputContrastFixScript(void) {
 @property (nonatomic, strong) dispatch_queue_t trustEvalQueue;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 @property (nonatomic, assign) NSUInteger bgEpoch;
+@property (nonatomic, strong) NSTimer *fgProtectTimer;
+@property (nonatomic, assign) NSUInteger tabSwitchSeq;
 
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *sessionTrustedCerts;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSURLCredential *> *sessionBasicAuth;
@@ -1764,6 +1868,8 @@ static WKUserScript *JWInputContrastFixScript(void) {
 @implementation JWHubViewController
 
 - (void)dealloc {
+    [_fgProtectTimer invalidate];
+    _fgProtectTimer = nil;
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     for (NSString *sid in self.webViews.allKeys) {
         [self detachObserversForWebView:self.webViews[sid]];
@@ -1782,6 +1888,8 @@ static WKUserScript *JWInputContrastFixScript(void) {
     self.protectQueue = dispatch_queue_create("com.lili.jetweb.protect", DISPATCH_QUEUE_SERIAL);
     self.trustEvalQueue = dispatch_queue_create("com.lili.jetweb.trust", DISPATCH_QUEUE_SERIAL);
     self.bgTask = UIBackgroundTaskInvalid;
+    self.bgEpoch = 1;
+    JWWriteBgEpochToken(self.bgEpoch);
 
     self.sessionTrustedCerts = [NSMutableDictionary dictionary];
     self.sessionBasicAuth = [NSMutableDictionary dictionary];
@@ -1794,6 +1902,7 @@ static WKUserScript *JWInputContrastFixScript(void) {
     [self syncWebViewsWithConfig];
     [self applyAppearanceStyles];
     [self applyDockCollapsedStateAnimated:NO];
+    [self startForegroundProtectTimer];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(appDidEnterBackground)
@@ -2243,7 +2352,7 @@ static WKUserScript *JWInputContrastFixScript(void) {
     }
     [self applyAppearanceStyles];
     [self rebuildTabPills];
-    [self scheduleApplyProtectionAsync:nil];
+    [self schedulePostStateChangeProtectionWaves];
 }
 
 - (void)reloadOrLoadInitialURLForSiteId:(NSString *)siteId {
@@ -2267,7 +2376,14 @@ static WKUserScript *JWInputContrastFixScript(void) {
 }
 
 - (void)recoverWebViewIfTerminatedForSiteId:(NSString *)siteId {
-    if (siteId.length == 0 || ![self.terminatedSiteIds containsObject:siteId]) return;
+    if (siteId.length == 0) return;
+    WKWebView *wv = self.webViews[siteId];
+    if (!wv) return;
+    JWErrorOverlayView *overlay = self.errorOverlays[siteId];
+    BOOL hasVisibleError = (overlay && !overlay.hidden);
+    BOOL markedTerminated = [self.terminatedSiteIds containsObject:siteId];
+    BOOL missingProcess = (JWWebViewContentPID(wv) <= 0 && !wv.isLoading && !hasVisibleError);
+    if (!markedTerminated && !missingProcess) return;
     [self.terminatedSiteIds removeObject:siteId];
     [self reloadOrLoadInitialURLForSiteId:siteId];
 }
@@ -2303,7 +2419,7 @@ static WKUserScript *JWInputContrastFixScript(void) {
     JWSiteItem *curSite = [self siteForId:siteId];
     self.floatingLabel.text = [NSString stringWithFormat:@"◉ %@", curSite.title ?: @"展开"];
     [self rebuildTabPills];
-    [self scheduleApplyProtectionAsync:nil];
+    [self schedulePostStateChangeProtectionWaves];
 }
 
 - (JWSiteItem *)siteForId:(NSString *)siteId {
@@ -2531,6 +2647,10 @@ static WKUserScript *JWInputContrastFixScript(void) {
             [pids addObject:@(wpid)];
             [sharedText appendFormat:@"webcontent_pid=%d site=%@\n", (int)wpid, s.siteId];
         }
+        pid_t pwpid = JWWebViewProvisionalContentPID(wv);
+        if (pwpid > 0) {
+            [pids addObject:@(pwpid)];
+        }
         pid_t npid = JWWebViewNetworkingPID(wv);
         if (npid > 0) {
             [pids addObject:@(npid)];
@@ -2555,6 +2675,51 @@ static void JWWriteSharedSnapshotOnBgQueue(NSString *sharedText) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:kJWPilotDir]) {
         [sharedText writeToFile:kJWSharedPidPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+
+- (void)startForegroundProtectTimer {
+    [self stopForegroundProtectTimer];
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:25.0
+                                                      target:self
+                                                    selector:@selector(fgProtectTimerFired:)
+                                                    userInfo:nil
+                                                     repeats:YES];
+    timer.tolerance = 5.0;
+    self.fgProtectTimer = timer;
+}
+
+- (void)stopForegroundProtectTimer {
+    if (self.fgProtectTimer) {
+        [self.fgProtectTimer invalidate];
+        self.fgProtectTimer = nil;
+    }
+}
+
+- (void)fgProtectTimerFired:(NSTimer *)timer {
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+    [self scheduleApplyProtectionAsync:nil];
+}
+
+/*
+ * 切标签或完成加载后，WebKit 的 ProcessThrottler 会异步延后释放隐藏标签的 Foreground/NearSuspended 断言
+ * （通常在 ~1s 内完成 IPC，最长有 20s prepareToSuspend 超时），需合并跟进重申断言优先级。
+ */
+- (void)schedulePostStateChangeProtectionWaves {
+    self.tabSwitchSeq++;
+    NSUInteger seq = self.tabSwitchSeq;
+    [self scheduleApplyProtectionAsync:nil];
+
+    __weak typeof(self) weakSelf = self;
+    NSArray<NSNumber *> *followUps = @[@1.5, @5.0, @21.5];
+    for (NSNumber *delayNum in followUps) {
+        double sec = delayNum.doubleValue;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || self.tabSwitchSeq != seq) return;
+            if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+            [self scheduleApplyProtectionAsync:nil];
+        });
     }
 }
 
@@ -2599,39 +2764,58 @@ static void JWWriteSharedSnapshotOnBgQueue(NSString *sharedText) {
 }
 
 - (void)appDidEnterBackground {
+    [self stopForegroundProtectTimer];
     [self endBackgroundGuardTask];
+
     UIApplication *app = [UIApplication sharedApplication];
     __weak typeof(self) weakSelf = self;
     self.bgEpoch++;
     NSUInteger epoch = self.bgEpoch;
+    JWWriteBgEpochToken(epoch);
 
     self.bgTask = [app beginBackgroundTaskWithName:@"com.lili.jetweb.jetsamguard" expirationHandler:^{
         [weakSelf endBackgroundGuardTask];
     }];
 
-    /* 覆盖 WebKit 与 RunningBoard 退后台后的数次降档时间点，随后立即结束任务实现零持续后台耗电 */
-    NSArray<NSNumber *> *delays = @[@0.8, @3.0, @8.0, @18.0];
-    for (NSUInteger i = 0; i < delays.count; i++) {
-        double sec = delays[i].doubleValue;
-        BOOL isLast = (i + 1 == delays.count);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) self = weakSelf;
-            if (!self || self.bgEpoch != epoch) return;
-            [self scheduleApplyProtectionAsync:^(NSString *summary) {
-                if (isLast && self.bgEpoch == epoch) {
-                    [self endBackgroundGuardTask];
-                }
-            }];
+    /* 先即时预抬高非活跃内存上限与保底标志 */
+    [self scheduleApplyProtectionAsync:nil];
+
+    /*
+     * +0.6s 收集最新全部 PID 并拉起独立短时 root 护航进程 (--bg-guard)，
+     * +1.0s 立即主动结束 UIBackgroundTask 让 JetWeb 主进程干净挂起（0 后台 CPU 耗电），
+     * 由独立 --bg-guard 覆盖主进程挂起后及 WebKit ~32s FinishTaskInterruptable 断言到期后的降档窗口，随后自退。
+     */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || self.bgEpoch != epoch) return;
+
+        NSString *sharedSnapshot = nil;
+        NSArray<NSString *> *pidArgs = [self collectTargetPIDStringsOnMainThreadWithSnapshot:&sharedSnapshot];
+        NSInteger band = self.config.targetBand;
+        NSInteger maxMB = self.config.maxMemoryMB;
+        NSString *epochPath = [JWAppConfig effectiveBgEpochPath];
+
+        dispatch_async(self.protectQueue, ^{
+            JWWriteSharedSnapshotOnBgQueue(sharedSnapshot);
+            JWSpawnDetachedBgGuard(band, maxMB, epochPath, epoch, pidArgs);
         });
-    }
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (!self2 || self2.bgEpoch != epoch) return;
+            [self2 endBackgroundGuardTask];
+        });
+    });
 }
 
 - (void)appWillEnterForeground {
     self.bgEpoch++;
+    JWWriteBgEpochToken(self.bgEpoch);
     [self endBackgroundGuardTask];
     [self applyAppearanceStyles];
     [self recoverWebViewIfTerminatedForSiteId:self.config.selectedSiteId];
-    [self scheduleApplyProtectionAsync:nil];
+    [self startForegroundProtectTimer];
+    [self schedulePostStateChangeProtectionWaves];
 }
 
 - (void)endBackgroundGuardTask {
@@ -3001,14 +3185,17 @@ static void JWWriteSharedSnapshotOnBgQueue(NSString *sharedText) {
 - (void)webView:(WKWebView *)webView didCommitNavigation:(WKNavigation *)navigation {
     NSString *sid = [self siteIdForWebView:webView];
     if (sid.length > 0) {
+        [self.terminatedSiteIds removeObject:sid];
         [self hideErrorOverlayForSiteId:sid];
     }
+    [self schedulePostStateChangeProtectionWaves];
 }
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     [webView.scrollView.refreshControl endRefreshing];
     NSString *sid = [self siteIdForWebView:webView];
     if (sid.length > 0) {
+        [self.terminatedSiteIds removeObject:sid];
         [self hideErrorOverlayForSiteId:sid];
     }
     if (webView == self.webViews[self.config.selectedSiteId]) {
@@ -3018,7 +3205,7 @@ static void JWWriteSharedSnapshotOnBgQueue(NSString *sharedText) {
                         inFrame:nil
                  inContentWorld:[WKContentWorld defaultClientWorld]
               completionHandler:nil];
-    [self scheduleApplyProtectionAsync:nil];
+    [self schedulePostStateChangeProtectionWaves];
 }
 
 static BOOL JWShouldIgnoreNavigationError(NSError *error) {
@@ -3091,6 +3278,7 @@ completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredentia
         [self reloadOrLoadInitialURLForSiteId:hitId];
     } else {
         [self.terminatedSiteIds addObject:hitId];
+        [self rebuildTabPills];
     }
 }
 
@@ -3206,6 +3394,11 @@ completionHandler:(void (^)(NSString *))completionHandler {
         if (p > 0) map[sid] = @(p);
     }
     return map;
+}
+
+- (BOOL)manageIsSiteTerminated:(NSString *)siteId {
+    if (siteId.length == 0) return NO;
+    return [self.terminatedSiteIds containsObject:siteId];
 }
 
 - (void)manageQueryLiveStatusesAsync:(void (^)(NSDictionary<NSNumber *, JWProcStatus *> *statuses))completion {
