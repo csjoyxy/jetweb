@@ -36,6 +36,11 @@ FOUNDATION_EXPORT void JWBridgePurgeIsolatedDataStore(NSString *uuidString,
                                                       NSString *fallbackRootDir,
                                                       WKWebsiteDataStore * _Nullable liveStore);
 
+FOUNDATION_EXPORT void JWBridgeTrimWebViewMemory(WKWebView * _Nullable webView,
+                                                 BOOL clearBFCache,
+                                                 BOOL suspendMedia);
+FOUNDATION_EXPORT void JWBridgeReleaseHostMemory(void);
+
 FOUNDATION_EXPORT NSDictionary<NSString *, NSString *> *JWBridgeExtractLeafCertInfo(SecTrustRef trust);
 FOUNDATION_EXPORT NSURLCredential *JWBridgeCredentialForAcceptedTrust(SecTrustRef trust);
 

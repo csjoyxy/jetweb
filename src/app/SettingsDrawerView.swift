@@ -5,6 +5,8 @@ final class HubRuntimeState: ObservableObject {
     @Published var liveStatuses: [Int32: ProcStatus] = [:]
     @Published var webPIDsBySiteId: [String: Int32] = [:]
     @Published var terminatedSiteIds: Set<String> = []
+    @Published var detachedSiteIds: Set<String> = []
+    @Published var isTrimmingMemory: Bool = false
     @Published var helperBannerText: String = ""
 
     var onSyncStructure: ((String?) -> Void)?
@@ -12,6 +14,8 @@ final class HubRuntimeState: ObservableObject {
     var onUpdateAppearance: (() -> Void)?
     var onUpdateTrustedCerts: (() -> Void)?
     var onApplyProtectionNow: (() -> Void)?
+    var onTrimMemoryNow: (() -> Void)?
+    var onMemoryPolicyChanged: (() -> Void)?
     var onRefreshLiveStatus: (() -> Void)?
     var onReloadSite: ((String) -> Void)?
     var onClearSiteData: ((String) -> Void)?
@@ -215,6 +219,7 @@ struct SettingsDrawerView: View {
             List {
                 glassDashboardSection
                 sitesSection
+                memoryManagementSection
                 notificationSection
                 policyAndToolsSection
             }
@@ -277,7 +282,7 @@ struct SettingsDrawerView: View {
         return Section(
             footer: Text(
                 runtime.helperBannerText.isEmpty
-                ? "各标签按专属档位分级保活（主容器压阵 \(guardian.hostBand) 档 · 网络/GPU \(guardian.auxBand) 档）；底栏长按标签可打开毛玻璃面板一键休眠释放内存。"
+                ? "各标签按专属档位分级保活（主容器压阵 \(guardian.hostBand) 档 · 网络/GPU \(guardian.auxBand) 档）；支持不重载「无损内存瘦身」与长按休眠释放内存。"
                 : runtime.helperBannerText
             )
         ) {
@@ -329,22 +334,42 @@ struct SettingsDrawerView: View {
 
                         Spacer(minLength: 4)
 
-                        Button {
-                            runtime.onApplyProtectionNow?()
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "arrow.clockwise")
-                                    .font(.system(size: 11, weight: .bold))
-                                Text("提档")
-                                    .font(.system(size: 12, weight: .semibold))
+                        HStack(spacing: 6) {
+                            Button {
+                                runtime.onTrimMemoryNow?()
+                            } label: {
+                                HStack(spacing: 3.5) {
+                                    Image(systemName: "wand.and.stars")
+                                        .font(.system(size: 11, weight: .bold))
+                                    Text(runtime.isTrimmingMemory ? "瘦身中" : "瘦身")
+                                        .font(.system(size: 12, weight: .semibold))
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 6)
+                                .background(Color(JWGlassPalette.chipFill(for: .teal)))
+                                .foregroundColor(Color(JWGlassPalette.foreground(for: .teal)))
+                                .clipShape(Capsule())
                             }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(Color.accentColor.opacity(0.16))
-                            .foregroundColor(.accentColor)
-                            .clipShape(Capsule())
+                            .disabled(runtime.isTrimmingMemory)
+                            .buttonStyle(PlainButtonStyle())
+
+                            Button {
+                                runtime.onApplyProtectionNow?()
+                            } label: {
+                                HStack(spacing: 3.5) {
+                                    Image(systemName: "arrow.clockwise")
+                                        .font(.system(size: 11, weight: .bold))
+                                    Text("提档")
+                                        .font(.system(size: 12, weight: .semibold))
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 6)
+                                .background(Color.accentColor.opacity(0.16))
+                                .foregroundColor(.accentColor)
+                                .clipShape(Capsule())
+                            }
+                            .buttonStyle(PlainButtonStyle())
                         }
-                        .buttonStyle(PlainButtonStyle())
                     }
 
                     HStack(spacing: 8) {
@@ -501,6 +526,7 @@ struct SettingsDrawerView: View {
         } else if let st = runtime.liveStatuses[wpid], st.band >= 0 {
             let badge = st.displayBadge(targetBand: effBand, maxMB: config.maxMemoryMB)
             let overMem = (badge == "OVER_MEM")
+            let isDetached = runtime.detachedSiteIds.contains(site.id)
             let summaryText: String = {
                 if overMem {
                     return "\(st.band)档(超限) · \(st.footprintMB) MB"
@@ -509,7 +535,7 @@ struct SettingsDrawerView: View {
                     return "前台(目标\(effBand)) · \(st.footprintMB) MB"
                 }
                 if st.band >= effBand {
-                    return "\(st.band)档(保活) · \(st.footprintMB) MB"
+                    return "\(st.band)档(\(isDetached ? "离屏" : "保活")) · \(st.footprintMB) MB"
                 }
                 return "\(st.band)/\(effBand)档 · \(st.footprintMB) MB"
             }()
@@ -590,6 +616,8 @@ struct SettingsDrawerView: View {
 
                                         if site.enabled && site.hibernated {
                                             miniTagPill(symbol: "moon.zzz.fill", text: "已休眠", role: .indigo)
+                                        } else if site.enabled && runtime.detachedSiteIds.contains(site.id) {
+                                            miniTagPill(symbol: "sparkles", text: "离屏省显存", role: .teal)
                                         } else if config.notificationsEnabled && site.notifyEnabled && site.enabled {
                                             miniTagPill(symbol: "bell.fill", text: "通知", role: .cobalt)
                                         }
@@ -643,6 +671,65 @@ struct SettingsDrawerView: View {
         .background(Color(JWGlassPalette.chipFill(for: role)))
         .foregroundColor(Color(JWGlassPalette.foreground(for: role)))
         .clipShape(RoundedRectangle(cornerRadius: 5.5, style: .continuous))
+    }
+
+    private var memoryManagementSection: some View {
+        Section(
+            header: Text("主动内存释放与防杀自救"),
+            footer: Text("「无损内存瘦身」通过 WebKit 原生 MemoryPressureHandler 清空历史快照、释放已解码大图位图与空闲脏页归还内核，不重新加载网页、不丢输入草稿与 WebSocket。闲置标签移出窗口树可释放离屏合成显存，并让 35~88 分档优先级在前台也实时生效。")
+        ) {
+            Button {
+                runtime.onTrimMemoryNow?()
+            } label: {
+                HStack {
+                    Label(
+                        runtime.isTrimmingMemory ? "正在无损内存脱水…" : "一键无损内存瘦身（不重载）",
+                        systemImage: "wand.and.stars"
+                    )
+                    .foregroundColor(Color(JWGlassPalette.foreground(for: .teal)))
+                    Spacer()
+                    if totalLiveMemoryMB > 0 {
+                        Text("\(totalLiveMemoryMB) MB")
+                            .font(.footnote.monospacedDigit().weight(.semibold))
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+            .disabled(runtime.isTrimmingMemory)
+
+            Toggle("自动无损内存脱水（超软水位 / 退后台前）", isOn: Binding(
+                get: { config.autoMemoryTrimEnabled },
+                set: { newVal in
+                    config.autoMemoryTrimEnabled = newVal
+                    config.save()
+                    runtime.onMemoryPolicyChanged?()
+                }
+            ))
+
+            Picker("闲置后台标签离屏省显存", selection: Binding(
+                get: { config.idleDetachSeconds },
+                set: { newSec in
+                    config.idleDetachSeconds = newSec
+                    config.save()
+                    runtime.onMemoryPolicyChanged?()
+                }
+            )) {
+                Text("关闭（始终挂载窗口树）").tag(0)
+                Text("闲置 30 秒后（激进省显存）").tag(30)
+                Text("闲置 45 秒后（均衡推荐）").tag(45)
+                Text("闲置 90 秒后").tag(90)
+                Text("闲置 3 分钟后").tag(180)
+            }
+
+            Toggle("极端内存告警自动休眠低档次要标签", isOn: Binding(
+                get: { config.autoHibernateOnCriticalMemory },
+                set: { newVal in
+                    config.autoHibernateOnCriticalMemory = newVal
+                    config.save()
+                    runtime.onMemoryPolicyChanged?()
+                }
+            ))
+        }
     }
 
     private var notificationSection: some View {
@@ -1209,7 +1296,7 @@ enum LogFilterCategory: String, CaseIterable, Identifiable {
         case .all:
             return true
         case .jetsam:
-            return line.contains("[JETSAM]") || line.contains("[BG]") || line.contains("[BG-GUARD]") || line.contains("[FG]") || line.contains("[MEM-WARN]") || line.contains("[BOOT]")
+            return line.contains("[JETSAM]") || line.contains("[BG]") || line.contains("[BG-GUARD]") || line.contains("[FG]") || line.contains("[MEM-WARN]") || line.contains("[MEM-TRIM]") || line.contains("[HIBERNATE]") || line.contains("[BOOT]")
         case .web:
             return line.contains("[WEBKIT]") || line.contains("[NAV]") || line.contains("[NAV-FAIL]") || line.contains("[TERM]") || line.contains("[JS-ERR]")
         case .auth:
@@ -1369,6 +1456,9 @@ struct DiagnosticLogView: View {
         }
         if line.contains("OVER") || line.contains("[JS-ERR]") {
             return .orange
+        }
+        if line.contains("[MEM-TRIM]") || line.contains("[HIBERNATE]") {
+            return Color(JWGlassPalette.foreground(for: .teal))
         }
         if line.contains("[BG-GUARD]") || line.contains("[JETSAM]") {
             return .green

@@ -20,6 +20,10 @@
  *      退后台后独立运行的短时多波次护航模式（覆盖 UIBackgroundTask 结束、XNU 10s 老化降档、
  *      WebKit 20s ProcessThrottler 挂起及 ~32s FinishTaskInterruptable 断言到期窗口），
  *      若检测到用户切回前台（epoch 变更）或宿主退出则 1 秒内立即退出，全部波次完成后自动退出，零常驻耗电。
+ *   5. --trim <gentle|deep> [pid1 pid2 ...]
+ *      以 uid=0 发送 WebKit 原生 MemoryPressureHandler 通知（org.WebKit.memoryWarning / org.WebKit.lowMemory），
+ *      在不重载网页、不丢 DOM/WebSocket/输入草稿的前提下，强制渲染进程同步清理 BFCache、已解码位图缓存、
+ *      字体/CSS/选择器缓冲与空闲 FastMalloc 脏页归还内核，并实测前后物理内存差值。
  */
 
 #include <stdio.h>
@@ -34,6 +38,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#ifdef __APPLE__
+#include <notify.h>
+#endif
 
 #define PROC_PIDPATHINFO_MAXSIZE (4 * 1024)
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
@@ -126,9 +133,12 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 
 #ifdef JW_TEST_BUILD
 extern uid_t jw_test_geteuid(void);
+extern uint32_t jw_test_notify_post(const char *name);
 #define JW_GETEUID() jw_test_geteuid()
+#define JW_NOTIFY_POST(name) jw_test_notify_post(name)
 #else
 #define JW_GETEUID() geteuid()
+#define JW_NOTIFY_POST(name) notify_post(name)
 #endif
 
 typedef enum {
@@ -582,6 +592,105 @@ static void clamp_policy_params(int *band_io, int *max_mb_io) {
     if (*max_mb_io > 1500) *max_mb_io = 1500;
 }
 
+#define JW_MAX_TRIM_PIDS 32
+
+typedef struct {
+    pid_t            pid;
+    jw_target_kind_t kind;
+    uint64_t         before_mb;
+} jw_trim_entry_t;
+
+static int run_memory_trim(int is_deep, int pid_argc, char *pid_argv[]) {
+    jw_trim_entry_t entries[JW_MAX_TRIM_PIDS];
+    int entry_count = 0;
+
+    for (int i = 0; i < pid_argc && entry_count < JW_MAX_TRIM_PIDS; i++) {
+        pid_t pid = 0;
+        int unused_band = 85;
+        if (parse_pid_spec(pid_argv[i], 85, &pid, &unused_band) != 0) continue;
+
+        int dup = 0;
+        for (int k = 0; k < entry_count; k++) {
+            if (entries[k].pid == pid) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) continue;
+
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath((int)pid, path, sizeof(path)) <= 0) {
+            printf("GONE pid=%d\n", (int)pid);
+            continue;
+        }
+        jw_target_kind_t kind = classify_allowed_path(path);
+        if (kind == JW_TARGET_INVALID) {
+            printf("SKIP_PATH pid=%d\n", (int)pid);
+            continue;
+        }
+        entries[entry_count].pid = pid;
+        entries[entry_count].kind = kind;
+        entries[entry_count].before_mb = read_phys_footprint_mb(pid);
+        entry_count++;
+    }
+
+    const char *notif_name = is_deep ? "org.WebKit.lowMemory" : "org.WebKit.memoryWarning";
+    uint32_t nrc = JW_NOTIFY_POST(notif_name);
+    if (nrc != 0) {
+        printf("ERR_NOTIFY code=%u\n", (unsigned)nrc);
+        return 3;
+    }
+
+    if (entry_count > 0) {
+        struct timespec req;
+        req.tv_sec = 0;
+#ifdef JW_TEST_BUILD
+        req.tv_nsec = 10L * 1000L * 1000L;
+#else
+        req.tv_nsec = 300L * 1000L * 1000L;
+#endif
+        while (nanosleep(&req, &req) != 0 && errno == EINTR) {}
+    }
+
+    uint64_t total_before = 0;
+    uint64_t total_after = 0;
+    int alive_count = 0;
+
+    for (int i = 0; i < entry_count; i++) {
+        pid_t pid = entries[i].pid;
+        int pid_i = (int)pid;
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(pid_i, path, sizeof(path)) <= 0) {
+            printf("GONE pid=%d\n", pid_i);
+            continue;
+        }
+        if (classify_allowed_path(path) == JW_TARGET_INVALID) {
+            continue;
+        }
+        int32_t cur = -1;
+        (void)read_priority(pid, &cur);
+        uint64_t after_mb = read_phys_footprint_mb(pid);
+        total_before += entries[i].before_mb;
+        total_after += after_mb;
+        alive_count++;
+        printf("STAT pid=%d kind=%d cur=%d before=%llu fp=%llu\n",
+               pid_i,
+               (int)entries[i].kind,
+               (int)cur,
+               (unsigned long long)entries[i].before_mb,
+               (unsigned long long)after_mb);
+    }
+
+    uint64_t saved = (total_before > total_after) ? (total_before - total_after) : 0;
+    printf("TRIM_SUM mode=%s before=%llu after=%llu saved=%llu count=%d\n",
+           is_deep ? "deep" : "gentle",
+           (unsigned long long)total_before,
+           (unsigned long long)total_after,
+           (unsigned long long)saved,
+           alive_count);
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc >= 2 && strcmp(argv[1], "--probe") == 0) {
         return (JW_GETEUID() == 0) ? 0 : 2;
@@ -615,6 +724,19 @@ int main(int argc, char *argv[]) {
                    pid_i, (int)kind, (int)cur, (unsigned long long)fp);
         }
         return 0;
+    }
+
+    if (argc >= 3 && strcmp(argv[1], "--trim") == 0) {
+        int is_deep = -1;
+        if (strcmp(argv[2], "gentle") == 0) {
+            is_deep = 0;
+        } else if (strcmp(argv[2], "deep") == 0) {
+            is_deep = 1;
+        } else {
+            fprintf(stderr, "ERR invalid_trim_mode mode=%s\n", argv[2]);
+            return 1;
+        }
+        return run_memory_trim(is_deep, argc - 3, &argv[3]);
     }
 
     if (argc >= 5 && strcmp(argv[1], "--apply") == 0) {
@@ -682,7 +804,8 @@ int main(int argc, char *argv[]) {
     }
 
     fprintf(stderr,
-            "Usage: jetwebctl --probe | --query <pids...> | --apply <band> <max_mb> <pids...> | "
+            "Usage: jetwebctl --probe | --query <pids...> | --trim <gentle|deep> [pids...] | "
+            "--apply <band> <max_mb> <pids...> | "
             "--bg-guard <band> <max_mb> <epoch_file> <epoch> <host_pid> <log_file|-> <pids...>\n");
     return 1;
 }

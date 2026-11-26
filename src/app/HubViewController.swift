@@ -369,9 +369,20 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private var terminatedSiteIds: Set<String> = [] {
         didSet { runtime.terminatedSiteIds = terminatedSiteIds }
     }
+    private var detachedSiteIds: Set<String> = [] {
+        didSet { runtime.detachedSiteIds = detachedSiteIds }
+    }
+    private var isTrimmingMemory: Bool = false {
+        didSet { runtime.isTrimmingMemory = isTrimmingMemory }
+    }
     private var lastProcStatuses: [Int32: ProcStatus] = [:] {
         didSet { runtime.liveStatuses = lastProcStatuses }
     }
+    private var lastActiveUptimeBySiteId: [String: TimeInterval] = [:]
+    private var lastStreamingUptimeBySiteId: [String: TimeInterval] = [:]
+    private var lastAutoTrimUptime: TimeInterval = 0
+    private var lastAutoDeepTrimUptime: TimeInterval = 0
+    private var lastMemWarningUptime: TimeInterval = 0
     private var lastLoggedApplyDigest: String = ""
 
     private let protectQueue = DispatchQueue(label: "com.lili.jetweb.protect")
@@ -419,8 +430,15 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private var floatingTrailingConstraint: NSLayoutConstraint!
     private var floatingBottomConstraint: NSLayoutConstraint!
 
+    private let toastShadowWrap = UIView()
+    private var toastPill: UIVisualEffectView!
+    private let toastIconView = UIImageView()
+    private let toastLabel = UILabel()
+    private var toastHideWorkItem: DispatchWorkItem?
+
     deinit {
         fgProtectTimer?.invalidate()
+        toastHideWorkItem?.cancel()
         NotificationCenter.default.removeObserver(self)
         for sid in Array(webViews.keys) {
             teardownWebView(forSiteId: sid)
@@ -506,6 +524,12 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 cornerRadius: 19
             ).cgPath
         }
+        if toastShadowWrap.bounds.width > 0 {
+            toastShadowWrap.layer.shadowPath = UIBezierPath(
+                roundedRect: toastShadowWrap.bounds,
+                cornerRadius: 18
+            ).cgPath
+        }
         if emptyShadowWrap.bounds.width > 0 {
             emptyShadowWrap.layer.shadowPath = UIBezierPath(
                 roundedRect: emptyShadowWrap.bounds,
@@ -552,6 +576,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 self?.runtime.helperBannerText = summary
                 self?.queryLiveStatusesAsync()
             }
+        }
+        runtime.onTrimMemoryNow = { [weak self] in
+            self?.triggerUserMemoryTrim()
+        }
+        runtime.onMemoryPolicyChanged = { [weak self] in
+            guard let self = self else { return }
+            let snap = self.currentLiveMemorySnapshot()
+            self.detachIdleBackgroundWebViewsIfNeeded(totalMemoryMB: snap.totalMB, forceAllUnselected: false)
         }
         runtime.onRefreshLiveStatus = { [weak self] in
             self?.queryLiveStatusesAsync()
@@ -750,6 +782,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         setupEmptyGlassStateView()
         setupHibernatedGlassStateView()
         setupFloatingGlassIsland()
+        setupTopGlassToast()
         updateGlassChromeMaterials()
     }
 
@@ -1099,6 +1132,101 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         floatingPill.addGestureRecognizer(pan)
     }
 
+    private func setupTopGlassToast() {
+        toastShadowWrap.translatesAutoresizingMaskIntoConstraints = false
+        toastShadowWrap.layer.shadowColor = UIColor.black.cgColor
+        toastShadowWrap.layer.shadowOpacity = 0.16
+        toastShadowWrap.layer.shadowRadius = 14
+        toastShadowWrap.layer.shadowOffset = CGSize(width: 0, height: 5)
+        toastShadowWrap.alpha = 0
+        toastShadowWrap.isHidden = true
+        toastShadowWrap.isUserInteractionEnabled = false
+        view.addSubview(toastShadowWrap)
+
+        toastPill = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterial))
+        toastPill.translatesAutoresizingMaskIntoConstraints = false
+        toastPill.layer.cornerRadius = 18
+        toastPill.layer.cornerCurve = .continuous
+        toastPill.clipsToBounds = true
+        toastShadowWrap.addSubview(toastPill)
+
+        toastIconView.translatesAutoresizingMaskIntoConstraints = false
+        toastIconView.contentMode = .scaleAspectFit
+        toastIconView.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        toastLabel.translatesAutoresizingMaskIntoConstraints = false
+        toastLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        toastLabel.textColor = .label
+        toastLabel.numberOfLines = 1
+        toastLabel.lineBreakMode = .byTruncatingTail
+
+        let hStack = UIStackView(arrangedSubviews: [toastIconView, toastLabel])
+        hStack.translatesAutoresizingMaskIntoConstraints = false
+        hStack.axis = .horizontal
+        hStack.alignment = .center
+        hStack.spacing = 6.5
+        toastPill.contentView.addSubview(hStack)
+
+        NSLayoutConstraint.activate([
+            toastShadowWrap.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            toastShadowWrap.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            toastShadowWrap.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 16),
+            toastShadowWrap.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -16),
+            toastShadowWrap.heightAnchor.constraint(equalToConstant: 36),
+
+            toastPill.topAnchor.constraint(equalTo: toastShadowWrap.topAnchor),
+            toastPill.leadingAnchor.constraint(equalTo: toastShadowWrap.leadingAnchor),
+            toastPill.trailingAnchor.constraint(equalTo: toastShadowWrap.trailingAnchor),
+            toastPill.bottomAnchor.constraint(equalTo: toastShadowWrap.bottomAnchor),
+
+            toastIconView.widthAnchor.constraint(equalToConstant: 15),
+            toastIconView.heightAnchor.constraint(equalToConstant: 15),
+
+            hStack.leadingAnchor.constraint(equalTo: toastPill.contentView.leadingAnchor, constant: 13),
+            hStack.trailingAnchor.constraint(equalTo: toastPill.contentView.trailingAnchor, constant: -14),
+            hStack.centerYAnchor.constraint(equalTo: toastPill.contentView.centerYAnchor)
+        ])
+    }
+
+    private func showTopGlassToast(symbol: String, tint: UIColor, text: String) {
+        toastHideWorkItem?.cancel()
+        let cfg = UIImage.SymbolConfiguration(pointSize: 12.5, weight: .bold)
+        toastIconView.image = UIImage(systemName: symbol, withConfiguration: cfg)
+        toastIconView.tintColor = JWGlassPalette.foreground(for: JWGlassPalette.role(for: tint))
+        toastLabel.text = text
+
+        view.bringSubviewToFront(toastShadowWrap)
+        if toastShadowWrap.isHidden {
+            toastShadowWrap.transform = CGAffineTransform(translationX: 0, y: -18)
+            toastShadowWrap.alpha = 0
+            toastShadowWrap.isHidden = false
+        }
+        UIView.animate(
+            withDuration: 0.26,
+            delay: 0,
+            usingSpringWithDamping: 0.84,
+            initialSpringVelocity: 0.5,
+            options: [.beginFromCurrentState, .curveEaseOut]
+        ) {
+            self.toastShadowWrap.alpha = 1.0
+            self.toastShadowWrap.transform = .identity
+        }
+
+        let hideWork = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            UIView.animate(withDuration: 0.22, delay: 0, options: [.beginFromCurrentState, .curveEaseIn]) {
+                self.toastShadowWrap.alpha = 0
+                self.toastShadowWrap.transform = CGAffineTransform(translationX: 0, y: -14)
+            } completion: { finished in
+                if finished && self.toastShadowWrap.alpha < 0.05 {
+                    self.toastShadowWrap.isHidden = true
+                }
+            }
+        }
+        toastHideWorkItem = hideWork
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.8, execute: hideWork)
+    }
+
     private func updateGlassChromeMaterials() {
         let effTrait = view.window?.traitCollection ?? traitCollection
         let isDark = (overrideUserInterfaceStyle == .dark)
@@ -1136,10 +1264,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         hibernatedGlassCard.layer.borderWidth = hairline
         hibernatedGlassCard.layer.borderColor = cardBorder
 
-        floatingPill.layer.borderWidth = hairline
-        floatingPill.layer.borderColor = (isDark
+        let pillBorder = (isDark
             ? UIColor.white.withAlphaComponent(0.20)
             : UIColor.white.withAlphaComponent(0.75)).cgColor
+        floatingPill.layer.borderWidth = hairline
+        floatingPill.layer.borderColor = pillBorder
+        toastPill?.layer.borderWidth = hairline
+        toastPill?.layer.borderColor = pillBorder
     }
 
     private func updateFloatingIslandVisuals() {
@@ -1264,6 +1395,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         cfg.userContentController.addUserScript(WebScripts.scrollAnchorStabilizerScript())
         cfg.userContentController.addUserScript(WebScripts.diagnosticJSErrorScript())
         cfg.userContentController.addUserScript(WebScripts.conversationMonitorScript())
+        cfg.userContentController.addUserScript(WebScripts.memoryReliefHelperScript())
         cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwDiag")
         cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwNotify")
 
@@ -1275,6 +1407,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         wv.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1"
 
         let capturedId = site.id
+        lastActiveUptimeBySiteId[capturedId] = ProcessInfo.processInfo.systemUptime
         progressObservations[capturedId] = wv.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
             guard let self = self, webView === self.webViews[self.config.selectedSiteId] else { return }
             let p = Float(webView.estimatedProgress)
@@ -1289,13 +1422,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             self.lastKnownURLBySiteId[capturedId] = curURL.absoluteString
         }
 
-        webContainerView.insertSubview(wv, belowSubview: emptyStateView)
-        NSLayoutConstraint.activate([
-            wv.topAnchor.constraint(equalTo: webContainerView.topAnchor),
-            wv.leadingAnchor.constraint(equalTo: webContainerView.leadingAnchor),
-            wv.trailingAnchor.constraint(equalTo: webContainerView.trailingAnchor),
-            wv.bottomAnchor.constraint(equalTo: webContainerView.bottomAnchor)
-        ])
+        attachWebViewIfNeeded(wv, forSiteId: capturedId)
 
         let overlay = ErrorOverlayView(frame: .zero)
         overlay.onRetry = { [weak self] in
@@ -1329,6 +1456,92 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         return wv
     }
 
+    private func snapshotRememberedURLIfNeeded(forSiteId siteId: String) {
+        guard !siteId.isEmpty,
+              let curURL = webViews[siteId]?.url,
+              let scheme = curURL.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https") else { return }
+        lastKnownURLBySiteId[siteId] = curURL.absoluteString
+    }
+
+    private func attachWebViewIfNeeded(_ wv: WKWebView, forSiteId siteId: String) {
+        if wv.superview !== webContainerView {
+            if webContainerView.bounds.width > 0 && webContainerView.bounds.height > 0 {
+                wv.frame = webContainerView.bounds
+            }
+            webContainerView.insertSubview(wv, belowSubview: emptyStateView)
+            NSLayoutConstraint.activate([
+                wv.topAnchor.constraint(equalTo: webContainerView.topAnchor),
+                wv.leadingAnchor.constraint(equalTo: webContainerView.leadingAnchor),
+                wv.trailingAnchor.constraint(equalTo: webContainerView.trailingAnchor),
+                wv.bottomAnchor.constraint(equalTo: webContainerView.bottomAnchor)
+            ])
+            webContainerView.layoutIfNeeded()
+        }
+        detachedSiteIds.remove(siteId)
+    }
+
+    @discardableResult
+    private func detachWebViewFromWindow(siteId: String, reason: String) -> Bool {
+        guard siteId != config.selectedSiteId,
+              let wv = webViews[siteId],
+              wv.superview != nil else { return false }
+        snapshotRememberedURLIfNeeded(forSiteId: siteId)
+        wv.isUserInteractionEnabled = false
+        wv.isHidden = true
+        wv.removeFromSuperview()
+        detachedSiteIds.insert(siteId)
+        let title = site(forId: siteId)?.title ?? siteId
+        JWLog("MEM-TRIM", "Detached off-screen WebView from window site=\(title) reason=\(reason)")
+        return true
+    }
+
+    private func detachIdleBackgroundWebViewsIfNeeded(totalMemoryMB: Int, forceAllUnselected: Bool) {
+        if !forceAllUnselected && config.idleDetachSeconds <= 0 {
+            if !detachedSiteIds.isEmpty {
+                for s in awakeSites() {
+                    if let wv = webViews[s.id], wv.superview == nil {
+                        attachWebViewIfNeeded(wv, forSiteId: s.id)
+                        wv.isHidden = (s.id != config.selectedSiteId)
+                        wv.isUserInteractionEnabled = (s.id == config.selectedSiteId)
+                    }
+                }
+            }
+            return
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let baseIdle = TimeInterval(max(15, config.idleDetachSeconds))
+        var detachedAny = false
+
+        for s in awakeSites() where s.id != config.selectedSiteId {
+            guard let wv = webViews[s.id], wv.superview != nil, !wv.isLoading else { continue }
+            if !forceAllUnselected {
+                if let stAt = lastStreamingUptimeBySiteId[s.id], (now - stAt) < 75.0 {
+                    continue
+                }
+                let pid = JWBridgeWebViewContentPID(wv)
+                let tabMB = (pid > 0) ? max(0, lastProcStatuses[pid]?.footprintMB ?? 0) : 0
+                let isNotifySite = config.notificationsEnabled && s.notifyEnabled
+                if isNotifySite && totalMemoryMB < 720 && tabMB < 260 {
+                    continue
+                }
+                let requiredIdle = isNotifySite ? max(baseIdle, 75.0) : baseIdle
+                let lastActive = lastActiveUptimeBySiteId[s.id] ?? now
+                if (now - lastActive) < requiredIdle {
+                    continue
+                }
+            }
+            if detachWebViewFromWindow(siteId: s.id, reason: forceAllUnselected ? "force" : "idle-\(Int(baseIdle))s") {
+                detachedAny = true
+            }
+        }
+
+        if detachedAny && !forceAllUnselected && UIApplication.shared.applicationState == .active {
+            schedulePostStateChangeProtectionWaves()
+        }
+    }
+
     private func teardownWebView(forSiteId siteId: String) {
         guard let old = webViews[siteId] else { return }
         old.stopLoading()
@@ -1343,7 +1556,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         webViewStoreIds.removeValue(forKey: siteId)
         errorOverlays.removeValue(forKey: siteId)
         terminatedSiteIds.remove(siteId)
+        detachedSiteIds.remove(siteId)
         unreadSiteIds.remove(siteId)
+        lastActiveUptimeBySiteId.removeValue(forKey: siteId)
+        lastStreamingUptimeBySiteId.removeValue(forKey: siteId)
         lastRejectedAuthBySiteId.removeValue(forKey: siteId)
     }
 
@@ -1519,12 +1735,19 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func selectSite(byId siteId: String, triggerWaves: Bool = true) {
         guard !siteId.isEmpty, let curSite = site(forId: siteId), curSite.enabled else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let prevSelectedId = config.selectedSiteId
+        if !prevSelectedId.isEmpty && prevSelectedId != siteId {
+            lastActiveUptimeBySiteId[prevSelectedId] = now
+        }
+        lastActiveUptimeBySiteId[siteId] = now
         config.selectedSiteId = siteId
         unreadSiteIds.remove(siteId)
         config.save()
 
         if let targetWV = webViews[siteId], !curSite.hibernated {
             hibernatedStateView.isHidden = true
+            attachWebViewIfNeeded(targetWV, forSiteId: siteId)
             for (sid, wv) in webViews {
                 let isSel = (sid == siteId)
                 wv.isHidden = !isSel
@@ -1575,6 +1798,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             return
         }
 
+        snapshotRememberedURLIfNeeded(forSiteId: siteId)
         let prevPID = JWBridgeWebViewContentPID(webViews[siteId])
         let prevMB = (prevPID > 0) ? (lastProcStatuses[prevPID]?.footprintMB ?? 0) : 0
         config.sites[idx].hibernated = true
@@ -1599,6 +1823,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             if config.sites[i].id == keepingSiteId {
                 config.sites[i].hibernated = false
             } else if !config.sites[i].hibernated {
+                snapshotRememberedURLIfNeeded(forSiteId: config.sites[i].id)
                 config.sites[i].hibernated = true
                 count += 1
             }
@@ -1612,6 +1837,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private func hibernateAllSites() {
         var count = 0
         for i in config.sites.indices where config.sites[i].enabled && !config.sites[i].hibernated {
+            snapshotRememberedURLIfNeeded(forSiteId: config.sites[i].id)
             config.sites[i].hibernated = true
             count += 1
         }
@@ -1801,6 +2027,17 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         ]
 
         var hibGroup: [JWGlassRowItem] = []
+        if !awakeSites().isEmpty {
+            let snap = currentLiveMemorySnapshot()
+            hibGroup.append(JWGlassRowItem(
+                symbol: "wand.and.stars",
+                tint: .systemTeal,
+                title: "一键无损内存瘦身",
+                trailingText: snap.totalMB > 0 ? "不重载 · \(snap.totalMB) MB" : "不重载网页"
+            ) { [weak self] in
+                self?.triggerUserMemoryTrim()
+            })
+        }
         let otherAwakeCount = awakeSites().filter { $0.id != targetSite.id }.count
         if otherAwakeCount > 0 {
             hibGroup.append(JWGlassRowItem(
@@ -2165,6 +2402,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             }
         ]
 
+        let snap = currentLiveMemorySnapshot()
+        let trimTrail = snap.totalMB > 0 ? "不重载 · \(snap.totalMB) MB" : "不重载网页"
         let pageGroup: [JWGlassRowItem] = [
             JWGlassRowItem(
                 symbol: "house.fill",
@@ -2181,9 +2420,17 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 UIPasteboard.general.string = curURLStr
             },
             JWGlassRowItem(
+                symbol: "wand.and.stars",
+                tint: .systemTeal,
+                title: "一键无损内存瘦身",
+                trailingText: trimTrail
+            ) { [weak self] in
+                self?.triggerUserMemoryTrim()
+            },
+            JWGlassRowItem(
                 symbol: "moon.zzz.fill",
                 tint: .systemIndigo,
-                title: "休眠此标签（释放内存）",
+                title: "休眠释放此标签",
                 trailingText: "保留登录态"
             ) { [weak self] in
                 self?.setSiteHibernated(siteId: siteId, hibernated: true)
@@ -2337,7 +2584,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             }
         }
 
-        var toolTiles: [JWGlassTileItem] = [
+        let toolTiles: [JWGlassTileItem] = [
             JWGlassTileItem(
                 symbol: "chevron.up",
                 title: "展开底栏",
@@ -2346,9 +2593,17 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 self?.expandDockTapped()
             },
             JWGlassTileItem(
+                symbol: "wand.and.stars",
+                title: "无损瘦身",
+                tint: .systemTeal,
+                isEnabled: !awakeSites().isEmpty && !isTrimmingMemory
+            ) { [weak self] in
+                self?.triggerUserMemoryTrim()
+            },
+            JWGlassTileItem(
                 symbol: "slider.horizontal.3",
                 title: "工作台设置",
-                tint: .systemTeal
+                tint: .systemIndigo
             ) { [weak self] in
                 self?.openManageSheet()
             },
@@ -2360,17 +2615,19 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 self?.openLogViewerSheet()
             }
         ]
+
+        var sections: [[JWGlassRowItem]] = [siteRows]
         if let cur = site(forId: config.selectedSiteId), cur.enabled && !cur.hibernated {
-            toolTiles.insert(
-                JWGlassTileItem(
+            sections.append([
+                JWGlassRowItem(
                     symbol: "moon.zzz.fill",
-                    title: "休眠当前",
-                    tint: .systemIndigo
+                    tint: .systemIndigo,
+                    title: "休眠释放当前标签",
+                    trailingText: "保留登录态"
                 ) { [weak self] in
                     self?.setSiteHibernated(siteId: cur.id, hibernated: true)
-                },
-                at: 1
-            )
+                }
+            ])
         }
 
         let sheet = JWGlassSheetController(
@@ -2380,9 +2637,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 bottom: UIColor(red: 0.32, green: 0.28, blue: 0.90, alpha: 1.0)
             ),
             title: "快速切换常驻 WebApp",
-            subtitle: "点击秒切 · 唤醒休眠标签",
+            subtitle: "点击秒切 · 无损瘦身不重载",
             tiles: toolTiles,
-            sections: [siteRows]
+            sections: sections
         )
         presentGlassSheet(sheet)
     }
@@ -2538,8 +2795,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         var lines: [String] = []
         lines.append("=== JetWeb 诊断摘要 ===")
+        let detachDesc = config.idleDetachSeconds > 0 ? "\(config.idleDetachSeconds)s" : "关闭"
         lines.append("版本: v\(JWBridgeVersion()) (\(JWBridgeGitCommit())) | 系统: \(dev.systemName) \(dev.systemVersion) | 物理内存: \(ramMB) MB")
-        lines.append("策略: 全局默认 \(config.targetBand) 档 (网络压阵 \(guardian.auxBand) 档 / 主容器 \(guardian.hostBand) 档) | 单页上限 \(config.maxMemoryMB) MB | 通知: \(notifySummary) | 外观: \(config.appearanceMode) | 日志: \(config.debugLoggingEnabled ? "开启" : "关闭")")
+        lines.append("策略: 全局默认 \(config.targetBand) 档 (网络压阵 \(guardian.auxBand) 档 / 主容器 \(guardian.hostBand) 档) | 单页上限 \(config.maxMemoryMB) MB | 自动脱水: \(config.autoMemoryTrimEnabled ? "开" : "关") | 离屏省显存: \(detachDesc) | 告警休眠: \(config.autoHibernateOnCriticalMemory ? "开" : "关") | 通知: \(notifySummary) | 外观: \(config.appearanceMode)")
         lines.append("主进程: PID \(selfPid) | 实测档位 \(hostSt?.band ?? -1) | 内存 \(hostSt?.footprintMB ?? 0) MB")
 
         for s in config.sites {
@@ -2548,7 +2806,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let npid = JWBridgeWebViewNetworkingPID(wv)
             let gpid = JWBridgeWebViewGPUPID(wv)
             let st = (wpid > 0) ? lastProcStatuses[wpid] : nil
-            let stateLabel = !s.enabled ? "隐藏" : (s.hibernated ? "已休眠" : "运行中")
+            let stateLabel = !s.enabled ? "隐藏" : (s.hibernated ? "已休眠" : (detachedSiteIds.contains(s.id) ? "离屏保活" : "运行中"))
             let effBand = config.effectiveSiteBand(for: s)
             let bandLabel = s.customBand > 0 ? "专属\(effBand)档" : "默认\(effBand)档"
             let notifyBadge = s.notifyEnabled ? "🔔" : "🔕"
@@ -2559,7 +2817,24 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         return lines.joined(separator: "\n")
     }
 
-    // MARK: - Jetsam Protection Engine & Detached Background Guard
+    // MARK: - Jetsam Protection Engine, Lossless Memory Trim & Detached Background Guard
+
+    private func currentLiveMemorySnapshot() -> (totalMB: Int, maxAwakeTabMB: Int, maxBgTabMB: Int) {
+        let selfPid = getpid()
+        var total = max(0, lastProcStatuses[selfPid]?.footprintMB ?? 0)
+        var maxTab = 0
+        var maxBg = 0
+        for s in awakeSites() {
+            let pid = JWBridgeWebViewContentPID(webViews[s.id])
+            let mb = (pid > 0) ? max(0, lastProcStatuses[pid]?.footprintMB ?? 0) : 0
+            total += mb
+            if mb > maxTab { maxTab = mb }
+            if s.id != config.selectedSiteId && mb > maxBg {
+                maxBg = mb
+            }
+        }
+        return (total, maxTab, maxBg)
+    }
 
     private func writeBgEpochToken(_ epoch: UInt) {
         let path = AppConfig.effectiveBgEpochPath()
@@ -2639,7 +2914,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         stopForegroundProtectTimer()
         let timer = Timer.scheduledTimer(withTimeInterval: 25.0, repeats: true) { [weak self] _ in
             guard let self = self, UIApplication.shared.applicationState == .active else { return }
-            self.scheduleApplyProtectionAsync(completion: nil)
+            self.scheduleApplyProtectionAsync { [weak self] _ in
+                self?.evaluateProactiveMemoryMaintenanceOnMainThread()
+            }
         }
         timer.tolerance = 5.0
         fgProtectTimer = timer
@@ -2729,6 +3006,231 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
     }
 
+    // MARK: - Active Lossless Memory Relief & Emergency LRU Self-Rescue
+
+    private func triggerUserMemoryTrim() {
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        performMemoryTrim(deep: true, reason: "user-manual", showFeedbackToast: true, completion: nil)
+    }
+
+    private func performMemoryTrim(
+        deep: Bool,
+        reason: String,
+        showFeedbackToast: Bool,
+        completion: ((MemoryTrimSummary?) -> Void)?
+    ) {
+        guard !isTrimmingMemory else {
+            completion?(nil)
+            return
+        }
+        isTrimmingMemory = true
+
+        if deep && config.idleDetachSeconds > 0 {
+            detachIdleBackgroundWebViewsIfNeeded(
+                totalMemoryMB: 9999,
+                forceAllUnselected: (reason == "mem-warning")
+            )
+        }
+
+        let aggLiteral = deep ? "true" : "false"
+        let suspendBgMedia = deep && (reason == "mem-warning")
+        for (sid, wv) in webViews {
+            let isHiddenTab = (sid != config.selectedSiteId)
+            let hidLiteral = isHiddenTab ? "true" : "false"
+            let js = "if(window.__jwTrimPageMemory)window.__jwTrimPageMemory({aggressive:\(aggLiteral),hiddenTab:\(hidLiteral)});"
+            wv.evaluateJavaScript(js, in: nil, in: .page, completionHandler: nil)
+            JWBridgeTrimWebViewMemory(wv, deep, suspendBgMedia && isHiddenTab)
+        }
+        JWBridgeReleaseHostMemory()
+
+        let preSnap = currentLiveMemorySnapshot()
+        let collected = collectTargetPIDStringsOnMainThread()
+        let band = config.targetBand
+        let maxMB = config.maxMemoryMB
+        let modeArg = deep ? "deep" : "gentle"
+
+        protectQueue.async { [weak self] in
+            HubViewController.writeSharedSnapshotOnBgQueue(collected.sharedSnapshot)
+
+            var trimArgs = ["--trim", modeArg]
+            trimArgs.append(contentsOf: collected.queryPIDs)
+            var trimCode: Int32 = -1
+            let trimOut = JWBridgeRunJetWebCtl(trimArgs, &trimCode)
+            let trimSummary = MemoryTrimSummary.parseHelperOutput(trimOut)
+            let trimStatuses = ProcStatus.parseHelperOutput(trimOut)
+
+            var applyArgs = ["--apply", "\(band)", "\(maxMB)"]
+            applyArgs.append(contentsOf: collected.applySpecs)
+            var applyCode: Int32 = -1
+            let applyOut = JWBridgeRunJetWebCtl(applyArgs, &applyCode)
+            let applyStatuses = ProcStatus.parseHelperOutput(applyOut)
+
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isTrimmingMemory = false
+
+                if !applyStatuses.isEmpty {
+                    self.lastProcStatuses = applyStatuses
+                } else if !trimStatuses.isEmpty {
+                    self.lastProcStatuses = trimStatuses
+                }
+                self.rebuildTabPills()
+
+                let postSnap = self.currentLiveMemorySnapshot()
+                let beforeMB = trimSummary?.beforeMB ?? preSnap.totalMB
+                let afterMB = trimSummary?.afterMB ?? postSnap.totalMB
+                let savedMB = max(0, trimSummary?.savedMB ?? (beforeMB - afterMB))
+
+                JWLog("MEM-TRIM", "mode=\(modeArg) reason=\(reason) rc=\(trimCode)/\(applyCode) before=\(beforeMB)MB after=\(afterMB)MB saved=\(savedMB)MB")
+
+                let banner: String
+                if trimCode == 0 {
+                    if savedMB > 0 {
+                        banner = "✓ 无损内存瘦身完成：释放 \(savedMB) MB（\(beforeMB) → \(afterMB) MB · 网页零重载）"
+                    } else {
+                        banner = "✓ 已完成内存紧致整理（当前总占用 \(afterMB) MB · 网页零重载）"
+                    }
+                } else {
+                    banner = "✓ 已执行 WebKit 缓存与垃圾回收（总占用 \(afterMB) MB）"
+                }
+                self.runtime.helperBannerText = banner
+
+                if showFeedbackToast {
+                    let toastText = savedMB > 0
+                        ? "已无损释放 \(savedMB) MB · 当前 \(afterMB) MB"
+                        : "内存已整理紧致 · 当前 \(afterMB) MB"
+                    self.showTopGlassToast(symbol: "wand.and.stars", tint: .systemTeal, text: toastText)
+                }
+
+                let resolved = trimSummary ?? MemoryTrimSummary(
+                    mode: modeArg,
+                    beforeMB: beforeMB,
+                    afterMB: afterMB,
+                    savedMB: savedMB,
+                    count: collected.queryPIDs.count
+                )
+                completion?(resolved)
+            }
+        }
+    }
+
+    private func evaluateProactiveMemoryMaintenanceOnMainThread() {
+        let snap = currentLiveMemorySnapshot()
+        detachIdleBackgroundWebViewsIfNeeded(totalMemoryMB: snap.totalMB, forceAllUnselected: false)
+
+        guard config.autoMemoryTrimEnabled, !isTrimmingMemory else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let softTabMB = max(210, Int(Double(config.maxMemoryMB) * 0.72))
+
+        if (snap.maxBgTabMB > config.maxMemoryMB || snap.totalMB >= 1120) && (now - lastAutoDeepTrimUptime) >= 90.0 {
+            lastAutoDeepTrimUptime = now
+            lastAutoTrimUptime = now
+            performMemoryTrim(
+                deep: true,
+                reason: "patrol-high(\(snap.totalMB)MB)",
+                showFeedbackToast: false,
+                completion: nil
+            )
+        } else if (snap.maxAwakeTabMB >= softTabMB || snap.totalMB >= 820) && (now - lastAutoTrimUptime) >= 55.0 {
+            lastAutoTrimUptime = now
+            performMemoryTrim(
+                deep: false,
+                reason: "patrol-soft(\(snap.totalMB)MB)",
+                showFeedbackToast: false,
+                completion: nil
+            )
+        }
+    }
+
+    private func evaluateEmergencyAutoHibernateAfterWarning(
+        trimSummary: MemoryTrimSummary?,
+        isRepeatedWarning: Bool,
+        detachedCount: Int
+    ) {
+        let postSnap = currentLiveMemorySnapshot()
+        let savedByTrim = max(0, trimSummary?.savedMB ?? 0)
+        let candidates = awakeSites().filter { $0.id != config.selectedSiteId }
+
+        let criticalTotalCap = max(860, config.maxMemoryMB * 2)
+        let hasOverLimitBgTab = candidates.contains { s in
+            let pid = JWBridgeWebViewContentPID(webViews[s.id])
+            return pid > 0 && (lastProcStatuses[pid]?.footprintMB ?? 0) > config.maxMemoryMB
+        }
+        let needEvict = config.autoHibernateOnCriticalMemory
+            && !candidates.isEmpty
+            && (postSnap.totalMB > criticalTotalCap || hasOverLimitBgTab || (isRepeatedWarning && postSnap.totalMB > 560))
+
+        guard needEvict else {
+            JWLog("MEM-TRIM", "Memory warning absorbed by lossless trim (saved=\(savedByTrim)MB after=\(postSnap.totalMB)MB detached=\(detachedCount))")
+            if UIApplication.shared.applicationState == .active && savedByTrim > 0 {
+                showTopGlassToast(
+                    symbol: "bolt.shield.fill",
+                    tint: .systemTeal,
+                    text: "内存吃紧：已无损释放 \(savedByTrim) MB 保住全部标签"
+                )
+            }
+            return
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let sortedCandidates = candidates.sorted { a, b in
+            let pidA = JWBridgeWebViewContentPID(webViews[a.id])
+            let pidB = JWBridgeWebViewContentPID(webViews[b.id])
+            let mbA = (pidA > 0) ? (lastProcStatuses[pidA]?.footprintMB ?? 0) : 0
+            let mbB = (pidB > 0) ? (lastProcStatuses[pidB]?.footprintMB ?? 0) : 0
+
+            let overA = mbA > config.maxMemoryMB
+            let overB = mbB > config.maxMemoryMB
+            if overA != overB { return overA && !overB }
+
+            let streamA = (now - (lastStreamingUptimeBySiteId[a.id] ?? 0)) < 45.0
+            let streamB = (now - (lastStreamingUptimeBySiteId[b.id] ?? 0)) < 45.0
+            if streamA != streamB { return !streamA && streamB }
+
+            let bandA = config.effectiveSiteBand(for: a)
+            let bandB = config.effectiveSiteBand(for: b)
+            if bandA != bandB { return bandA < bandB }
+
+            let activeA = lastActiveUptimeBySiteId[a.id] ?? 0
+            let activeB = lastActiveUptimeBySiteId[b.id] ?? 0
+            if abs(activeA - activeB) > 1.0 { return activeA < activeB }
+
+            return mbA > mbB
+        }
+
+        var projectedMB = postSnap.totalMB
+        let targetSafeMB = max(680, Int(Double(criticalTotalCap) * 0.76))
+        var evictedTitles: [String] = []
+        var evictedMB = 0
+
+        for victim in sortedCandidates {
+            if evictedTitles.count >= 2 { break }
+            if evictedTitles.count >= 1 && projectedMB <= targetSafeMB { break }
+            guard let idx = config.sites.firstIndex(where: { $0.id == victim.id }) else { continue }
+
+            snapshotRememberedURLIfNeeded(forSiteId: victim.id)
+            let vPid = JWBridgeWebViewContentPID(webViews[victim.id])
+            let vMB = (vPid > 0) ? max(0, lastProcStatuses[vPid]?.footprintMB ?? 0) : 0
+            config.sites[idx].hibernated = true
+            evictedTitles.append(victim.title)
+            evictedMB += vMB
+            projectedMB = max(0, projectedMB - vMB)
+        }
+
+        guard !evictedTitles.isEmpty else { return }
+        config.save()
+        let joinedNames = evictedTitles.joined(separator: "、")
+        let totalSaved = savedByTrim + evictedMB
+        JWLog("MEM-WARN", "Emergency self-rescue auto-hibernated [\(joinedNames)] freeing ~\(evictedMB)MB (trim+\(savedByTrim)MB) to protect active tab")
+        syncWebViewsWithConfig(preferredSelectId: config.selectedSiteId)
+
+        let rescueMsg = "🛡 内存自救：已自动休眠「\(joinedNames)」释放 \(max(evictedMB, totalSaved)) MB，保住当前页"
+        runtime.helperBannerText = rescueMsg
+        if UIApplication.shared.applicationState == .active {
+            showTopGlassToast(symbol: "exclamationmark.shield.fill", tint: .systemOrange, text: rescueMsg)
+        }
+    }
+
     private func armDetachedJetsamGuardForBackgroundTransition(reason: String) {
         endBackgroundGuardTask()
 
@@ -2742,9 +3244,50 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             self?.endBackgroundGuardTask()
         }
 
+        let now = ProcessInfo.processInfo.systemUptime
+        let snap = currentLiveMemorySnapshot()
+        let shouldTrimBeforeBg = (reason == "enter-bg")
+            && config.autoMemoryTrimEnabled
+            && !awakeSites().isEmpty
+            && (now - lastAutoTrimUptime) >= 15.0
+
+        if shouldTrimBeforeBg {
+            let useDeepBgTrim = (snap.totalMB >= 650 || snap.maxAwakeTabMB >= 300)
+            lastAutoTrimUptime = now
+            if useDeepBgTrim { lastAutoDeepTrimUptime = now }
+
+            let aggLit = useDeepBgTrim ? "true" : "false"
+            for (sid, wv) in webViews {
+                let hidLit = (sid != config.selectedSiteId) ? "true" : "false"
+                let js = "if(window.__jwTrimPageMemory)window.__jwTrimPageMemory({aggressive:\(aggLit),hiddenTab:\(hidLit)});"
+                wv.evaluateJavaScript(js, in: nil, in: .page, completionHandler: nil)
+                JWBridgeTrimWebViewMemory(wv, useDeepBgTrim, false)
+            }
+            JWBridgeReleaseHostMemory()
+
+            let trimPIDs = collectTargetPIDStringsOnMainThread().queryPIDs
+            let modeStr = useDeepBgTrim ? "deep" : "gentle"
+            protectQueue.async { [weak self] in
+                var trimArgs = ["--trim", modeStr]
+                trimArgs.append(contentsOf: trimPIDs)
+                var trimCode: Int32 = -1
+                let trimOut = JWBridgeRunJetWebCtl(trimArgs, &trimCode)
+                if let sum = MemoryTrimSummary.parseHelperOutput(trimOut) {
+                    DispatchQueue.main.async {
+                        JWLog("MEM-TRIM", "pre-bg mode=\(modeStr) before=\(sum.beforeMB)MB after=\(sum.afterMB)MB saved=\(sum.savedMB)MB")
+                        let parsed = ProcStatus.parseHelperOutput(trimOut)
+                        if !parsed.isEmpty {
+                            self?.lastProcStatuses = parsed
+                        }
+                    }
+                }
+            }
+        }
+
         scheduleApplyProtectionAsync(completion: nil)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+        let guardSpawnDelay: TimeInterval = shouldTrimBeforeBg ? 0.85 : 0.6
+        DispatchQueue.main.asyncAfter(deadline: .now() + guardSpawnDelay) { [weak self] in
             guard let self = self, self.bgEpoch == epoch else { return }
             let collected = self.collectTargetPIDStringsOnMainThread()
             let band = self.config.targetBand
@@ -2753,15 +3296,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let logArg = self.config.debugLoggingEnabled ? JWLogger.logFilePath : "-"
             JWLog("BG", "Spawning detached --bg-guard reason=\(reason) epoch=\(epoch) specs=[\(collected.applySpecs.joined(separator: ","))]")
 
-            self.protectQueue.async {
+            self.protectQueue.async { [weak self] in
                 HubViewController.writeSharedSnapshotOnBgQueue(collected.sharedSnapshot)
                 JWBridgeSpawnDetachedBgGuard(band, maxMB, epochPath, epoch, logArg, collected.applySpecs)
-            }
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                guard let self = self, self.bgEpoch == epoch else { return }
-                JWLog("BG", "Releasing UIBackgroundTask (reason=\(reason) epoch=\(epoch))")
-                self.endBackgroundGuardTask()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    guard let self = self, self.bgEpoch == epoch else { return }
+                    JWLog("BG", "Releasing UIBackgroundTask (reason=\(reason) epoch=\(epoch))")
+                    self.endBackgroundGuardTask()
+                }
             }
         }
     }
@@ -2769,6 +3311,17 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     @objc private func appDidEnterBackground() {
         stopForegroundProtectTimer()
         syncAllWebViewHostStates(appActive: false)
+
+        if config.idleDetachSeconds > 0 {
+            let now = ProcessInfo.processInfo.systemUptime
+            for s in awakeSites() where s.id != config.selectedSiteId {
+                let isNotifyActive = config.notificationsEnabled && s.notifyEnabled && config.bgNotifyGuardMinutes > 0
+                let isStreaming = (now - (lastStreamingUptimeBySiteId[s.id] ?? 0)) < 60.0
+                if !isNotifyActive && !isStreaming {
+                    detachWebViewFromWindow(siteId: s.id, reason: "enter-bg")
+                }
+            }
+        }
 
         if config.hasAwakeNotifySite() && config.bgNotifyGuardMinutes > 0 {
             JWNotificationManager.shared.startBackgroundListening(
@@ -2794,8 +3347,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         writeBgEpochToken(bgEpoch)
         endBackgroundGuardTask()
         unreadSiteIds.remove(config.selectedSiteId)
+        if !config.selectedSiteId.isEmpty {
+            lastActiveUptimeBySiteId[config.selectedSiteId] = ProcessInfo.processInfo.systemUptime
+            if let curWV = webViews[config.selectedSiteId] {
+                attachWebViewIfNeeded(curWV, forSiteId: config.selectedSiteId)
+            }
+        }
         updateFloatingIslandVisuals()
-        JWLog("FG", "WillEnterForeground newEpoch=\(bgEpoch) terminatedCount=\(terminatedSiteIds.count)")
+        JWLog("FG", "WillEnterForeground newEpoch=\(bgEpoch) terminatedCount=\(terminatedSiteIds.count) detachedCount=\(detachedSiteIds.count)")
         applyAppearanceStyles()
         recoverWebViewIfTerminated(siteId: config.selectedSiteId)
         syncAllWebViewHostStates(appActive: true)
@@ -2805,6 +3364,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     }
 
     @objc private func appDidReceiveMemoryWarning() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let isRepeatedWarning = (lastMemWarningUptime > 0 && (now - lastMemWarningUptime) < 25.0)
+        lastMemWarningUptime = now
+
         let hibCount = enabledSites().filter { $0.hibernated }.count
         let items = awakeSites().map { s -> String in
             let wpid = JWBridgeWebViewContentPID(webViews[s.id])
@@ -2812,7 +3375,26 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let eff = config.effectiveSiteBand(for: s)
             return "\(s.title)(\(wpid):\(mb)MB@\(eff))"
         }
-        JWLog("MEM-WARN", "System memory warning! awake=[\(items.joined(separator: ", "))] hibernated=\(hibCount)")
+        JWLog("MEM-WARN", "System memory warning (repeated=\(isRepeatedWarning))! awake=[\(items.joined(separator: ", "))] hibernated=\(hibCount)")
+
+        // Stage 1: Detach all non-selected WebViews from window to immediately free off-screen layer surfaces
+        var detachedCount = 0
+        for s in awakeSites() where s.id != config.selectedSiteId {
+            if detachWebViewFromWindow(siteId: s.id, reason: "mem-warning") {
+                detachedCount += 1
+            }
+        }
+        JWBridgeReleaseHostMemory()
+
+        // Stage 2 & 3: Deep lossless WebKit trim -> LRU lowest-band emergency hibernation if still critical
+        performMemoryTrim(deep: true, reason: "mem-warning", showFeedbackToast: false) { [weak self] summary in
+            guard let self = self else { return }
+            self.evaluateEmergencyAutoHibernateAfterWarning(
+                trimSummary: summary,
+                isRepeatedWarning: isRepeatedWarning,
+                detachedCount: detachedCount
+            )
+        }
     }
 
     private func endBackgroundGuardTask() {
@@ -3106,10 +3688,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                   let senderSite = site(forId: sid) else { return }
             let kind = (dict["k"] as? String) ?? ""
             if kind == "user_sent" {
+                let now = ProcessInfo.processInfo.systemUptime
+                lastStreamingUptimeBySiteId[sid] = now
+                lastActiveUptimeBySiteId[sid] = now
                 JWLog("NOTIFY", "User submitted message in site=\(senderSite.title)")
                 return
             }
             if kind == "streaming" {
+                lastStreamingUptimeBySiteId[sid] = ProcessInfo.processInfo.systemUptime
                 JWNotificationManager.shared.noteSiteStreamingActivity()
                 return
             }

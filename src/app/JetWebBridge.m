@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <errno.h>
+#include <malloc/malloc.h>
 
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
 extern int posix_spawnattr_set_persona_np(const posix_spawnattr_t *, uid_t, uint32_t);
@@ -137,7 +138,7 @@ NSString *JWBridgeRunJetWebCtl(NSArray<NSString *> *args, int *exitCodeOut) {
     NSMutableData *outData = [NSMutableData data];
     if (rc == 0 && child > 0) {
         fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
-        uint64_t deadline = JWMonotonicMillis() + 1500ULL;
+        uint64_t deadline = JWMonotonicMillis() + 2200ULL;
         int status = 0;
         BOOL done = NO;
 
@@ -406,4 +407,34 @@ NSURLCredential *JWBridgeCredentialForAcceptedTrust(SecTrustRef trust) {
         CFRelease(exceptions);
     }
     return [NSURLCredential credentialForTrust:trust];
+}
+
+static void JWInvokeVoidSelectorSafely(id target, NSString *selName) {
+    if (!target || selName.length == 0) return;
+    SEL sel = NSSelectorFromString(selName);
+    if ([target respondsToSelector:sel]) {
+        @try {
+            ((void (*)(id, SEL))objc_msgSend)(target, sel);
+        } @catch (__unused NSException *ex) {}
+    }
+}
+
+void JWBridgeTrimWebViewMemory(WKWebView *webView, BOOL clearBFCache, BOOL suspendMedia) {
+    if (!webView) return;
+    if (clearBFCache) {
+        JWInvokeVoidSelectorSafely(webView, @"_clearBackForwardCache");
+    }
+    if (suspendMedia) {
+        JWInvokeVoidSelectorSafely(webView, @"_suspendAllMediaPlayback");
+    }
+    WKProcessPool *pool = webView.configuration.processPool;
+    if (pool) {
+        JWInvokeVoidSelectorSafely(pool, @"_clearWebProcessCache");
+        JWInvokeVoidSelectorSafely(pool, @"_garbageCollectJavaScriptObjectsForTesting");
+    }
+}
+
+void JWBridgeReleaseHostMemory(void) {
+    [[NSURLCache sharedURLCache] removeAllCachedResponses];
+    (void)malloc_zone_pressure_relief(NULL, 0);
 }
