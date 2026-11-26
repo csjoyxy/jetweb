@@ -296,4 +296,472 @@ enum WebScripts {
             in: .page
         )
     }
+
+    /// Universal 3-in-1 conversation & unread message detector:
+    /// 1) Polyfills `window.Notification` + `ServiceWorkerRegistration.prototype.showNotification`
+    /// 2) Monitors `document.title` unread counters `(1)` / `[新消息]`
+    /// 3) Detects newly appearing unread dots in conversation lists & settled streaming replies (`Muse` / `agy` / `Hermes`)
+    static func conversationMonitorScript() -> WKUserScript {
+        let js = #"""
+        (function(){
+        'use strict';
+        if(window.__jwNotifyInstalled)return;
+        window.__jwNotifyInstalled=true;
+
+        var hostState={appActive:true,tabSelected:true};
+        var bootIgnoreUntil=Date.now()+4800;
+        var lastHref=location.href;
+        var lastComposerText='';
+        var lastBaselineTail='';
+        var lastNotifiedSnippet='';
+        var lastNotifiedAt=0;
+        var lastStreamPingAt=0;
+        var pendingReply=false;
+        var streamStartedAt=0;
+        var settleTimer=null;
+        var dotScanTimer=null;
+        var knownUnreadTitles=new Set();
+        var lastTitleCount=0;
+
+        function postNative(payload){
+          try{
+            if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.jwNotify){
+              window.webkit.messageHandlers.jwNotify.postMessage(payload);
+            }
+          }catch(_){}
+        }
+
+        function isUserWatching(){
+          return !!(hostState.appActive && hostState.tabSelected && document.visibilityState!=='hidden');
+        }
+
+        function normText(s){
+          return String(s||'').replace(/\s+/g,' ').trim();
+        }
+
+        function isTrivialStatusOrTime(t){
+          if(!t||t.length<2)return true;
+          if(/^(\d+\s*(s|sec|m|min|h|hr|d|秒|分钟|小时|天)(\s*ago|前)?|just now|刚刚|剛剛|\d{1,2}:\d{2}(\s*[ap]m)?)$/i.test(t))return true;
+          if(/^(thinking|analyzing|generating|loading|working|running|searching|思考中|正在输入|加载中)[.…·\s]*$/i.test(t))return true;
+          return false;
+        }
+
+        /* 1. Polyfill standard Web Notification API -> Native iOS Banner */
+        try{
+          if(typeof window.Notification==='undefined'){
+            var JWNotification=function(title,options){
+              var opts=options||{};
+              this.title=String(title||'');
+              this.body=String(opts.body||'');
+              this.tag=String(opts.tag||'');
+              this.onclick=null;
+              this.onclose=null;
+              postNative({
+                k:'web_api',
+                sub:this.title,
+                body:this.body||'收到一条新网页通知'
+              });
+            };
+            JWNotification.permission='granted';
+            JWNotification.requestPermission=function(cb){
+              if(typeof cb==='function'){try{cb('granted');}catch(_){}}
+              return Promise.resolve('granted');
+            };
+            JWNotification.prototype.close=function(){
+              if(typeof this.onclose==='function'){try{this.onclose();}catch(_){}}
+            };
+            JWNotification.prototype.addEventListener=function(){};
+            JWNotification.prototype.removeEventListener=function(){};
+            window.Notification=JWNotification;
+          }
+          if(window.ServiceWorkerRegistration&&window.ServiceWorkerRegistration.prototype&&!window.ServiceWorkerRegistration.prototype.__jwPatched){
+            window.ServiceWorkerRegistration.prototype.__jwPatched=true;
+            window.ServiceWorkerRegistration.prototype.showNotification=function(title,options){
+              var opts=options||{};
+              postNative({k:'web_api',sub:String(title||''),body:String(opts.body||'收到一条新网页通知')});
+              return Promise.resolve();
+            };
+          }
+        }catch(_){}
+
+        /* 2. Extract latest meaningful reply snippet from conversation DOM */
+        function isInsideIgnoredChrome(el){
+          var cur=el,d=0;
+          while(cur&&cur.nodeType===1&&d<16){
+            var tag=cur.tagName;
+            if(tag==='NAV'||tag==='ASIDE'||tag==='HEADER'||tag==='FOOTER'||tag==='SCRIPT'||tag==='STYLE'||tag==='SVG'||tag==='TEXTAREA'||tag==='INPUT'||tag==='BUTTON'){
+              return true;
+            }
+            if(cur.isContentEditable)return true;
+            var role=(cur.getAttribute('role')||'').toLowerCase();
+            if(role==='navigation'||role==='textbox'||role==='combobox'||role==='Dialog')return true;
+            cur=cur.parentElement;
+            d++;
+          }
+          return false;
+        }
+
+        function captureLatestChatSnippet(){
+          try{
+            if(!document.body)return '';
+            var selectors=[
+              '[data-message-author-role="assistant"]',
+              '[data-role="assistant"]',
+              '[class*="assistant" i]',
+              '[class*="agent-message" i]',
+              '[class*="model-response" i]',
+              '[class*="markdown" i]',
+              '[class*="prose" i]',
+              '[class*="message-content" i]',
+              '[class*="chat-message" i]',
+              'main article',
+              'main p',
+              '[role="main"] p',
+              '[role="log"] div'
+            ];
+            var best='';
+            for(var s=0;s<selectors.length;s++){
+              var nodes=document.querySelectorAll(selectors[s]);
+              if(!nodes||!nodes.length)continue;
+              for(var i=nodes.length-1;i>=Math.max(0,nodes.length-6);i--){
+                var el=nodes[i];
+                if(isInsideIgnoredChrome(el))continue;
+                var r=el.getBoundingClientRect();
+                if(r.width<=0||r.height<=0)continue;
+                var txt=normText(el.innerText||el.textContent||'');
+                if(txt.length>=4&&!isTrivialStatusOrTime(txt)&&txt!==lastComposerText){
+                  best=txt;
+                  break;
+                }
+              }
+              if(best)break;
+            }
+            if(!best){
+              var root=document.querySelector('main,[role="main"],[role="log"]')||document.body;
+              var blocks=root.querySelectorAll('p,li,div');
+              for(var j=blocks.length-1;j>=Math.max(0,blocks.length-40);j--){
+                var b=blocks[j];
+                if(b.children&&b.children.length>4)continue;
+                if(isInsideIgnoredChrome(b))continue;
+                var t=normText(b.innerText||b.textContent||'');
+                if(t.length>=6&&t.length<=600&&!isTrivialStatusOrTime(t)&&t!==lastComposerText){
+                  best=t;
+                  break;
+                }
+              }
+            }
+            if(best.length>120){
+              best=best.slice(0,120)+'…';
+            }
+            return best;
+          }catch(_){
+            return '';
+          }
+        }
+
+        /* 3. Unread blue/red dot scanner for conversation lists (e.g. Antigravity / Muse sidebar) */
+        function extractRowTitleForDot(dotEl){
+          var cur=dotEl.parentElement,d=0;
+          while(cur&&cur.nodeType===1&&cur!==document.body&&d<6){
+            var rect=cur.getBoundingClientRect();
+            if(rect.height>=22&&rect.height<=92&&rect.width>=120){
+              var raw=normText(cur.innerText||cur.textContent||'');
+              raw=raw.replace(/\b\d+\s*(s|m|h|d|min|hr)\b$/i,'').trim();
+              if(raw.length>=2&&raw.length<=95&&!isTrivialStatusOrTime(raw)){
+                return raw;
+              }
+            }
+            cur=cur.parentElement;
+            d++;
+          }
+          return '';
+        }
+
+        function isColoredUnreadDot(el){
+          if(!el||el.nodeType!==1)return false;
+          var tag=el.tagName;
+          if(tag!=='SPAN'&&tag!=='DIV'&&tag!=='I')return false;
+          if(el.children&&el.children.length>0)return false;
+          var txt=normText(el.textContent||'');
+          if(txt.length>0)return false;
+          var r=el.getBoundingClientRect();
+          if(r.width<4.5||r.width>14.5||r.height<4.5||r.height>14.5)return false;
+          if(Math.abs(r.width-r.height)>2.5)return false;
+          var cs=getComputedStyle(el);
+          if(cs.display==='none'||cs.visibility==='hidden'||parseFloat(cs.opacity)<0.35)return false;
+          var br=parseFloat(cs.borderTopLeftRadius)||0;
+          if(br<r.width*0.35)return false;
+          var bg=cs.backgroundColor||'';
+          var m=bg.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*[,/]\s*([\d.]+))?/);
+          if(!m)return false;
+          var rv=parseInt(m[1],10),gv=parseInt(m[2],10),bv=parseInt(m[3],10);
+          var av=m[4]!==undefined?parseFloat(m[4]):1;
+          if(av<0.45)return false;
+          var spread=Math.max(rv,gv,bv)-Math.min(rv,gv,bv);
+          return spread>=40;
+        }
+
+        function scanUnreadDots(allowEmit){
+          try{
+            if(!document.body)return;
+            var currentSet=new Set();
+            var explicit=document.querySelectorAll('[aria-label*="unread" i],[data-unread="true"],[title*="未读"]');
+            for(var i=0;i<explicit.length;i++){
+              var rt=extractRowTitleForDot(explicit[i])||normText(explicit[i].textContent||'');
+              if(rt.length>=2&&rt.length<=95)currentSet.add(rt);
+            }
+            var candidates=document.body.querySelectorAll('a span,a div,li span,li div,[role="listitem"] span,[role="listitem"] div,div > span,div > div');
+            var limit=Math.min(candidates.length,450);
+            for(var j=0;j<limit;j++){
+              var el=candidates[j];
+              if(isColoredUnreadDot(el)){
+                var rowTitle=extractRowTitleForDot(el);
+                if(rowTitle)currentSet.add(rowTitle);
+              }
+            }
+            if(allowEmit&&!isUserWatching()&&Date.now()>bootIgnoreUntil){
+              currentSet.forEach(function(title){
+                if(!knownUnreadTitles.has(title)){
+                  if(Date.now()-lastNotifiedAt>=6000){
+                    lastNotifiedAt=Date.now();
+                    postNative({
+                      k:'unread_dot',
+                      sub:'新对话动态',
+                      body:'「'+title+'」有新回复待查看'
+                    });
+                  }
+                }
+              });
+            }
+            knownUnreadTitles=currentSet;
+          }catch(_){}
+        }
+
+        /* 4. Streaming / Generation busy check & reply settle detector */
+        function isBusyGenerating(){
+          if(streamStartedAt>0&&(Date.now()-streamStartedAt)>85000)return false;
+          try{
+            var btns=document.querySelectorAll('button,[role="button"]');
+            for(var i=0;i<btns.length;i++){
+              var b=btns[i];
+              var label=((b.getAttribute('aria-label')||'')+' '+(b.getAttribute('title')||'')+' '+(b.getAttribute('data-testid')||'')).toLowerCase();
+              if(label.indexOf('stop')!==-1||label.indexOf('停止')!==-1||label.indexOf('cancel generation')!==-1){
+                var r=b.getBoundingClientRect();
+                if(r.width>4&&r.height>4)return true;
+              }
+            }
+          }catch(_){}
+          return false;
+        }
+
+        function checkReplySettled(){
+          settleTimer=null;
+          if(!pendingReply)return;
+          if(isUserWatching()){
+            pendingReply=false;
+            streamStartedAt=0;
+            lastBaselineTail=captureLatestChatSnippet();
+            return;
+          }
+          if(isBusyGenerating()){
+            settleTimer=setTimeout(checkReplySettled,2000);
+            return;
+          }
+          pendingReply=false;
+          streamStartedAt=0;
+          var snippet=captureLatestChatSnippet();
+          if(!snippet||snippet===lastBaselineTail||snippet===lastNotifiedSnippet||snippet===lastComposerText){
+            return;
+          }
+          if(Date.now()-lastNotifiedAt<6000)return;
+          lastNotifiedAt=Date.now();
+          lastNotifiedSnippet=snippet;
+          lastBaselineTail=snippet;
+          postNative({
+            k:'reply_done',
+            sub:'收到新回复',
+            body:snippet
+          });
+        }
+
+        function scheduleReplySettle(){
+          if(Date.now()<bootIgnoreUntil)return;
+          if(!pendingReply){
+            pendingReply=true;
+            streamStartedAt=Date.now();
+          }
+          if(!isUserWatching()&&(Date.now()-lastStreamPingAt)>12000){
+            lastStreamPingAt=Date.now();
+            postNative({k:'streaming'});
+          }
+          if(settleTimer)clearTimeout(settleTimer);
+          settleTimer=setTimeout(checkReplySettled,3000);
+        }
+
+        /* 5. Title unread counter observer */
+        function checkTitleBadge(){
+          if(Date.now()<bootIgnoreUntil)return;
+          var t=normText(document.title||'');
+          var m=t.match(/^(?:\((\d+)\)|\[(\d+|新消息)\])\s*(.*)$/);
+          if(!m){
+            lastTitleCount=0;
+            return;
+          }
+          var n=parseInt(m[1]||m[2]||'1',10);
+          if(isNaN(n))n=1;
+          if(n>lastTitleCount&&!isUserWatching()&&(Date.now()-lastNotifiedAt)>=6000){
+            lastTitleCount=n;
+            lastNotifiedAt=Date.now();
+            postNative({
+              k:'title_badge',
+              sub:'有 '+n+' 条未读消息',
+              body:m[3]||t
+            });
+          }else{
+            lastTitleCount=n;
+          }
+        }
+
+        /* 6. Composer input & send tracking */
+        document.addEventListener('input',function(ev){
+          var el=ev&&ev.target;
+          if(!el)return;
+          if(el.tagName==='TEXTAREA'||el.tagName==='INPUT'||el.isContentEditable){
+            var v=normText(el.value||el.textContent||'');
+            if(v.length>=2)lastComposerText=v.length>120?(v.slice(0,120)+'…'):v;
+          }
+        },true);
+
+        document.addEventListener('keydown',function(ev){
+          if(!ev||ev.key!=='Enter'||ev.shiftKey||ev.isComposing)return;
+          var el=ev.target;
+          if(el&&(el.tagName==='TEXTAREA'||el.isContentEditable||el.tagName==='INPUT')){
+            postNative({k:'user_sent'});
+          }
+        },true);
+
+        document.addEventListener('click',function(ev){
+          var cur=ev&&ev.target,d=0;
+          while(cur&&cur.nodeType===1&&d<5){
+            if(cur.tagName==='BUTTON'||cur.getAttribute('role')==='button'){
+              var tp=(cur.getAttribute('type')||'').toLowerCase();
+              var lb=((cur.getAttribute('aria-label')||'')+' '+(cur.textContent||'')).toLowerCase();
+              if(tp==='submit'||/send|submit|发送|提交|ask/.test(lb)){
+                postNative({k:'user_sent'});
+              }
+              break;
+            }
+            cur=cur.parentElement;
+            d++;
+          }
+        },true);
+
+        /* 7. Host foreground/tab state hook */
+        window.__jwUpdateHostState=function(st){
+          var wasWatching=isUserWatching();
+          if(st&&typeof st.appActive==='boolean')hostState.appActive=st.appActive;
+          if(st&&typeof st.tabSelected==='boolean')hostState.tabSelected=st.tabSelected;
+          var nowWatching=isUserWatching();
+          if(wasWatching&&!nowWatching){
+            lastBaselineTail=captureLatestChatSnippet();
+            scanUnreadDots(false);
+          }else if(!wasWatching&&nowWatching){
+            pendingReply=false;
+            streamStartedAt=0;
+            if(settleTimer){clearTimeout(settleTimer);settleTimer=null;}
+            scanUnreadDots(false);
+          }
+        };
+
+        document.addEventListener('visibilitychange',function(){
+          if(document.visibilityState==='hidden'){
+            if(!pendingReply)lastBaselineTail=captureLatestChatSnippet();
+          }
+        });
+
+        /* 8. Start DOM MutationObserver after documentElement exists */
+        function installObserver(){
+          if(!document.documentElement)return;
+          setTimeout(function(){
+            lastBaselineTail=captureLatestChatSnippet();
+            scanUnreadDots(false);
+          },4600);
+
+          var obs=new MutationObserver(function(mutations){
+            if(location.href!==lastHref){
+              lastHref=location.href;
+              bootIgnoreUntil=Date.now()+4200;
+              pendingReply=false;
+              if(settleTimer){clearTimeout(settleTimer);settleTimer=null;}
+              setTimeout(function(){
+                lastBaselineTail=captureLatestChatSnippet();
+                scanUnreadDots(false);
+              },4300);
+              return;
+            }
+            if(Date.now()<bootIgnoreUntil)return;
+
+            var hasMeaningfulText=false;
+            var hasElementAdded=false;
+            for(var i=0;i<mutations.length;i++){
+              var m=mutations[i];
+              if(m.target&&m.target.nodeName==='TITLE'){
+                checkTitleBadge();
+                continue;
+              }
+              if(m.type==='characterData'){
+                var p=m.target?m.target.parentElement:null;
+                if(p&&!isInsideIgnoredChrome(p)){
+                  var t=normText(m.target.nodeValue||'');
+                  if(t.length>=3&&!isTrivialStatusOrTime(t))hasMeaningfulText=true;
+                }
+              }else if(m.type==='childList'&&m.addedNodes&&m.addedNodes.length>0){
+                hasElementAdded=true;
+                if(m.target&&m.target.nodeType===1&&!isInsideIgnoredChrome(m.target)){
+                  for(var k=0;k<m.addedNodes.length;k++){
+                    var nd=m.addedNodes[k];
+                    var nt=normText(nd.textContent||'');
+                    if(nt.length>=4&&!isTrivialStatusOrTime(nt)){
+                      hasMeaningfulText=true;
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+
+            if(hasMeaningfulText && !isUserWatching()){
+              scheduleReplySettle();
+            }
+            if(hasElementAdded && !isUserWatching()){
+              if(!dotScanTimer){
+                dotScanTimer=setTimeout(function(){
+                  dotScanTimer=null;
+                  scanUnreadDots(true);
+                },1500);
+              }
+            }
+          });
+
+          obs.observe(document.documentElement,{
+            childList:true,
+            subtree:true,
+            characterData:true
+          });
+        }
+
+        if(document.documentElement){
+          installObserver();
+        }else{
+          window.addEventListener('DOMContentLoaded',installObserver,{once:true});
+        }
+        })();
+        """#
+        return WKUserScript(
+            source: js,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true,
+            in: .page
+        )
+    }
 }

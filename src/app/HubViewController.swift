@@ -151,9 +151,24 @@ final class SitePillControl: UIControl {
         }
     }
 
-    func configure(title: String, active: Bool, aliveState: String, isolated: Bool, hibernated: Bool = false, customBand: Int = 0) {
+    func configure(
+        title: String,
+        active: Bool,
+        aliveState: String,
+        isolated: Bool,
+        hibernated: Bool = false,
+        customBand: Int = 0,
+        unread: Bool = false
+    ) {
         let baseTitle = title.isEmpty ? "网页" : title
-        var display = hibernated ? "🌙 \(baseTitle)" : baseTitle
+        var display: String
+        if hibernated {
+            display = "🌙 \(baseTitle)"
+        } else if unread && !active {
+            display = "🔴 \(baseTitle)"
+        } else {
+            display = baseTitle
+        }
         if isolated {
             display += " · 独"
         }
@@ -171,7 +186,9 @@ final class SitePillControl: UIControl {
             titleLabel.textColor = hibernated ? .secondaryLabel : .label
         }
 
-        if hibernated {
+        if unread && !active && !hibernated {
+            dotView.backgroundColor = .systemRed
+        } else if hibernated {
             dotView.backgroundColor = active
                 ? UIColor(red: 0.85, green: 0.78, blue: 1.0, alpha: 1.0)
                 : .systemIndigo
@@ -203,6 +220,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private var progressObservations: [String: NSKeyValueObservation] = [:]
     private var urlObservations: [String: NSKeyValueObservation] = [:]
     private var lastKnownURLBySiteId: [String: String] = [:]
+    private var unreadSiteIds: Set<String> = []
 
     private var terminatedSiteIds: Set<String> = [] {
         didSet { runtime.terminatedSiteIds = terminatedSiteIds }
@@ -262,6 +280,18 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         JWLog("BOOT", "JetWeb v\(JWBridgeVersion()) (\(JWBridgeGitCommit())) Swift launched | iOS \(UIDevice.current.systemVersion) | RAM=\(ramMB)MB | hostPID=\(getpid()) | sites=\(config.sites.count)")
 
         writeBgEpochToken(bgEpoch)
+        JWNotificationManager.shared.configure()
+        JWNotificationManager.shared.onSelectSiteFromNotification = { [weak self] siteId in
+            guard let self = self, let target = self.site(forId: siteId) else { return }
+            if !target.enabled || target.hibernated {
+                self.setSiteHibernated(siteId: siteId, hibernated: false)
+            } else {
+                self.selectSite(byId: siteId)
+            }
+        }
+        JWNotificationManager.shared.onBackgroundListenWillStopForSuspend = { [weak self] in
+            self?.armDetachedJetsamGuardForBackgroundTransition(reason: "notify-guard-ending")
+        }
         bindRuntimeCallbacks()
 
         protectQueue.async {
@@ -275,6 +305,12 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         applyAppearanceStyles()
         applyDockCollapsedState(animated: false)
         startForegroundProtectTimer()
+
+        if config.notificationsEnabled {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                JWNotificationManager.shared.requestPermissionIfNeeded()
+            }
+        }
 
         NotificationCenter.default.addObserver(
             self,
@@ -353,8 +389,47 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         runtime.onClearAllWebsiteData = { [weak self] in
             self?.clearAllWebsiteData()
         }
+        runtime.onSendTestNotification = { [weak self] in
+            self?.sendUserTestNotification()
+        }
+        runtime.onNotificationPolicyChanged = { [weak self] in
+            guard let self = self else { return }
+            if self.config.notificationsEnabled {
+                JWNotificationManager.shared.requestPermissionIfNeeded()
+            }
+            self.rebuildTabPills()
+        }
         runtime.buildDiagnosticHeader = { [weak self] in
             self?.buildDiagnosticHeaderText() ?? ""
+        }
+    }
+
+    private func sendUserTestNotification() {
+        JWNotificationManager.shared.requestPermissionIfNeeded { [weak self] granted in
+            guard let self = self else { return }
+            if !granted {
+                let alert = UIAlertController(
+                    title: "系统通知权限未开启",
+                    message: "请在 iOS「设置 → 通知 → JetWeb」中允许通知，即可接收对话回复横幅与提示音。",
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+                alert.addAction(UIAlertAction(title: "前往系统设置", style: .default) { _ in
+                    if let u = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(u, options: [:], completionHandler: nil)
+                    }
+                })
+                self.topMostPresenter().present(alert, animated: true)
+                return
+            }
+            let curSite = self.site(forId: self.config.selectedSiteId)
+            JWNotificationManager.shared.postSiteNotification(
+                siteId: curSite?.id ?? "",
+                siteTitle: curSite?.title ?? "JetWeb",
+                subtitle: "测试通知成功",
+                body: "通知栏横幅与声音已就绪！当其他标签或后台网页（如 Muse / agy）完成回复时将自动提醒你。",
+                isTest: true
+            )
         }
     }
 
@@ -709,7 +784,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         cfg.userContentController.addUserScript(WebScripts.compatPolyfillScript())
         cfg.userContentController.addUserScript(WebScripts.inputContrastFixScript())
         cfg.userContentController.addUserScript(WebScripts.diagnosticJSErrorScript())
+        cfg.userContentController.addUserScript(WebScripts.conversationMonitorScript())
         cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwDiag")
+        cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwNotify")
 
         let wv = WKWebView(frame: webContainerView.bounds, configuration: cfg)
         wv.translatesAutoresizingMaskIntoConstraints = false
@@ -781,6 +858,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         guard let old = webViews[siteId] else { return }
         old.stopLoading()
         old.configuration.userContentController.removeScriptMessageHandler(forName: "jwDiag")
+        old.configuration.userContentController.removeScriptMessageHandler(forName: "jwNotify")
         progressObservations.removeValue(forKey: siteId)?.invalidate()
         urlObservations.removeValue(forKey: siteId)?.invalidate()
         old.navigationDelegate = nil
@@ -790,7 +868,17 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         webViewStoreIds.removeValue(forKey: siteId)
         errorOverlays.removeValue(forKey: siteId)
         terminatedSiteIds.remove(siteId)
+        unreadSiteIds.remove(siteId)
         lastRejectedAuthBySiteId.removeValue(forKey: siteId)
+    }
+
+    private func syncAllWebViewHostStates(appActive: Bool) {
+        let activeLiteral = appActive ? "true" : "false"
+        for (sid, wv) in webViews {
+            let selLiteral = (sid == config.selectedSiteId) ? "true" : "false"
+            let js = "if(window.__jwUpdateHostState)window.__jwUpdateHostState({appActive:\(activeLiteral),tabSelected:\(selLiteral)});"
+            wv.evaluateJavaScript(js, in: nil, in: .page, completionHandler: nil)
+        }
     }
 
     private func refreshRuntimeWebPIDMap() {
@@ -957,6 +1045,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private func selectSite(byId siteId: String, triggerWaves: Bool = true) {
         guard !siteId.isEmpty, let curSite = site(forId: siteId), curSite.enabled else { return }
         config.selectedSiteId = siteId
+        unreadSiteIds.remove(siteId)
         config.save()
 
         if let targetWV = webViews[siteId], !curSite.hibernated {
@@ -986,6 +1075,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             webContainerView.bringSubviewToFront(hibernatedStateView)
             floatingLabel.text = "🌙 \(curSite.title)"
         }
+
+        let isAppActive = (UIApplication.shared.applicationState == .active)
+        syncAllWebViewHostStates(appActive: isAppActive)
 
         if triggerWaves {
             rebuildTabPills()
@@ -1112,7 +1204,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 aliveState: badge,
                 isolated: s.isIsolatedStore,
                 hibernated: s.hibernated,
-                customBand: JWPriorityHelper.normalizeCustomBand(s.customBand)
+                customBand: JWPriorityHelper.normalizeCustomBand(s.customBand),
+                unread: unreadSiteIds.contains(s.id)
             )
             pill.addTarget(self, action: #selector(tabPillTapped(_:)), for: .touchUpInside)
             pill.onLongPress = { [weak self] pressedPill in
@@ -1141,6 +1234,19 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         guard let targetSite = site(forId: sender.siteId) else { return }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         showTabLongPressMenu(for: targetSite, sourceView: sender)
+    }
+
+    private func toggleSiteNotify(siteId: String) {
+        guard let idx = config.sites.firstIndex(where: { $0.id == siteId }) else { return }
+        config.sites[idx].notifyEnabled.toggle()
+        let enabled = config.sites[idx].notifyEnabled
+        if enabled {
+            config.notificationsEnabled = true
+            JWNotificationManager.shared.requestPermissionIfNeeded()
+        }
+        config.save()
+        JWLog("NOTIFY", "Toggled site=\(config.sites[idx].title) notifyEnabled=\(enabled)")
+        rebuildTabPills()
     }
 
     private func configureCenteredPopover(_ sheet: UIAlertController, sourceView: UIView?) {
@@ -1201,6 +1307,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         sheet.addAction(UIAlertAction(title: "🎯 保活等级：\(tierText)", style: .default) { [weak self] _ in
             self?.showQuickPriorityPicker(for: targetSite, sourceView: sourceView)
+        })
+
+        let notifyTitle = (config.notificationsEnabled && targetSite.notifyEnabled)
+            ? "🔔 新消息通知：已开启（点击关闭）"
+            : "🔕 新消息通知：已关闭（点击开启）"
+        sheet.addAction(UIAlertAction(title: notifyTitle, style: .default) { [weak self] _ in
+            self?.toggleSiteNotify(siteId: targetSite.id)
         })
 
         sheet.addAction(UIAlertAction(title: "复制为独立新账号分身", style: .default) { [weak self] _ in
@@ -1410,7 +1523,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 appearanceMode: site.appearanceMode,
                 dataStoreId: UUID().uuidString,
                 customBand: site.customBand,
-                hibernated: false
+                hibernated: false,
+                notifyEnabled: site.notifyEnabled
             )
             self.config.sites.append(clone)
             self.config.selectedSiteId = clone.id
@@ -1450,6 +1564,12 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         })
         sheet.addAction(UIAlertAction(title: "🎯 保活等级：\(tierText)", style: .default) { [weak self] _ in
             self?.showQuickPriorityPicker(for: curSite, sourceView: sourceView)
+        })
+        let curNotifyTitle = (config.notificationsEnabled && curSite.notifyEnabled)
+            ? "🔔 新消息通知：已开启（点击关闭）"
+            : "🔕 新消息通知：已关闭（点击开启）"
+        sheet.addAction(UIAlertAction(title: curNotifyTitle, style: .default) { [weak self] _ in
+            self?.toggleSiteNotify(siteId: siteId)
         })
         sheet.addAction(UIAlertAction(title: "复制为独立新账号分身", style: .default) { [weak self] _ in
             self?.promptCloneIsolatedSite(from: curSite)
@@ -1515,7 +1635,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let sheet = UIAlertController(title: "快速切换常驻 WebApp", message: nil, preferredStyle: .actionSheet)
         for s in enabledSites() {
             let selPrefix = (s.id == config.selectedSiteId) ? "✓ " : ""
-            let hibPrefix = s.hibernated ? "🌙 " : ""
+            let hibPrefix = s.hibernated ? "🌙 " : (unreadSiteIds.contains(s.id) && s.id != config.selectedSiteId ? "🔴 " : "")
             let bandSuffix = s.customBand > 0 ? " (\(s.customBand)档)" : ""
             sheet.addAction(UIAlertAction(title: "\(selPrefix)\(hibPrefix)\(s.title)\(bandSuffix)", style: .default) { [weak self] _ in
                 if s.hibernated {
@@ -1696,11 +1816,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let selfPid = getpid()
         let hostSt = lastProcStatuses[selfPid]
         let guardian = config.computedGuardianBands()
+        let notifySummary = config.notificationsEnabled
+            ? "开启(护航\(config.bgNotifyGuardMinutes)m\(config.bgAutoSleepAfterNotify ? "/回完休眠" : ""))"
+            : "关闭"
 
         var lines: [String] = []
         lines.append("=== JetWeb 诊断摘要 ===")
         lines.append("版本: v\(JWBridgeVersion()) (\(JWBridgeGitCommit())) | 系统: \(dev.systemName) \(dev.systemVersion) | 物理内存: \(ramMB) MB")
-        lines.append("策略: 全局默认 \(config.targetBand) 档 (网络压阵 \(guardian.auxBand) 档 / 主容器 \(guardian.hostBand) 档) | 单页上限 \(config.maxMemoryMB) MB | 外观: \(config.appearanceMode) | 日志: \(config.debugLoggingEnabled ? "开启" : "关闭")")
+        lines.append("策略: 全局默认 \(config.targetBand) 档 (网络压阵 \(guardian.auxBand) 档 / 主容器 \(guardian.hostBand) 档) | 单页上限 \(config.maxMemoryMB) MB | 通知: \(notifySummary) | 外观: \(config.appearanceMode) | 日志: \(config.debugLoggingEnabled ? "开启" : "关闭")")
         lines.append("主进程: PID \(selfPid) | 实测档位 \(hostSt?.band ?? -1) | 内存 \(hostSt?.footprintMB ?? 0) MB")
 
         for s in config.sites {
@@ -1712,8 +1835,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let stateLabel = !s.enabled ? "隐藏" : (s.hibernated ? "已休眠" : "运行中")
             let effBand = config.effectiveSiteBand(for: s)
             let bandLabel = s.customBand > 0 ? "专属\(effBand)档" : "默认\(effBand)档"
+            let notifyBadge = s.notifyEnabled ? "🔔" : "🔕"
             let recMark = terminatedSiteIds.contains(s.id) ? " [曾被回收]" : ""
-            lines.append("站点[\(stateLabel)]: \(s.title) | \(bandLabel) | \(JWDataStoreHelper.shortBadge(for: s.dataStoreId)) | WebPID=\(wpid) NetPID=\(npid) GPUPID=\(gpid) | 实测=\(st?.band ?? -1)档 内存=\(st?.footprintMB ?? 0)MB\(recMark)")
+            lines.append("站点[\(stateLabel)]: \(s.title) \(notifyBadge) | \(bandLabel) | \(JWDataStoreHelper.shortBadge(for: s.dataStoreId)) | WebPID=\(wpid) NetPID=\(npid) GPUPID=\(gpid) | 实测=\(st?.band ?? -1)档 内存=\(st?.footprintMB ?? 0)MB\(recMark)")
         }
         lines.append("======================")
         return lines.joined(separator: "\n")
@@ -1889,14 +2013,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
     }
 
-    @objc private func appDidEnterBackground() {
-        stopForegroundProtectTimer()
+    private func armDetachedJetsamGuardForBackgroundTransition(reason: String) {
         endBackgroundGuardTask()
 
         bgEpoch &+= 1
         let epoch = bgEpoch
         writeBgEpochToken(epoch)
-        JWLog("BG", "DidEnterBackground epoch=\(epoch)")
+        JWLog("BG", "Arming detached Jetsam guard reason=\(reason) epoch=\(epoch)")
 
         bgTask = UIApplication.shared.beginBackgroundTask(withName: "com.lili.jetweb.jetsamguard") { [weak self] in
             JWLog("BG", "UIBackgroundTask expired by system")
@@ -1912,7 +2035,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let maxMB = self.config.maxMemoryMB
             let epochPath = AppConfig.effectiveBgEpochPath()
             let logArg = self.config.debugLoggingEnabled ? JWLogger.logFilePath : "-"
-            JWLog("BG", "Spawning detached --bg-guard epoch=\(epoch) specs=[\(collected.applySpecs.joined(separator: ","))]")
+            JWLog("BG", "Spawning detached --bg-guard reason=\(reason) epoch=\(epoch) specs=[\(collected.applySpecs.joined(separator: ","))]")
 
             self.protectQueue.async {
                 HubViewController.writeSharedSnapshotOnBgQueue(collected.sharedSnapshot)
@@ -1921,19 +2044,48 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                 guard let self = self, self.bgEpoch == epoch else { return }
-                JWLog("BG", "Releasing UIBackgroundTask so host suspends cleanly (epoch=\(epoch))")
+                JWLog("BG", "Releasing UIBackgroundTask (reason=\(reason) epoch=\(epoch))")
                 self.endBackgroundGuardTask()
             }
         }
     }
 
+    @objc private func appDidEnterBackground() {
+        stopForegroundProtectTimer()
+        syncAllWebViewHostStates(appActive: false)
+
+        if config.hasAwakeNotifySite() && config.bgNotifyGuardMinutes > 0 {
+            JWNotificationManager.shared.startBackgroundListening(
+                minutes: config.bgNotifyGuardMinutes,
+                autoSleepAfterNotify: config.bgAutoSleepAfterNotify
+            )
+        } else {
+            JWNotificationManager.shared.stopBackgroundListening(
+                reason: "no_awake_notify_site",
+                triggerJetsamGuard: false
+            )
+        }
+
+        armDetachedJetsamGuardForBackgroundTransition(reason: "enter-bg")
+    }
+
     @objc private func appWillEnterForeground() {
+        JWNotificationManager.shared.stopBackgroundListening(
+            reason: "entered_foreground",
+            triggerJetsamGuard: false
+        )
         bgEpoch &+= 1
         writeBgEpochToken(bgEpoch)
         endBackgroundGuardTask()
+        unreadSiteIds.remove(config.selectedSiteId)
+        if let cur = site(forId: config.selectedSiteId), config.dockCollapsed, !cur.hibernated {
+            floatingLabel.text = "◉ \(cur.title)"
+        }
         JWLog("FG", "WillEnterForeground newEpoch=\(bgEpoch) terminatedCount=\(terminatedSiteIds.count)")
         applyAppearanceStyles()
         recoverWebViewIfTerminated(siteId: config.selectedSiteId)
+        syncAllWebViewHostStates(appActive: true)
+        rebuildTabPills()
         startForegroundProtectTimer()
         schedulePostStateChangeProtectionWaves()
     }
@@ -2220,17 +2372,62 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     // MARK: - WKScriptMessageHandler & WKNavigationDelegate & WKUIDelegate
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard config.debugLoggingEnabled,
-              message.name == "jwDiag",
-              let dict = message.body as? [String: Any] else { return }
-        let kind = (dict["k"] as? String) ?? "err"
-        var msg = (dict["m"] as? String) ?? ""
-        guard !msg.isEmpty else { return }
-        if msg.count > 220 {
-            msg = String(msg.prefix(220)) + "..."
+        if message.name == "jwDiag" {
+            guard config.debugLoggingEnabled,
+                  let dict = message.body as? [String: Any] else { return }
+            let kind = (dict["k"] as? String) ?? "err"
+            var msg = (dict["m"] as? String) ?? ""
+            guard !msg.isEmpty else { return }
+            if msg.count > 220 {
+                msg = String(msg.prefix(220)) + "..."
+            }
+            let title = siteId(for: message.webView).flatMap { site(forId: $0)?.title } ?? "?"
+            JWLog("JS-ERR", "site=\(title) (\(kind)) \(msg)")
+            return
         }
-        let title = siteId(for: message.webView).flatMap { site(forId: $0)?.title } ?? "?"
-        JWLog("JS-ERR", "site=\(title) (\(kind)) \(msg)")
+
+        if message.name == "jwNotify" {
+            guard let dict = message.body as? [String: Any],
+                  let sid = siteId(for: message.webView),
+                  let senderSite = site(forId: sid) else { return }
+            let kind = (dict["k"] as? String) ?? ""
+            if kind == "user_sent" {
+                JWLog("NOTIFY", "User submitted message in site=\(senderSite.title)")
+                return
+            }
+            if kind == "streaming" {
+                JWNotificationManager.shared.noteSiteStreamingActivity()
+                return
+            }
+            guard kind == "reply_done" || kind == "unread_dot" || kind == "web_api" || kind == "title_badge" else {
+                return
+            }
+            guard config.notificationsEnabled,
+                  senderSite.notifyEnabled,
+                  senderSite.enabled,
+                  !senderSite.hibernated else { return }
+
+            let isActivelyViewing = (UIApplication.shared.applicationState == .active && sid == config.selectedSiteId)
+            guard !isActivelyViewing else { return }
+
+            let sub = (dict["sub"] as? String) ?? "收到新消息"
+            let body = (dict["body"] as? String) ?? "有新的对话回复待查看"
+
+            if sid != config.selectedSiteId {
+                unreadSiteIds.insert(sid)
+                rebuildTabPills()
+                if config.dockCollapsed {
+                    floatingLabel.text = "🔴 \(senderSite.title)"
+                }
+            }
+
+            JWNotificationManager.shared.postSiteNotification(
+                siteId: sid,
+                siteTitle: senderSite.title,
+                subtitle: sub,
+                body: body
+            )
+        }
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
@@ -2267,6 +2464,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             in: .defaultClient,
             completionHandler: nil
         )
+        syncAllWebViewHostStates(appActive: UIApplication.shared.applicationState == .active)
         refreshRuntimeWebPIDMap()
         schedulePostStateChangeProtectionWaves()
     }

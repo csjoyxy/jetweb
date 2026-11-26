@@ -16,6 +16,8 @@ final class HubRuntimeState: ObservableObject {
     var onReloadSite: ((String) -> Void)?
     var onClearSiteData: ((String) -> Void)?
     var onClearAllWebsiteData: (() -> Void)?
+    var onSendTestNotification: (() -> Void)?
+    var onNotificationPolicyChanged: (() -> Void)?
     var buildDiagnosticHeader: (() -> String)?
 }
 
@@ -194,6 +196,7 @@ struct SettingsDrawerView: View {
             List {
                 liveProcessSection
                 sitesSection
+                notificationSection
                 policyAndToolsSection
             }
             .listStyle(InsetGroupedListStyle())
@@ -414,6 +417,16 @@ struct SettingsDrawerView: View {
                                             .cornerRadius(4)
                                     }
 
+                                    if config.notificationsEnabled && site.notifyEnabled && site.enabled && !site.hibernated {
+                                        Text("🔔 通知")
+                                            .font(.system(size: 10.5, weight: .medium))
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.teal.opacity(0.15))
+                                            .foregroundColor(.teal)
+                                            .cornerRadius(4)
+                                    }
+
                                     let mode = JWAppearanceHelper.normalizeSite(site.appearanceMode)
                                     if mode != JWConstants.appearanceInherit {
                                         Text(JWAppearanceHelper.label(for: mode))
@@ -455,6 +468,56 @@ struct SettingsDrawerView: View {
                     config.sites.remove(atOffsets: offsets)
                     config.save()
                     runtime.onSyncStructure?(nil)
+                }
+            }
+        }
+    }
+
+    private var notificationSection: some View {
+        Section(
+            header: Text("智能新消息通知与省电护航"),
+            footer: Text("开启后自动识别网页对话回复收尾、未读蓝点与网页通知并推送到 iOS 系统通知栏。退后台限时护航结束后（或通知送达约 1 分钟后）自动切断后台连线恢复 0 耗电冻结，锁屏过夜不跑电。")
+        ) {
+            Toggle("开启新对话 / 回复系统通知", isOn: Binding(
+                get: { config.notificationsEnabled },
+                set: { newVal in
+                    config.notificationsEnabled = newVal
+                    config.save()
+                    runtime.onNotificationPolicyChanged?()
+                }
+            ))
+
+            if config.notificationsEnabled {
+                Picker("退后台等信护航时长", selection: Binding(
+                    get: { config.bgNotifyGuardMinutes },
+                    set: { newMin in
+                        config.bgNotifyGuardMinutes = newMin
+                        config.save()
+                        runtime.onNotificationPolicyChanged?()
+                    }
+                )) {
+                    Text("仅前台跨标签通知（退后台即睡）").tag(0)
+                    Text("5 分钟（短任务省电）").tag(5)
+                    Text("15 分钟（均衡推荐）").tag(15)
+                    Text("30 分钟（长任务护航）").tag(30)
+                    Text("60 分钟").tag(60)
+                }
+
+                if config.bgNotifyGuardMinutes > 0 {
+                    Toggle("收到通知后 1 分钟自动休眠省电", isOn: Binding(
+                        get: { config.bgAutoSleepAfterNotify },
+                        set: { newVal in
+                            config.bgAutoSleepAfterNotify = newVal
+                            config.save()
+                            runtime.onNotificationPolicyChanged?()
+                        }
+                    ))
+                }
+
+                Button {
+                    runtime.onSendTestNotification?()
+                } label: {
+                    Label("发送一条测试通知（检验系统横幅与声音）", systemImage: "bell.badge.fill")
                 }
             }
         }
@@ -547,6 +610,7 @@ struct AddSiteSheet: View {
     @State private var useIsolatedStore: Bool = true
     @State private var userTouchedStoreToggle: Bool = false
     @State private var customBand: Int = 0
+    @State private var notifyEnabled: Bool = true
     @State private var appearanceMode: String = JWConstants.appearanceInherit
     @State private var showingInvalidURLAlert = false
 
@@ -592,7 +656,8 @@ struct AddSiteSheet: View {
                     ))
                 }
 
-                Section(header: Text("单站点外观模式")) {
+                Section(header: Text("通知与单站点外观")) {
+                    Toggle("🔔 接收此站点新消息通知", isOn: $notifyEnabled)
                     Picker("外观模式", selection: $appearanceMode) {
                         Text("跟随全局").tag(JWConstants.appearanceInherit)
                         Text("跟随系统").tag(JWConstants.appearanceSystem)
@@ -648,12 +713,13 @@ struct AddSiteSheet: View {
             appearanceMode: appearanceMode,
             dataStoreId: dsId,
             customBand: customBand,
-            hibernated: false
+            hibernated: false,
+            notifyEnabled: notifyEnabled
         )
         config.sites.append(item)
         config.selectedSiteId = item.id
         config.save()
-        JWLog("STORE", "Added site=\(item.title) isolated=\(useIsolatedStore) customBand=\(item.customBand)")
+        JWLog("STORE", "Added site=\(item.title) isolated=\(useIsolatedStore) customBand=\(item.customBand) notify=\(notifyEnabled)")
         runtime.onSyncStructure?(item.id)
         presentationMode.wrappedValue.dismiss()
     }
@@ -766,9 +832,18 @@ struct SiteDetailView: View {
                 }
 
                 Section(
-                    header: Text("内存释放与外观"),
-                    footer: Text("休眠会立即销毁网页渲染进程释放内存，底栏保留标签且不丢登录态，下次点击即唤醒。")
+                    header: Text("通知、内存释放与外观"),
+                    footer: Text("开启新消息通知后，切去其他标签或退后台限时护航期间会自动推送对话回复与未读提醒；休眠此标签时会自动暂停后台通知以节省内存与电量。")
                 ) {
+                    Toggle("🔔 接收此站点新消息通知", isOn: Binding(
+                        get: { config.sites[idx].notifyEnabled },
+                        set: { newVal in
+                            config.sites[idx].notifyEnabled = newVal
+                            config.save()
+                            runtime.onNotificationPolicyChanged?()
+                        }
+                    ))
+
                     Picker("外观模式", selection: Binding(
                         get: { JWAppearanceHelper.normalizeSite(config.sites[idx].appearanceMode) },
                         set: { newMode in
@@ -864,7 +939,8 @@ struct SiteDetailView: View {
             appearanceMode: site.appearanceMode,
             dataStoreId: UUID().uuidString,
             customBand: site.customBand,
-            hibernated: false
+            hibernated: false,
+            notifyEnabled: site.notifyEnabled
         )
         config.sites.append(clone)
         config.selectedSiteId = clone.id

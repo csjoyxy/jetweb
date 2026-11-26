@@ -56,13 +56,14 @@ jobs:
             JetWebBridge.o \
             app/Models.swift \
             app/Logger.swift \
+            app/NotificationManager.swift \
             app/WebScripts.swift \
             app/ErrorOverlayView.swift \
             app/SettingsDrawerView.swift \
             app/HubViewController.swift \
             app/AppMain.swift \
             -Xlinker -rpath -Xlinker /usr/lib/swift \
-            -framework UIKit -framework SwiftUI -framework Foundation -framework WebKit -framework CoreGraphics -framework QuartzCore -framework Security \
+            -framework UIKit -framework SwiftUI -framework Foundation -framework WebKit -framework UserNotifications -framework AVFoundation -framework CoreGraphics -framework QuartzCore -framework Security \
             -o JetWeb
           rm -f JetWebBridge.o
           ldid -Sentitlements-app.plist JetWeb

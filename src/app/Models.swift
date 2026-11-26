@@ -10,6 +10,7 @@ enum JWConstants {
     static let maxSites = 8
     static let defaultBand = 85
     static let defaultMaxMB = 450
+    static let defaultBgNotifyMinutes = 15
     static let minSiteBand = 30
     static let maxSiteBand = 92
 
@@ -170,6 +171,8 @@ struct SiteItem: Identifiable, Equatable {
     var customBand: Int
     /// true = 已手动休眠释放内存（底栏保留标签与登录态，点击即唤醒）
     var hibernated: Bool
+    /// true = 接收该站点新对话/回复完成通知
+    var notifyEnabled: Bool
 
     init(
         id: String = UUID().uuidString,
@@ -179,7 +182,8 @@ struct SiteItem: Identifiable, Equatable {
         appearanceMode: String = JWConstants.appearanceInherit,
         dataStoreId: String = JWConstants.dataStoreDefault,
         customBand: Int = 0,
-        hibernated: Bool = false
+        hibernated: Bool = false,
+        notifyEnabled: Bool = true
     ) {
         self.id = id
         self.title = title
@@ -189,6 +193,7 @@ struct SiteItem: Identifiable, Equatable {
         self.dataStoreId = JWDataStoreHelper.normalize(dataStoreId)
         self.customBand = JWPriorityHelper.normalizeCustomBand(customBand)
         self.hibernated = hibernated
+        self.notifyEnabled = notifyEnabled
     }
 
     var isIsolatedStore: Bool {
@@ -204,6 +209,7 @@ struct SiteItem: Identifiable, Equatable {
         let dsId = JWDataStoreHelper.normalize(dict["dataStoreId"] as? String)
         let rawBand = (dict["customBand"] as? NSNumber)?.intValue ?? (dict["customBand"] as? Int) ?? 0
         let hibernated = (dict["hibernated"] as? NSNumber)?.boolValue ?? (dict["hibernated"] as? Bool) ?? false
+        let notifyEnabled = (dict["notifyEnabled"] as? NSNumber)?.boolValue ?? (dict["notifyEnabled"] as? Bool) ?? true
         return SiteItem(
             id: sid,
             title: rawTitle.isEmpty ? url : rawTitle,
@@ -212,7 +218,8 @@ struct SiteItem: Identifiable, Equatable {
             appearanceMode: appearance,
             dataStoreId: dsId,
             customBand: rawBand,
-            hibernated: hibernated
+            hibernated: hibernated,
+            notifyEnabled: notifyEnabled
         )
     }
 
@@ -225,7 +232,8 @@ struct SiteItem: Identifiable, Equatable {
             "appearanceMode": JWAppearanceHelper.normalizeSite(appearanceMode),
             "dataStoreId": JWDataStoreHelper.normalize(dataStoreId),
             "customBand": JWPriorityHelper.normalizeCustomBand(customBand),
-            "hibernated": hibernated
+            "hibernated": hibernated,
+            "notifyEnabled": notifyEnabled
         ]
     }
 }
@@ -286,6 +294,16 @@ final class AppConfig: ObservableObject {
     @Published var appearanceMode: String = JWConstants.appearanceSystem
     @Published var trustedCerts: [String: String] = [:]
     @Published var debugLoggingEnabled: Bool = true
+    @Published var notificationsEnabled: Bool = true
+    /// 0 = 仅前台跨标签通知（退后台不保活）；5 / 15 / 30 / 60 = 退后台等信护航分钟数
+    @Published var bgNotifyGuardMinutes: Int = JWConstants.defaultBgNotifyMinutes
+    /// 退后台期间收到新消息弹完通知后，缓冲约 1 分钟自动停止后台连线省电
+    @Published var bgAutoSleepAfterNotify: Bool = true
+
+    func hasAwakeNotifySite() -> Bool {
+        guard notificationsEnabled else { return false }
+        return sites.contains { $0.enabled && !$0.hibernated && $0.notifyEnabled }
+    }
 
     func effectiveSiteBand(for site: SiteItem) -> Int {
         let norm = JWPriorityHelper.normalizeCustomBand(site.customBand)
@@ -406,6 +424,16 @@ final class AppConfig: ObservableObject {
         if let dl = (root["debugLoggingEnabled"] as? NSNumber)?.boolValue ?? (root["debugLoggingEnabled"] as? Bool) {
             cfg.debugLoggingEnabled = dl
         }
+        if let ne = (root["notificationsEnabled"] as? NSNumber)?.boolValue ?? (root["notificationsEnabled"] as? Bool) {
+            cfg.notificationsEnabled = ne
+        }
+        if let bm = (root["bgNotifyGuardMinutes"] as? NSNumber)?.intValue ?? (root["bgNotifyGuardMinutes"] as? Int),
+           [0, 5, 15, 30, 60].contains(bm) {
+            cfg.bgNotifyGuardMinutes = bm
+        }
+        if let aslp = (root["bgAutoSleepAfterNotify"] as? NSNumber)?.boolValue ?? (root["bgAutoSleepAfterNotify"] as? Bool) {
+            cfg.bgAutoSleepAfterNotify = aslp
+        }
         return cfg
     }
 
@@ -420,7 +448,10 @@ final class AppConfig: ObservableObject {
             "dockCollapsed": dockCollapsed,
             "appearanceMode": JWAppearanceHelper.normalizeGlobal(appearanceMode),
             "trustedCerts": trustedCerts,
-            "debugLoggingEnabled": debugLoggingEnabled
+            "debugLoggingEnabled": debugLoggingEnabled,
+            "notificationsEnabled": notificationsEnabled,
+            "bgNotifyGuardMinutes": bgNotifyGuardMinutes,
+            "bgAutoSleepAfterNotify": bgAutoSleepAfterNotify
         ]
         guard let json = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]) else {
             return false
