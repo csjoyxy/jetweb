@@ -14,6 +14,8 @@
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Security/Security.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <objc/message.h>
 #include <spawn.h>
 #include <fcntl.h>
@@ -45,7 +47,103 @@ static const NSInteger kJWMaxSites      = 8;
 static const NSInteger kJWDefaultBand   = 85;
 static const NSInteger kJWDefaultMaxMB  = 450;
 
-#pragma mark - One-Shot WKUIDelegate Completion Guards
+static NSString *const kJWAppearanceInherit = @"inherit";
+static NSString *const kJWAppearanceSystem  = @"system";
+static NSString *const kJWAppearanceLight   = @"light";
+static NSString *const kJWAppearanceDark    = @"dark";
+
+#pragma mark - Appearance & Certificate Helpers
+
+static NSString *JWNormalizeGlobalAppearanceMode(NSString *raw) {
+    if ([raw isEqualToString:kJWAppearanceLight]) return kJWAppearanceLight;
+    if ([raw isEqualToString:kJWAppearanceDark]) return kJWAppearanceDark;
+    return kJWAppearanceSystem;
+}
+
+static NSString *JWNormalizeSiteAppearanceMode(NSString *raw) {
+    if ([raw isEqualToString:kJWAppearanceSystem]) return kJWAppearanceSystem;
+    if ([raw isEqualToString:kJWAppearanceLight]) return kJWAppearanceLight;
+    if ([raw isEqualToString:kJWAppearanceDark]) return kJWAppearanceDark;
+    return kJWAppearanceInherit;
+}
+
+static NSString *JWAppearanceModeLabel(NSString *mode) {
+    if ([mode isEqualToString:kJWAppearanceLight]) return @"强制浅色";
+    if ([mode isEqualToString:kJWAppearanceDark]) return @"强制深色";
+    if ([mode isEqualToString:kJWAppearanceSystem]) return @"跟随系统";
+    return @"跟随全局";
+}
+
+static UIUserInterfaceStyle JWUIUserInterfaceStyleForMode(NSString *resolvedMode, UIUserInterfaceStyle fallbackSystemStyle) {
+    if ([resolvedMode isEqualToString:kJWAppearanceLight]) return UIUserInterfaceStyleLight;
+    if ([resolvedMode isEqualToString:kJWAppearanceDark]) return UIUserInterfaceStyleDark;
+    return fallbackSystemStyle;
+}
+
+static void JWExtractLeafCertInfo(SecTrustRef trust, NSString **fingerprintOut, NSString **subjectOut) {
+    NSString *fp = @"";
+    NSString *subj = @"";
+    if (trust) {
+        CFArrayRef chain = SecTrustCopyCertificateChain(trust);
+        if (chain && CFArrayGetCount(chain) > 0) {
+            SecCertificateRef leaf = (SecCertificateRef)CFArrayGetValueAtIndex(chain, 0);
+            if (leaf) {
+                CFStringRef subjRef = SecCertificateCopySubjectSummary(leaf);
+                if (subjRef) {
+                    subj = (__bridge_transfer NSString *)subjRef;
+                }
+                CFDataRef derRef = SecCertificateCopyData(leaf);
+                if (derRef) {
+                    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+                    CC_SHA256(CFDataGetBytePtr(derRef), (CC_LONG)CFDataGetLength(derRef), digest);
+                    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+                    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+                        [hex appendFormat:@"%02X", digest[i]];
+                    }
+                    fp = [hex copy];
+                    CFRelease(derRef);
+                }
+            }
+        }
+        if (chain) CFRelease(chain);
+    }
+    if (fingerprintOut) *fingerprintOut = fp;
+    if (subjectOut) *subjectOut = subj;
+}
+
+static NSString *JWFormatShortFingerprint(NSString *hex) {
+    if (hex.length < 24) return hex ?: @"";
+    NSMutableString *out = [NSMutableString string];
+    for (NSUInteger i = 0; i < 16; i += 2) {
+        if (i > 0) [out appendString:@":"];
+        [out appendString:[hex substringWithRange:NSMakeRange(i, 2)]];
+    }
+    [out appendString:@" ... "];
+    NSUInteger tailStart = hex.length - 8;
+    for (NSUInteger i = tailStart; i < hex.length; i += 2) {
+        if (i > tailStart) [out appendString:@":"];
+        [out appendString:[hex substringWithRange:NSMakeRange(i, 2)]];
+    }
+    return [out copy];
+}
+
+static BOOL JWIsSSLError(NSError *error) {
+    if (!error || ![error.domain isEqualToString:NSURLErrorDomain]) return NO;
+    switch (error.code) {
+        case NSURLErrorSecureConnectionFailed:
+        case NSURLErrorServerCertificateHasBadDate:
+        case NSURLErrorServerCertificateUntrusted:
+        case NSURLErrorServerCertificateHasUnknownRoot:
+        case NSURLErrorServerCertificateNotYetValid:
+        case NSURLErrorClientCertificateRejected:
+        case NSURLErrorClientCertificateRequired:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+#pragma mark - One-Shot Delegate Completion Guards
 
 @interface JWAlertCompletionGuard : NSObject
 - (instancetype)initWithBlock:(void (^)(void))block;
@@ -116,6 +214,97 @@ static const NSInteger kJWDefaultMaxMB  = 450;
 }
 @end
 
+@interface JWAuthChallengeCompletionGuard : NSObject
+- (instancetype)initWithBlock:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))block;
+- (void)invokeWithDisposition:(NSURLSessionAuthChallengeDisposition)disposition credential:(NSURLCredential *)credential;
+@end
+
+@implementation JWAuthChallengeCompletionGuard {
+    void (^_block)(NSURLSessionAuthChallengeDisposition, NSURLCredential *);
+}
+- (instancetype)initWithBlock:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))block {
+    self = [super init];
+    if (self) _block = [block copy];
+    return self;
+}
+- (void)invokeWithDisposition:(NSURLSessionAuthChallengeDisposition)disposition credential:(NSURLCredential *)credential {
+    void (^b)(NSURLSessionAuthChallengeDisposition, NSURLCredential *) = nil;
+    @synchronized (self) {
+        b = _block;
+        _block = nil;
+    }
+    if (b) b(disposition, credential);
+}
+- (void)dealloc {
+    [self invokeWithDisposition:NSURLSessionAuthChallengeCancelAuthenticationChallenge credential:nil];
+}
+@end
+
+@interface JWPendingTrustItem : NSObject
+@property (nonatomic, strong) JWAuthChallengeCompletionGuard *guard;
+@property (nonatomic, weak) WKWebView *webView;
+- (instancetype)initWithServerTrust:(SecTrustRef)trust guard:(JWAuthChallengeCompletionGuard *)guard webView:(WKWebView *)webView;
+- (void)resolveAccept:(BOOL)accept;
+@end
+
+@implementation JWPendingTrustItem {
+    SecTrustRef _serverTrust;
+}
+- (instancetype)initWithServerTrust:(SecTrustRef)trust guard:(JWAuthChallengeCompletionGuard *)guard webView:(WKWebView *)webView {
+    self = [super init];
+    if (self) {
+        if (trust) _serverTrust = (SecTrustRef)CFRetain(trust);
+        _guard = guard;
+        _webView = webView;
+    }
+    return self;
+}
+- (void)resolveAccept:(BOOL)accept {
+    if (accept && _serverTrust) {
+        CFDataRef exceptions = SecTrustCopyExceptions(_serverTrust);
+        if (exceptions) {
+            SecTrustSetExceptions(_serverTrust, exceptions);
+            CFRelease(exceptions);
+        }
+        NSURLCredential *cred = [NSURLCredential credentialForTrust:_serverTrust];
+        [self.guard invokeWithDisposition:NSURLSessionAuthChallengeUseCredential credential:cred];
+    } else {
+        [self.guard invokeWithDisposition:NSURLSessionAuthChallengeCancelAuthenticationChallenge credential:nil];
+    }
+}
+- (void)dealloc {
+    if (_serverTrust) {
+        CFRelease(_serverTrust);
+        _serverTrust = NULL;
+    }
+}
+@end
+
+@interface JWPendingBasicAuthItem : NSObject
+@property (nonatomic, strong) JWAuthChallengeCompletionGuard *guard;
+@property (nonatomic, weak) WKWebView *webView;
+- (instancetype)initWithGuard:(JWAuthChallengeCompletionGuard *)guard webView:(WKWebView *)webView;
+- (void)resolveWithCredential:(NSURLCredential *)credential;
+@end
+
+@implementation JWPendingBasicAuthItem
+- (instancetype)initWithGuard:(JWAuthChallengeCompletionGuard *)guard webView:(WKWebView *)webView {
+    self = [super init];
+    if (self) {
+        _guard = guard;
+        _webView = webView;
+    }
+    return self;
+}
+- (void)resolveWithCredential:(NSURLCredential *)credential {
+    if (credential) {
+        [self.guard invokeWithDisposition:NSURLSessionAuthChallengeUseCredential credential:credential];
+    } else {
+        [self.guard invokeWithDisposition:NSURLSessionAuthChallengeCancelAuthenticationChallenge credential:nil];
+    }
+}
+@end
+
 #pragma mark - Data Models
 
 @interface JWSiteItem : NSObject
@@ -123,6 +312,7 @@ static const NSInteger kJWDefaultMaxMB  = 450;
 @property (nonatomic, copy) NSString *title;
 @property (nonatomic, copy) NSString *urlString;
 @property (nonatomic, assign) BOOL enabled;
+@property (nonatomic, copy) NSString *appearanceMode; // inherit / system / light / dark
 + (instancetype)siteWithDictionary:(NSDictionary *)dict;
 - (NSDictionary *)toDictionary;
 @end
@@ -135,6 +325,7 @@ static const NSInteger kJWDefaultMaxMB  = 450;
         _title = @"";
         _urlString = @"";
         _enabled = YES;
+        _appearanceMode = kJWAppearanceInherit;
     }
     return self;
 }
@@ -151,6 +342,8 @@ static const NSInteger kJWDefaultMaxMB  = 450;
     item.urlString = url;
     NSNumber *en = [dict[@"enabled"] isKindOfClass:[NSNumber class]] ? dict[@"enabled"] : @YES;
     item.enabled = en.boolValue;
+    NSString *am = [dict[@"appearanceMode"] isKindOfClass:[NSString class]] ? dict[@"appearanceMode"] : kJWAppearanceInherit;
+    item.appearanceMode = JWNormalizeSiteAppearanceMode(am);
     return item;
 }
 
@@ -159,7 +352,8 @@ static const NSInteger kJWDefaultMaxMB  = 450;
         @"id": self.siteId ?: [[NSUUID UUID] UUIDString],
         @"title": self.title ?: @"",
         @"url": self.urlString ?: @"",
-        @"enabled": @(self.enabled)
+        @"enabled": @(self.enabled),
+        @"appearanceMode": JWNormalizeSiteAppearanceMode(self.appearanceMode)
     };
 }
 @end
@@ -194,8 +388,11 @@ static const NSInteger kJWDefaultMaxMB  = 450;
 @property (nonatomic, assign) NSInteger targetBand;
 @property (nonatomic, assign) NSInteger maxMemoryMB;
 @property (nonatomic, assign) BOOL dockCollapsed;
+@property (nonatomic, copy) NSString *appearanceMode; // system / light / dark
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *trustedCerts; // host -> SHA256 hex
 + (instancetype)loadConfig;
 - (BOOL)saveConfig;
+- (NSString *)effectiveAppearanceModeForSite:(JWSiteItem *)site;
 @end
 
 @implementation JWAppConfig
@@ -207,8 +404,18 @@ static const NSInteger kJWDefaultMaxMB  = 450;
         _targetBand = kJWDefaultBand;
         _maxMemoryMB = kJWDefaultMaxMB;
         _dockCollapsed = NO;
+        _appearanceMode = kJWAppearanceSystem;
+        _trustedCerts = [NSMutableDictionary dictionary];
     }
     return self;
+}
+
+- (NSString *)effectiveAppearanceModeForSite:(JWSiteItem *)site {
+    NSString *siteMode = JWNormalizeSiteAppearanceMode(site.appearanceMode);
+    if (![siteMode isEqualToString:kJWAppearanceInherit]) {
+        return siteMode;
+    }
+    return JWNormalizeGlobalAppearanceMode(self.appearanceMode);
 }
 
 + (NSString *)effectiveDir {
@@ -259,6 +466,22 @@ static const NSInteger kJWDefaultMaxMB  = 450;
     if ([root[@"dockCollapsed"] isKindOfClass:[NSNumber class]]) {
         cfg.dockCollapsed = [root[@"dockCollapsed"] boolValue];
     }
+    if ([root[@"appearanceMode"] isKindOfClass:[NSString class]]) {
+        cfg.appearanceMode = JWNormalizeGlobalAppearanceMode(root[@"appearanceMode"]);
+    }
+    if ([root[@"trustedCerts"] isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *rawCerts = root[@"trustedCerts"];
+        for (id key in rawCerts) {
+            id val = rawCerts[key];
+            if ([key isKindOfClass:[NSString class]] && [val isKindOfClass:[NSString class]]) {
+                NSString *host = [(NSString *)key lowercaseString];
+                NSString *fp = [(NSString *)val uppercaseString];
+                if (host.length > 0 && fp.length >= 32) {
+                    cfg.trustedCerts[host] = fp;
+                }
+            }
+        }
+    }
     return cfg;
 }
 
@@ -272,7 +495,9 @@ static const NSInteger kJWDefaultMaxMB  = 450;
         @"selectedSiteId": self.selectedSiteId ?: @"",
         @"targetBand": @(self.targetBand),
         @"maxMemoryMB": @(self.maxMemoryMB),
-        @"dockCollapsed": @(self.dockCollapsed)
+        @"dockCollapsed": @(self.dockCollapsed),
+        @"appearanceMode": JWNormalizeGlobalAppearanceMode(self.appearanceMode),
+        @"trustedCerts": self.trustedCerts ?: @{}
     };
     NSData *json = [NSJSONSerialization dataWithJSONObject:root options:NSJSONWritingPrettyPrinted error:nil];
     if (!json) return NO;
@@ -492,6 +717,405 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
     }
 }
 
+#pragma mark - WebKit User Scripts (iOS 16.4 Polyfills & Input Contrast Fallback)
+
+static WKUserScript *JWWebKitCompatPolyfillScript(void) {
+    static NSString *const kPolyfillJS =
+        @"(function(){\n"
+        @"'use strict';\n"
+        @"try{\n"
+        @"  if(typeof Promise==='function'&&typeof Promise.withResolvers!=='function'){\n"
+        @"    Object.defineProperty(Promise,'withResolvers',{configurable:true,writable:true,value:function withResolvers(){\n"
+        @"      var resolve,reject;\n"
+        @"      var promise=new this(function(res,rej){resolve=res;reject=rej;});\n"
+        @"      return{promise:promise,resolve:resolve,reject:reject};\n"
+        @"    }});\n"
+        @"  }\n"
+        @"  if(typeof Promise==='function'&&typeof Promise.try!=='function'){\n"
+        @"    Object.defineProperty(Promise,'try',{configurable:true,writable:true,value:function promiseTry(fn){\n"
+        @"      var args=Array.prototype.slice.call(arguments,1);\n"
+        @"      return new this(function(resolve){resolve(fn.apply(undefined,args));});\n"
+        @"    }});\n"
+        @"  }\n"
+        @"  if(typeof URL==='function'&&typeof URL.parse!=='function'){\n"
+        @"    Object.defineProperty(URL,'parse',{configurable:true,writable:true,value:function parse(url,base){\n"
+        @"      try{return(arguments.length>1&&base!==undefined)?new URL(url,base):new URL(url);}catch(_){return null;}\n"
+        @"    }});\n"
+        @"  }\n"
+        @"  if(typeof URL==='function'&&typeof URL.canParse!=='function'){\n"
+        @"    Object.defineProperty(URL,'canParse',{configurable:true,writable:true,value:function canParse(url,base){\n"
+        @"      try{if(arguments.length>1&&base!==undefined){new URL(url,base);}else{new URL(url);}return true;}catch(_){return false;}\n"
+        @"    }});\n"
+        @"  }\n"
+        @"  if(typeof Object.groupBy!=='function'){\n"
+        @"    Object.defineProperty(Object,'groupBy',{configurable:true,writable:true,value:function groupBy(items,cb){\n"
+        @"      var out=Object.create(null),idx=0;\n"
+        @"      for(var item of items){var k=cb(item,idx++);if(Object.prototype.hasOwnProperty.call(out,k)){out[k].push(item);}else{out[k]=[item];}}\n"
+        @"      return out;\n"
+        @"    }});\n"
+        @"  }\n"
+        @"  if(typeof Map==='function'&&typeof Map.groupBy!=='function'){\n"
+        @"    Object.defineProperty(Map,'groupBy',{configurable:true,writable:true,value:function groupBy(items,cb){\n"
+        @"      var out=new Map(),idx=0;\n"
+        @"      for(var item of items){var k=cb(item,idx++),arr=out.get(k);if(arr){arr.push(item);}else{out.set(k,[item]);}}\n"
+        @"      return out;\n"
+        @"    }});\n"
+        @"  }\n"
+        @"  if(typeof AbortSignal==='function'&&typeof AbortSignal.any!=='function'){\n"
+        @"    Object.defineProperty(AbortSignal,'any',{configurable:true,writable:true,value:function any(signals){\n"
+        @"      var ctrl=new AbortController(),list=Array.from(signals||[]);\n"
+        @"      for(var i=0;i<list.length;i++){if(list[i]&&list[i].aborted){ctrl.abort(list[i].reason);return ctrl.signal;}}\n"
+        @"      var onAbort=function(ev){\n"
+        @"        ctrl.abort(ev&&ev.target?ev.target.reason:undefined);\n"
+        @"        for(var j=0;j<list.length;j++){if(list[j])list[j].removeEventListener('abort',onAbort);}\n"
+        @"      };\n"
+        @"      for(var k=0;k<list.length;k++){if(list[k])list[k].addEventListener('abort',onAbort,{once:true});}\n"
+        @"      return ctrl.signal;\n"
+        @"    }});\n"
+        @"  }\n"
+        @"}catch(_){}\n"
+        @"})();\n";
+    return [[WKUserScript alloc] initWithSource:kPolyfillJS
+                                  injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                               forMainFrameOnly:NO
+                                 inContentWorld:[WKContentWorld pageWorld]];
+}
+
+static WKUserScript *JWInputContrastFixScript(void) {
+    static NSString *const kContrastJS =
+        @"(function(){\n"
+        @"'use strict';\n"
+        @"if(window.__jwContrastFixInstalled)return;\n"
+        @"window.__jwContrastFixInstalled=true;\n"
+        @"var SKIP_TYPES={hidden:1,checkbox:1,radio:1,button:1,submit:1,reset:1,image:1,file:1,range:1,color:1};\n"
+        @"var patched=new WeakMap();\n"
+        @"function isTextInput(el){\n"
+        @"  if(!el||el.nodeType!==1)return false;\n"
+        @"  var tag=el.tagName;\n"
+        @"  if(tag==='TEXTAREA')return true;\n"
+        @"  if(tag==='INPUT'){var t=(el.getAttribute('type')||'text').toLowerCase();return !SKIP_TYPES[t];}\n"
+        @"  return false;\n"
+        @"}\n"
+        @"function parseColor(str){\n"
+        @"  if(!str||typeof str!=='string')return null;\n"
+        @"  str=str.trim().toLowerCase();\n"
+        @"  if(str==='transparent')return{r:0,g:0,b:0,a:0};\n"
+        @"  var m=str.match(/^rgba?\\(([^)]+)\\)$/);\n"
+        @"  if(m){\n"
+        @"    var body=m[1].trim();\n"
+        @"    var alpha=1;\n"
+        @"    var slash=body.split('/');\n"
+        @"    if(slash.length===2){\n"
+        @"      var aStr=slash[1].trim();\n"
+        @"      alpha=aStr.endsWith('%')?parseFloat(aStr)/100:parseFloat(aStr);\n"
+        @"      body=slash[0].trim();\n"
+        @"    }\n"
+        @"    var parts=body.indexOf(',')!==-1?body.split(','):body.split(/\\s+/);\n"
+        @"    if(parts.length<3)return null;\n"
+        @"    var r=parseFloat(parts[0]),g=parseFloat(parts[1]),b=parseFloat(parts[2]);\n"
+        @"    if(parts.length>=4&&slash.length===1){\n"
+        @"      var a4=parts[3].trim();\n"
+        @"      alpha=a4.endsWith('%')?parseFloat(a4)/100:parseFloat(a4);\n"
+        @"    }\n"
+        @"    if(isNaN(r)||isNaN(g)||isNaN(b)||isNaN(alpha))return null;\n"
+        @"    return{r:Math.max(0,Math.min(255,r)),g:Math.max(0,Math.min(255,g)),b:Math.max(0,Math.min(255,b)),a:Math.max(0,Math.min(1,alpha))};\n"
+        @"  }\n"
+        @"  var srgb=str.match(/^color\\(\\s*srgb\\s+([\\d.e+-]+)\\s+([\\d.e+-]+)\\s+([\\d.e+-]+)(?:\\s*\\/\\s*([\\d.e+%-]+))?\\s*\\)$/);\n"
+        @"  if(srgb){\n"
+        @"    var a=1;\n"
+        @"    if(srgb[4]!==undefined){a=srgb[4].endsWith('%')?parseFloat(srgb[4])/100:parseFloat(srgb[4]);}\n"
+        @"    return{r:Math.max(0,Math.min(255,parseFloat(srgb[1])*255)),g:Math.max(0,Math.min(255,parseFloat(srgb[2])*255)),b:Math.max(0,Math.min(255,parseFloat(srgb[3])*255)),a:isNaN(a)?1:Math.max(0,Math.min(1,a))};\n"
+        @"  }\n"
+        @"  return null;\n"
+        @"}\n"
+        @"function compositeOver(fg,bg){\n"
+        @"  var a=fg.a;\n"
+        @"  return{r:fg.r*a+bg.r*(1-a),g:fg.g*a+bg.g*(1-a),b:fg.b*a+bg.b*(1-a),a:1};\n"
+        @"}\n"
+        @"function baseCanvasColor(){\n"
+        @"  try{\n"
+        @"    var isDark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;\n"
+        @"    if(isDark&&document.documentElement){\n"
+        @"      var cs=(getComputedStyle(document.documentElement).colorScheme||'').toLowerCase();\n"
+        @"      if(cs.indexOf('dark')!==-1&&cs!=='only light')return{r:18,g:18,b:18,a:1};\n"
+        @"    }\n"
+        @"  }catch(_){}\n"
+        @"  return{r:255,g:255,b:255,a:1};\n"
+        @"}\n"
+        @"function effectiveBackground(el){\n"
+        @"  var layers=[],node=el,depth=0;\n"
+        @"  while(node&&node.nodeType===1&&depth<40){\n"
+        @"    var bg=parseColor(getComputedStyle(node).backgroundColor);\n"
+        @"    if(bg&&bg.a>0.01){\n"
+        @"      layers.push(bg);\n"
+        @"      if(bg.a>=0.99)break;\n"
+        @"    }\n"
+        @"    var next=node.parentElement;\n"
+        @"    if(!next&&node.getRootNode){var rn=node.getRootNode();if(rn&&rn.host)next=rn.host;}\n"
+        @"    node=next;\n"
+        @"    depth++;\n"
+        @"  }\n"
+        @"  var cur=(layers.length>0&&layers[layers.length-1].a>=0.99)?layers.pop():baseCanvasColor();\n"
+        @"  for(var i=layers.length-1;i>=0;i--){cur=compositeOver(layers[i],cur);}\n"
+        @"  return cur;\n"
+        @"}\n"
+        @"function luminance(c){\n"
+        @"  function lin(v){v/=255;return v<=0.03928?v/12.92:Math.pow((v+0.055)/1.055,2.4);}\n"
+        @"  return 0.2126*lin(c.r)+0.7152*lin(c.g)+0.0722*lin(c.b);\n"
+        @"}\n"
+        @"function contrastRatio(c1,c2){\n"
+        @"  var l1=luminance(c1),l2=luminance(c2);\n"
+        @"  return(Math.max(l1,l2)+0.05)/(Math.min(l1,l2)+0.05);\n"
+        @"}\n"
+        @"function restoreOriginal(el){\n"
+        @"  var orig=patched.get(el);\n"
+        @"  if(!orig)return;\n"
+        @"  if(orig.color)el.style.setProperty('color',orig.color,orig.colorPrio);\n"
+        @"  else el.style.removeProperty('color');\n"
+        @"  if(orig.fill)el.style.setProperty('-webkit-text-fill-color',orig.fill,orig.fillPrio);\n"
+        @"  else el.style.removeProperty('-webkit-text-fill-color');\n"
+        @"  if(orig.caret)el.style.setProperty('caret-color',orig.caret,orig.caretPrio);\n"
+        @"  else el.style.removeProperty('caret-color');\n"
+        @"}\n"
+        @"function saveOriginal(el){\n"
+        @"  if(patched.has(el))return;\n"
+        @"  patched.set(el,{\n"
+        @"    color:el.style.getPropertyValue('color'),\n"
+        @"    colorPrio:el.style.getPropertyPriority('color'),\n"
+        @"    fill:el.style.getPropertyValue('-webkit-text-fill-color'),\n"
+        @"    fillPrio:el.style.getPropertyPriority('-webkit-text-fill-color'),\n"
+        @"    caret:el.style.getPropertyValue('caret-color'),\n"
+        @"    caretPrio:el.style.getPropertyPriority('caret-color')\n"
+        @"  });\n"
+        @"}\n"
+        @"function checkAndFix(el){\n"
+        @"  try{\n"
+        @"    if(!isTextInput(el))return;\n"
+        @"    var wasPatched=patched.has(el);\n"
+        @"    if(wasPatched)restoreOriginal(el);\n"
+        @"    var cs=getComputedStyle(el);\n"
+        @"    if(!cs||cs.display==='none'||cs.visibility==='hidden'){if(wasPatched)patched.delete(el);return;}\n"
+        @"    var op=parseFloat(cs.opacity);\n"
+        @"    if(!isNaN(op)&&op<0.05){if(wasPatched)patched.delete(el);return;}\n"
+        @"    var fs=parseFloat(cs.fontSize);\n"
+        @"    if(!isNaN(fs)&&fs<1){if(wasPatched)patched.delete(el);return;}\n"
+        @"    var rect=el.getBoundingClientRect();\n"
+        @"    if(rect.width<=2||rect.height<=2){if(wasPatched)patched.delete(el);return;}\n"
+        @"    var rawColor=parseColor(cs.color);\n"
+        @"    var rawFill=parseColor(cs.getPropertyValue('-webkit-text-fill-color'));\n"
+        @"    if((rawColor&&rawColor.a<0.05)||(rawFill&&rawFill.a<0.05)){if(wasPatched)patched.delete(el);return;}\n"
+        @"    var selfBg=parseColor(cs.backgroundColor);\n"
+        @"    if((!selfBg||selfBg.a<0.05)&&cs.backgroundImage&&cs.backgroundImage!=='none'){if(wasPatched)patched.delete(el);return;}\n"
+        @"    var fg=rawFill||rawColor;\n"
+        @"    if(!fg){if(wasPatched)patched.delete(el);return;}\n"
+        @"    var bg=effectiveBackground(el);\n"
+        @"    var effFg=(fg.a<0.99)?compositeOver(fg,bg):fg;\n"
+        @"    var ratio=contrastRatio(effFg,bg);\n"
+        @"    if(ratio<2.6){\n"
+        @"      saveOriginal(el);\n"
+        @"      var target=luminance(bg)>0.35?'#111827':'#f8fafc';\n"
+        @"      el.style.setProperty('color',target,'important');\n"
+        @"      el.style.setProperty('-webkit-text-fill-color',target,'important');\n"
+        @"      el.style.setProperty('caret-color',target,'important');\n"
+        @"    }else if(wasPatched){\n"
+        @"      patched.delete(el);\n"
+        @"    }\n"
+        @"  }catch(_){}\n"
+        @"}\n"
+        @"function eventTarget(ev){\n"
+        @"  if(ev&&typeof ev.composedPath==='function'){var p=ev.composedPath();if(p&&p.length)return p[0];}\n"
+        @"  return ev?ev.target:null;\n"
+        @"}\n"
+        @"document.addEventListener('focusin',function(ev){\n"
+        @"  var t=eventTarget(ev);\n"
+        @"  if(!isTextInput(t))return;\n"
+        @"  checkAndFix(t);\n"
+        @"  requestAnimationFrame(function(){checkAndFix(t);});\n"
+        @"  setTimeout(function(){checkAndFix(t);},80);\n"
+        @"},true);\n"
+        @"document.addEventListener('input',function(ev){checkAndFix(eventTarget(ev));},true);\n"
+        @"document.addEventListener('change',function(ev){checkAndFix(eventTarget(ev));},true);\n"
+        @"document.addEventListener('blur',function(ev){\n"
+        @"  var t=eventTarget(ev);\n"
+        @"  if(isTextInput(t)&&(patched.has(t)||(t.value&&t.value.length>0))){checkAndFix(t);}\n"
+        @"},true);\n"
+        @"window.__jwRecheckInputs=function(){\n"
+        @"  try{\n"
+        @"    if(document.activeElement)checkAndFix(document.activeElement);\n"
+        @"    var list=document.querySelectorAll('input,textarea');\n"
+        @"    for(var i=0;i<list.length;i++){\n"
+        @"      var el=list[i];\n"
+        @"      if(el===document.activeElement||patched.has(el)||(el.value&&el.value.length>0))checkAndFix(el);\n"
+        @"    }\n"
+        @"  }catch(_){}\n"
+        @"};\n"
+        @"try{\n"
+        @"  var mq=window.matchMedia('(prefers-color-scheme: dark)');\n"
+        @"  if(mq&&mq.addEventListener)mq.addEventListener('change',function(){setTimeout(window.__jwRecheckInputs,50);});\n"
+        @"}catch(_){}\n"
+        @"})();\n";
+    return [[WKUserScript alloc] initWithSource:kContrastJS
+                                  injectionTime:WKUserScriptInjectionTimeAtDocumentEnd
+                               forMainFrameOnly:NO
+                                 inContentWorld:[WKContentWorld defaultClientWorld]];
+}
+
+#pragma mark - Navigation Error Overlay View
+
+@interface JWErrorOverlayView : UIView
+@property (nonatomic, copy) NSString *failedURLString;
+@property (nonatomic, copy) void (^onRetry)(void);
+@property (nonatomic, copy) void (^onGoHome)(void);
+- (void)configureWithError:(NSError *)error failedURL:(NSString *)failedURL homeURL:(NSString *)homeURL customTitle:(NSString *)customTitle customDetail:(NSString *)customDetail;
+@end
+
+@implementation JWErrorOverlayView {
+    UIImageView *_iconView;
+    UILabel *_titleLabel;
+    UILabel *_urlLabel;
+    UILabel *_detailLabel;
+    UIButton *_retryButton;
+    UIButton *_homeButton;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.translatesAutoresizingMaskIntoConstraints = NO;
+        self.backgroundColor = UIColor.systemBackgroundColor;
+        self.hidden = YES;
+
+        UIStackView *stack = [UIStackView new];
+        stack.translatesAutoresizingMaskIntoConstraints = NO;
+        stack.axis = UILayoutConstraintAxisVertical;
+        stack.alignment = UIStackViewAlignmentCenter;
+        stack.spacing = 12;
+        [self addSubview:stack];
+
+        _iconView = [UIImageView new];
+        _iconView.translatesAutoresizingMaskIntoConstraints = NO;
+        _iconView.contentMode = UIViewContentModeScaleAspectFit;
+        [stack addArrangedSubview:_iconView];
+
+        _titleLabel = [UILabel new];
+        _titleLabel.font = [UIFont systemFontOfSize:19 weight:UIFontWeightBold];
+        _titleLabel.textColor = UIColor.labelColor;
+        _titleLabel.textAlignment = NSTextAlignmentCenter;
+        _titleLabel.numberOfLines = 0;
+        [stack addArrangedSubview:_titleLabel];
+
+        _urlLabel = [UILabel new];
+        _urlLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+        _urlLabel.textColor = UIColor.secondaryLabelColor;
+        _urlLabel.textAlignment = NSTextAlignmentCenter;
+        _urlLabel.numberOfLines = 2;
+        _urlLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        [stack addArrangedSubview:_urlLabel];
+
+        _detailLabel = [UILabel new];
+        _detailLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
+        _detailLabel.textColor = UIColor.secondaryLabelColor;
+        _detailLabel.textAlignment = NSTextAlignmentCenter;
+        _detailLabel.numberOfLines = 0;
+        [stack addArrangedSubview:_detailLabel];
+
+        UIStackView *btnRow = [UIStackView new];
+        btnRow.axis = UILayoutConstraintAxisHorizontal;
+        btnRow.spacing = 12;
+        btnRow.alignment = UIStackViewAlignmentCenter;
+        [stack addArrangedSubview:btnRow];
+        [stack setCustomSpacing:20 afterView:_detailLabel];
+
+        _retryButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        UIButtonConfiguration *retryCfg = [UIButtonConfiguration filledButtonConfiguration];
+        retryCfg.title = @"重新加载";
+        retryCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+        retryCfg.contentInsets = NSDirectionalEdgeInsetsMake(10, 22, 10, 22);
+        _retryButton.configuration = retryCfg;
+        [_retryButton addTarget:self action:@selector(retryTapped) forControlEvents:UIControlEventTouchUpInside];
+        [btnRow addArrangedSubview:_retryButton];
+
+        _homeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        UIButtonConfiguration *homeCfg = [UIButtonConfiguration tintedButtonConfiguration];
+        homeCfg.title = @"回到首页";
+        homeCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+        homeCfg.contentInsets = NSDirectionalEdgeInsetsMake(10, 18, 10, 18);
+        _homeButton.configuration = homeCfg;
+        [_homeButton addTarget:self action:@selector(homeTapped) forControlEvents:UIControlEventTouchUpInside];
+        [btnRow addArrangedSubview:_homeButton];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [stack.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+            [stack.centerYAnchor constraintEqualToAnchor:self.centerYAnchor constant:-12],
+            [stack.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.leadingAnchor constant:28],
+            [stack.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor constant:-28],
+            [_iconView.widthAnchor constraintEqualToConstant:44],
+            [_iconView.heightAnchor constraintEqualToConstant:44]
+        ]];
+    }
+    return self;
+}
+
+- (void)configureWithError:(NSError *)error failedURL:(NSString *)failedURL homeURL:(NSString *)homeURL customTitle:(NSString *)customTitle customDetail:(NSString *)customDetail {
+    self.failedURLString = failedURL.length > 0 ? failedURL : (homeURL ?: @"");
+    BOOL isSSL = JWIsSSLError(error);
+
+    UIImageSymbolConfiguration *symCfg = [UIImageSymbolConfiguration configurationWithPointSize:36 weight:UIFontWeightMedium];
+    NSString *symbolName = isSSL ? @"lock.trianglebadge.exclamationmark" : @"exclamationmark.triangle.fill";
+    UIImage *img = [UIImage systemImageNamed:symbolName withConfiguration:symCfg];
+    if (!img) img = [UIImage systemImageNamed:@"exclamationmark.triangle.fill" withConfiguration:symCfg];
+    _iconView.image = img;
+    _iconView.tintColor = isSSL ? UIColor.systemRedColor : UIColor.systemOrangeColor;
+
+    if (customTitle.length > 0) {
+        _titleLabel.text = customTitle;
+    } else if (isSSL) {
+        _titleLabel.text = @"HTTPS 证书校验失败";
+    } else if (error && [error.domain isEqualToString:NSURLErrorDomain] &&
+               (error.code == NSURLErrorNotConnectedToInternet ||
+                error.code == NSURLErrorCannotFindHost ||
+                error.code == NSURLErrorCannotConnectToHost ||
+                error.code == NSURLErrorTimedOut)) {
+        _titleLabel.text = @"无法连接到服务器";
+    } else {
+        _titleLabel.text = @"页面加载失败";
+    }
+
+    _urlLabel.text = self.failedURLString;
+    _urlLabel.hidden = (self.failedURLString.length == 0);
+
+    if (customDetail.length > 0) {
+        _detailLabel.text = customDetail;
+    } else if (error) {
+        NSString *tip = @"";
+        if (isSSL) {
+            tip = @"\n\n若这是你自建的内网或自签名 HTTPS 服务，请点击「重新加载」并在弹窗中选择信任此域名证书。";
+        } else if ([error.domain isEqualToString:NSURLErrorDomain] &&
+                   (error.code == NSURLErrorCannotConnectToHost || error.code == NSURLErrorCannotFindHost)) {
+            tip = @"\n\n请确认手机已接入对应内网 / VPN，并允许 JetWeb 访问「本地网络」。";
+        }
+        _detailLabel.text = [NSString stringWithFormat:@"%@\n（%@ · 错误码 %ld）%@",
+                             error.localizedDescription ?: @"未知网络错误",
+                             error.domain ?: @"",
+                             (long)error.code,
+                             tip];
+    } else {
+        _detailLabel.text = @"页面加载中断，请点击下方按钮重试。";
+    }
+
+    BOOL showHome = (homeURL.length > 0 && self.failedURLString.length > 0 && ![homeURL isEqualToString:self.failedURLString]);
+    _homeButton.hidden = !showHome;
+}
+
+- (void)retryTapped {
+    if (self.onRetry) self.onRetry();
+}
+
+- (void)homeTapped {
+    if (self.onGoHome) self.onGoHome();
+}
+@end
+
 #pragma mark - Tab Pill Control
 
 @interface JWSitePillControl : UIControl
@@ -565,6 +1189,8 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
 - (NSDictionary<NSString *, NSNumber *> *)manageCurrentWebPIDsBySiteId;
 - (void)manageQueryLiveStatusesAsync:(void (^)(NSDictionary<NSNumber *, JWProcStatus *> *statuses))completion;
 - (void)manageDidUpdateConfigAndReloadSites:(BOOL)structureChanged selectedSiteId:(NSString *)siteId;
+- (void)manageDidUpdateAppearanceConfig;
+- (void)manageDidUpdateTrustedCerts;
 - (void)manageDidRequestApplyProtectionNow:(void (^)(NSString *summary))completion;
 - (void)manageDidRequestReloadSiteId:(NSString *)siteId;
 - (void)manageDidClearWebsiteData;
@@ -628,6 +1254,122 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
         return;
     }
     [self showSiteEditorForItem:nil];
+}
+
+- (void)showSiteActionSheetForItem:(JWSiteItem *)site {
+    if (!site) return;
+    NSString *modeLabel = JWAppearanceModeLabel(site.appearanceMode);
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:site.title
+                                                                   message:site.urlString
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"编辑名称与网址" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [weakSelf showSiteEditorForItem:site];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"外观模式：%@", modeLabel]
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf showAppearancePickerForSite:site];
+    }]];
+    if (site.enabled) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"重新加载此站点" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [weakSelf.delegate manageDidRequestReloadSiteId:site.siteId];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    JWConfigureCenteredPopover(sheet, self.view);
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)showAppearancePickerForSite:(JWSiteItem *)site {
+    if (!site) return;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"%@ · 外观模式", site.title]
+                                                                   message:@"部分网页在深色模式下会出现输入框白底白字，可单独切换为强制浅色。"
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    NSArray<NSString *> *modes = @[kJWAppearanceInherit, kJWAppearanceSystem, kJWAppearanceLight, kJWAppearanceDark];
+    NSString *cur = JWNormalizeSiteAppearanceMode(site.appearanceMode);
+    __weak typeof(self) weakSelf = self;
+    for (NSString *m in modes) {
+        NSString *prefix = [m isEqualToString:cur] ? @"✓ " : @"";
+        NSString *title = [prefix stringByAppendingString:JWAppearanceModeLabel(m)];
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
+            site.appearanceMode = m;
+            [self.config saveConfig];
+            [self.delegate manageDidUpdateAppearanceConfig];
+            [self.tableView reloadData];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    JWConfigureCenteredPopover(sheet, self.view);
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)showGlobalAppearancePicker {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"全局外观模式"
+                                                                   message:@"作用于所有设为「跟随全局」的站点及工作台界面。"
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    NSArray<NSString *> *modes = @[kJWAppearanceSystem, kJWAppearanceLight, kJWAppearanceDark];
+    NSString *cur = JWNormalizeGlobalAppearanceMode(self.config.appearanceMode);
+    __weak typeof(self) weakSelf = self;
+    for (NSString *m in modes) {
+        NSString *prefix = [m isEqualToString:cur] ? @"✓ " : @"";
+        NSString *title = [prefix stringByAppendingString:JWAppearanceModeLabel(m)];
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
+            self.config.appearanceMode = m;
+            [self.config saveConfig];
+            self.navigationController.overrideUserInterfaceStyle = JWUIUserInterfaceStyleForMode(m, UIUserInterfaceStyleUnspecified);
+            [self.delegate manageDidUpdateAppearanceConfig];
+            [self.tableView reloadData];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    JWConfigureCenteredPopover(sheet, self.view);
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)showTrustedCertsManager {
+    NSArray<NSString *> *hosts = [[self.config.trustedCerts allKeys] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    if (hosts.count == 0) {
+        UIAlertController *empty = [UIAlertController alertControllerWithTitle:@"暂无已信任的自签名证书"
+                                                                       message:@"访问使用自签名证书的内网 HTTPS 站点时，会在弹窗中提示是否按域名永久信任。"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [empty addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:empty animated:YES completion:nil];
+        return;
+    }
+
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"已信任的自签名证书"
+                                                                   message:@"点击对应域名可撤销信任（撤销后下次访问会重新询问）"
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    for (NSString *host in hosts) {
+        NSString *fp = self.config.trustedCerts[host] ?: @"";
+        NSString *shortFp = JWFormatShortFingerprint(fp);
+        NSString *title = [NSString stringWithFormat:@"撤销 %@ (%@)", host, shortFp];
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
+            [self.config.trustedCerts removeObjectForKey:host];
+            [self.config saveConfig];
+            [self.delegate manageDidUpdateTrustedCerts];
+            [self.tableView reloadData];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"清除全部已信任证书" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        [self.config.trustedCerts removeAllObjects];
+        [self.config saveConfig];
+        [self.delegate manageDidUpdateTrustedCerts];
+        [self.tableView reloadData];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    JWConfigureCenteredPopover(sheet, self.view);
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 - (void)showSiteEditorForItem:(JWSiteItem *)existing {
@@ -701,13 +1443,13 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     if (section == 0) return (NSInteger)self.config.sites.count + 2; // Host + sites + refresh button
     if (section == 1) return MAX(1, (NSInteger)self.config.sites.count);
-    return 3; // Band, MaxMB, Clear Cache
+    return 5; // Global Appearance, Trusted Certs, Band, MaxMB, Clear Cache
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     if (section == 0) return @"实时进程与保活档位";
     if (section == 1) return [NSString stringWithFormat:@"常驻 WebApp (%lu/%ld)", (unsigned long)self.config.sites.count, (long)kJWMaxSites];
-    return @"保活策略与存储";
+    return @"外观、证书与保活策略";
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
@@ -801,7 +1543,12 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
         if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"SiteCell"];
         JWSiteItem *site = self.config.sites[(NSUInteger)indexPath.row];
         cell.textLabel.text = site.title;
-        cell.detailTextLabel.text = site.urlString;
+        NSString *siteMode = JWNormalizeSiteAppearanceMode(site.appearanceMode);
+        if (![siteMode isEqualToString:kJWAppearanceInherit]) {
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@", site.urlString, JWAppearanceModeLabel(siteMode)];
+        } else {
+            cell.detailTextLabel.text = site.urlString;
+        }
         cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
 
         UISwitch *sw = [UISwitch new];
@@ -816,10 +1563,19 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
     if (!cfgCell) cfgCell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"CfgCell"];
     cfgCell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     if (indexPath.row == 0) {
+        cfgCell.textLabel.text = @"全局外观模式";
+        cfgCell.textLabel.textColor = UIColor.labelColor;
+        cfgCell.detailTextLabel.text = JWAppearanceModeLabel(JWNormalizeGlobalAppearanceMode(self.config.appearanceMode));
+    } else if (indexPath.row == 1) {
+        cfgCell.textLabel.text = @"已信任的自签名证书";
+        cfgCell.textLabel.textColor = UIColor.labelColor;
+        NSUInteger certCount = self.config.trustedCerts.count;
+        cfgCell.detailTextLabel.text = certCount > 0 ? [NSString stringWithFormat:@"%lu 个域名", (unsigned long)certCount] : @"无";
+    } else if (indexPath.row == 2) {
         cfgCell.textLabel.text = @"后台保活目标档位";
         cfgCell.textLabel.textColor = UIColor.labelColor;
         cfgCell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 档", (long)self.config.targetBand];
-    } else if (indexPath.row == 1) {
+    } else if (indexPath.row == 3) {
         cfgCell.textLabel.text = @"单网页内存安全上限";
         cfgCell.textLabel.textColor = UIColor.labelColor;
         cfgCell.detailTextLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.config.maxMemoryMB];
@@ -888,14 +1644,18 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
         if (self.config.sites.count == 0) {
             [self addSiteTapped];
         } else {
-            [self showSiteEditorForItem:self.config.sites[(NSUInteger)indexPath.row]];
+            [self showSiteActionSheetForItem:self.config.sites[(NSUInteger)indexPath.row]];
         }
         return;
     }
     if (indexPath.section == 2) {
         if (indexPath.row == 0) {
-            [self showBandPicker];
+            [self showGlobalAppearancePicker];
         } else if (indexPath.row == 1) {
+            [self showTrustedCertsManager];
+        } else if (indexPath.row == 2) {
+            [self showBandPicker];
+        } else if (indexPath.row == 3) {
             [self showMaxMemoryPicker];
         } else {
             [self confirmClearAllWebsiteData];
@@ -969,11 +1729,21 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
 @interface JWHubViewController : UIViewController <WKNavigationDelegate, WKUIDelegate, JWManageViewControllerDelegate>
 @property (nonatomic, strong) JWAppConfig *config;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, WKWebView *> *webViews;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, JWErrorOverlayView *> *errorOverlays;
 @property (nonatomic, strong) NSMutableSet<NSString *> *terminatedSiteIds;
 @property (nonatomic, strong) NSDictionary<NSNumber *, JWProcStatus *> *lastProcStatuses;
 @property (nonatomic, strong) dispatch_queue_t protectQueue;
+@property (nonatomic, strong) dispatch_queue_t trustEvalQueue;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 @property (nonatomic, assign) NSUInteger bgEpoch;
+
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *sessionTrustedCerts;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSURLCredential *> *sessionBasicAuth;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableArray<JWPendingTrustItem *> *> *pendingTrustQueues;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableArray<JWPendingBasicAuthItem *> *> *pendingBasicAuthQueues;
+@property (nonatomic, strong) NSMutableArray<void (^)(void)> *authPromptQueue;
+@property (nonatomic, assign) BOOL isPresentingAuthAlert;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary<NSString *, NSString *> *> *lastRejectedAuthBySiteId;
 
 @property (nonatomic, strong) UIView *webContainerView;
 @property (nonatomic, strong) UIProgressView *progressView;
@@ -1006,13 +1776,23 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
 
     self.config = [JWAppConfig loadConfig];
     self.webViews = [NSMutableDictionary dictionary];
+    self.errorOverlays = [NSMutableDictionary dictionary];
     self.terminatedSiteIds = [NSMutableSet set];
     self.lastProcStatuses = @{};
     self.protectQueue = dispatch_queue_create("com.lili.jetweb.protect", DISPATCH_QUEUE_SERIAL);
+    self.trustEvalQueue = dispatch_queue_create("com.lili.jetweb.trust", DISPATCH_QUEUE_SERIAL);
     self.bgTask = UIBackgroundTaskInvalid;
+
+    self.sessionTrustedCerts = [NSMutableDictionary dictionary];
+    self.sessionBasicAuth = [NSMutableDictionary dictionary];
+    self.pendingTrustQueues = [NSMutableDictionary dictionary];
+    self.pendingBasicAuthQueues = [NSMutableDictionary dictionary];
+    self.authPromptQueue = [NSMutableArray array];
+    self.lastRejectedAuthBySiteId = [NSMutableDictionary dictionary];
 
     [self setupLayout];
     [self syncWebViewsWithConfig];
+    [self applyAppearanceStyles];
     [self applyDockCollapsedStateAnimated:NO];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
@@ -1023,6 +1803,14 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
                                              selector:@selector(appWillEnterForeground)
                                                  name:UIApplicationWillEnterForegroundNotification
                                                object:nil];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    if (previousTraitCollection &&
+        [self.traitCollection hasDifferentColorAppearanceComparedToTraitCollection:previousTraitCollection]) {
+        [self applyAppearanceStyles];
+    }
 }
 
 - (void)viewDidLayoutSubviews {
@@ -1240,6 +2028,50 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
     return b;
 }
 
+#pragma mark - Appearance Management
+
+- (UIUserInterfaceStyle)currentSystemInterfaceStyle {
+    if (self.view.window) {
+        return self.view.window.traitCollection.userInterfaceStyle;
+    }
+    return UIUserInterfaceStyleUnspecified;
+}
+
+- (void)applyAppearanceStyleToWebView:(WKWebView *)wv forSite:(JWSiteItem *)site {
+    if (!wv) return;
+    NSString *globalMode = JWNormalizeGlobalAppearanceMode(self.config.appearanceMode);
+    NSString *effectiveMode = [self.config effectiveAppearanceModeForSite:site];
+    UIUserInterfaceStyle targetStyle = UIUserInterfaceStyleUnspecified;
+    if ([effectiveMode isEqualToString:kJWAppearanceLight]) {
+        targetStyle = UIUserInterfaceStyleLight;
+    } else if ([effectiveMode isEqualToString:kJWAppearanceDark]) {
+        targetStyle = UIUserInterfaceStyleDark;
+    } else {
+        /* 站点显式设为「跟随系统」而全局为强制浅/深色时，从 window 获取真实系统外观防止被父 VC 覆盖 */
+        targetStyle = [globalMode isEqualToString:kJWAppearanceSystem]
+            ? UIUserInterfaceStyleUnspecified
+            : [self currentSystemInterfaceStyle];
+    }
+    wv.overrideUserInterfaceStyle = targetStyle;
+    wv.backgroundColor = UIColor.systemBackgroundColor;
+    wv.scrollView.backgroundColor = UIColor.systemBackgroundColor;
+    [wv evaluateJavaScript:@"if(window.__jwRecheckInputs)window.__jwRecheckInputs();"
+                   inFrame:nil
+            inContentWorld:[WKContentWorld defaultClientWorld]
+         completionHandler:nil];
+}
+
+- (void)applyAppearanceStyles {
+    NSString *globalMode = JWNormalizeGlobalAppearanceMode(self.config.appearanceMode);
+    self.overrideUserInterfaceStyle = JWUIUserInterfaceStyleForMode(globalMode, UIUserInterfaceStyleUnspecified);
+    for (JWSiteItem *s in [self enabledSites]) {
+        WKWebView *wv = self.webViews[s.siteId];
+        if (wv) {
+            [self applyAppearanceStyleToWebView:wv forSite:s];
+        }
+    }
+}
+
 #pragma mark - WebView Management & Instant Tab Switching
 
 - (WKWebView *)createWebViewForSite:(JWSiteItem *)site {
@@ -1248,6 +2080,8 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
     cfg.allowsInlineMediaPlayback = YES;
     cfg.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
     cfg.defaultWebpagePreferences.allowsContentJavaScript = YES;
+    [cfg.userContentController addUserScript:JWWebKitCompatPolyfillScript()];
+    [cfg.userContentController addUserScript:JWInputContrastFixScript()];
 
     WKWebView *wv = [[WKWebView alloc] initWithFrame:self.webContainerView.bounds configuration:cfg];
     wv.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1269,6 +2103,34 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
         [wv.trailingAnchor constraintEqualToAnchor:self.webContainerView.trailingAnchor],
         [wv.bottomAnchor constraintEqualToAnchor:self.webContainerView.bottomAnchor]
     ]];
+
+    JWErrorOverlayView *overlay = [[JWErrorOverlayView alloc] initWithFrame:CGRectZero];
+    NSString *capturedSiteId = [site.siteId copy];
+    __weak typeof(self) weakSelf = self;
+    overlay.onRetry = ^{
+        [weakSelf reloadOrLoadInitialURLForSiteId:capturedSiteId];
+    };
+    overlay.onGoHome = ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        JWSiteItem *s = [self siteForId:capturedSiteId];
+        WKWebView *target = self.webViews[capturedSiteId];
+        NSURL *home = s ? [NSURL URLWithString:s.urlString ?: @""] : nil;
+        if (target && home) {
+            [self hideErrorOverlayForSiteId:capturedSiteId];
+            [target loadRequest:[NSURLRequest requestWithURL:home]];
+        }
+    };
+    [wv addSubview:overlay];
+    [NSLayoutConstraint activateConstraints:@[
+        [overlay.topAnchor constraintEqualToAnchor:wv.topAnchor],
+        [overlay.leadingAnchor constraintEqualToAnchor:wv.leadingAnchor],
+        [overlay.trailingAnchor constraintEqualToAnchor:wv.trailingAnchor],
+        [overlay.bottomAnchor constraintEqualToAnchor:wv.bottomAnchor]
+    ]];
+    self.errorOverlays[site.siteId] = overlay;
+
+    [self applyAppearanceStyleToWebView:wv forSite:site];
 
     NSURL *url = [NSURL URLWithString:site.urlString];
     if (url) {
@@ -1294,6 +2156,50 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
     return arr;
 }
 
+- (NSString *)siteIdForWebView:(WKWebView *)webView {
+    if (!webView) return nil;
+    for (NSString *sid in self.webViews) {
+        if (self.webViews[sid] == webView) return sid;
+    }
+    return nil;
+}
+
+- (void)hideErrorOverlayForSiteId:(NSString *)siteId {
+    if (siteId.length == 0) return;
+    JWErrorOverlayView *overlay = self.errorOverlays[siteId];
+    if (overlay) {
+        overlay.hidden = YES;
+    }
+    [self.lastRejectedAuthBySiteId removeObjectForKey:siteId];
+}
+
+- (void)showErrorOverlayForWebView:(WKWebView *)webView error:(NSError *)error customTitle:(NSString *)customTitle customDetail:(NSString *)customDetail {
+    NSString *sid = [self siteIdForWebView:webView];
+    if (sid.length == 0) return;
+    JWErrorOverlayView *overlay = self.errorOverlays[sid];
+    if (!overlay) return;
+    JWSiteItem *site = [self siteForId:sid];
+    NSString *failedURL = nil;
+    if ([error.userInfo[NSURLErrorFailingURLStringErrorKey] isKindOfClass:[NSString class]]) {
+        failedURL = error.userInfo[NSURLErrorFailingURLStringErrorKey];
+    } else if ([error.userInfo[NSURLErrorFailingURLErrorKey] isKindOfClass:[NSURL class]]) {
+        failedURL = ((NSURL *)error.userInfo[NSURLErrorFailingURLErrorKey]).absoluteString;
+    }
+    if (failedURL.length == 0) {
+        failedURL = webView.URL.absoluteString;
+    }
+    if (failedURL.length == 0 || [failedURL isEqualToString:@"about:blank"]) {
+        failedURL = site.urlString ?: @"";
+    }
+    [overlay configureWithError:error
+                      failedURL:failedURL
+                        homeURL:(site.urlString ?: @"")
+                    customTitle:customTitle
+                   customDetail:customDetail];
+    overlay.hidden = NO;
+    [webView bringSubviewToFront:overlay];
+}
+
 - (void)syncWebViewsWithConfig {
     NSMutableSet<NSString *> *validIds = [NSMutableSet set];
     NSArray<JWSiteItem *> *enabled = [self enabledSites];
@@ -1310,7 +2216,9 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
             [self detachObserversForWebView:old];
             [old removeFromSuperview];
             [self.webViews removeObjectForKey:existingId];
+            [self.errorOverlays removeObjectForKey:existingId];
             [self.terminatedSiteIds removeObject:existingId];
+            [self.lastRejectedAuthBySiteId removeObjectForKey:existingId];
         }
     }
 
@@ -1333,6 +2241,7 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
         }
         [self selectSiteById:self.config.selectedSiteId];
     }
+    [self applyAppearanceStyles];
     [self rebuildTabPills];
     [self scheduleApplyProtectionAsync:nil];
 }
@@ -1341,8 +2250,15 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
     if (siteId.length == 0) return;
     WKWebView *wv = self.webViews[siteId];
     if (!wv) return;
-    if (wv.URL) {
+    JWErrorOverlayView *overlay = self.errorOverlays[siteId];
+    NSString *failedURL = overlay ? [overlay.failedURLString copy] : nil;
+    [self hideErrorOverlayForSiteId:siteId];
+
+    if (wv.URL && wv.URL.absoluteString.length > 0 && ![wv.URL.absoluteString isEqualToString:@"about:blank"]) {
         [wv reload];
+    } else if (failedURL.length > 0) {
+        NSURL *fu = [NSURL URLWithString:failedURL];
+        if (fu) [wv loadRequest:[NSURLRequest requestWithURL:fu]];
     } else {
         JWSiteItem *site = [self siteForId:siteId];
         NSURL *u = site ? [NSURL URLWithString:site.urlString] : nil;
@@ -1433,13 +2349,44 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
     [self selectSiteById:sender.siteId];
 }
 
+- (void)showQuickAppearancePickerForSite:(JWSiteItem *)site sourceView:(UIView *)sourceView {
+    if (!site) return;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"%@ · 外观模式", site.title]
+                                                                   message:@"遇到深色模式下输入框白底白字时，可切换为「强制浅色」立即生效。"
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    NSArray<NSString *> *modes = @[kJWAppearanceInherit, kJWAppearanceSystem, kJWAppearanceLight, kJWAppearanceDark];
+    NSString *cur = JWNormalizeSiteAppearanceMode(site.appearanceMode);
+    __weak typeof(self) weakSelf = self;
+    for (NSString *m in modes) {
+        NSString *prefix = [m isEqualToString:cur] ? @"✓ " : @"";
+        NSString *title = [prefix stringByAppendingString:JWAppearanceModeLabel(m)];
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
+            site.appearanceMode = m;
+            [self.config saveConfig];
+            [self applyAppearanceStyles];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    if (sourceView) {
+        sheet.popoverPresentationController.sourceView = sourceView;
+        sheet.popoverPresentationController.sourceRect = sourceView.bounds;
+    } else {
+        JWConfigureCenteredPopover(sheet, self.view);
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
 - (void)showCurrentSiteQuickMenuFromSource:(UIView *)sourceView {
     WKWebView *wv = self.webViews[self.config.selectedSiteId];
     if (!wv) return;
     JWSiteItem *site = [self siteForId:self.config.selectedSiteId];
+    NSString *siteId = site.siteId;
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:(site.title ?: @"当前站点")
                                                                    message:(wv.URL.absoluteString ?: site.urlString)
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
     if (wv.canGoBack) {
         [sheet addAction:[UIAlertAction actionWithTitle:@"后退" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             [wv goBack];
@@ -1451,11 +2398,19 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
         }]];
     }
     [sheet addAction:[UIAlertAction actionWithTitle:@"刷新当前页" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [wv reload];
+        [weakSelf reloadOrLoadInitialURLForSiteId:siteId];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"回到初始首页" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         NSURL *u = [NSURL URLWithString:site.urlString ?: @""];
-        if (u) [wv loadRequest:[NSURLRequest requestWithURL:u]];
+        if (u) {
+            [weakSelf hideErrorOverlayForSiteId:siteId];
+            [wv loadRequest:[NSURLRequest requestWithURL:u]];
+        }
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"外观模式：%@", JWAppearanceModeLabel(site.appearanceMode)]
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf showQuickAppearancePickerForSite:site sourceView:sourceView];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"复制当前网址" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [UIPasteboard generalPasteboard].string = wv.URL.absoluteString ?: site.urlString ?: @"";
@@ -1556,6 +2511,7 @@ static void JWConfigureCenteredPopover(UIAlertController *sheet, UIView *hostVie
     JWManageViewController *vc = [[JWManageViewController alloc] initWithConfig:self.config delegate:self];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    nav.overrideUserInterfaceStyle = JWUIUserInterfaceStyleForMode(JWNormalizeGlobalAppearanceMode(self.config.appearanceMode), UIUserInterfaceStyleUnspecified);
     [self presentViewController:nav animated:YES completion:nil];
 }
 
@@ -1673,6 +2629,7 @@ static void JWWriteSharedSnapshotOnBgQueue(NSString *sharedText) {
 - (void)appWillEnterForeground {
     self.bgEpoch++;
     [self endBackgroundGuardTask];
+    [self applyAppearanceStyles];
     [self recoverWebViewIfTerminatedForSiteId:self.config.selectedSiteId];
     [self scheduleApplyProtectionAsync:nil];
 }
@@ -1682,6 +2639,341 @@ static void JWWriteSharedSnapshotOnBgQueue(NSString *sharedText) {
         [[UIApplication sharedApplication] endBackgroundTask:self.bgTask];
         self.bgTask = UIBackgroundTaskInvalid;
     }
+}
+
+#pragma mark - Auth Challenge Prompt Queue (ServerTrust & HTTP Basic Auth)
+
+- (UIViewController *)topMostPresenterForAuthAlert {
+    UIViewController *top = self;
+    while (top.presentedViewController) {
+        top = top.presentedViewController;
+    }
+    return top;
+}
+
+- (void)presentAuthAlertSafely:(UIAlertController *)alert
+                     retryLeft:(NSInteger)retryLeft
+                      onCancel:(void (^)(void))onCancel {
+    if (self.view.window == nil) {
+        if (retryLeft > 0) {
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [weakSelf presentAuthAlertSafely:alert retryLeft:(retryLeft - 1) onCancel:onCancel];
+            });
+        } else {
+            if (onCancel) onCancel();
+            self.isPresentingAuthAlert = NO;
+            [self drainAuthPromptQueue];
+        }
+        return;
+    }
+
+    UIViewController *top = [self topMostPresenterForAuthAlert];
+    BOOL busy = [top isKindOfClass:[UIAlertController class]] ||
+                top.isBeingDismissed ||
+                top.isBeingPresented ||
+                (top.transitionCoordinator != nil);
+    if (busy) {
+        if (retryLeft > 0) {
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [weakSelf presentAuthAlertSafely:alert retryLeft:(retryLeft - 1) onCancel:onCancel];
+            });
+        } else {
+            if (onCancel) onCancel();
+            self.isPresentingAuthAlert = NO;
+            [self drainAuthPromptQueue];
+        }
+        return;
+    }
+
+    [top presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)enqueueAuthPrompt:(void (^)(void))promptBlock {
+    if (!promptBlock) return;
+    [self.authPromptQueue addObject:[promptBlock copy]];
+    [self drainAuthPromptQueue];
+}
+
+- (void)drainAuthPromptQueue {
+    if (self.isPresentingAuthAlert || self.authPromptQueue.count == 0) return;
+    void (^next)(void) = self.authPromptQueue.firstObject;
+    [self.authPromptQueue removeObjectAtIndex:0];
+    self.isPresentingAuthAlert = YES;
+    next();
+}
+
+- (void)resolvePendingTrustForKey:(NSString *)trustKey accept:(BOOL)accept rejectedHost:(NSString *)rejectedHost {
+    NSArray<JWPendingTrustItem *> *items = [self.pendingTrustQueues[trustKey] copy];
+    [self.pendingTrustQueues removeObjectForKey:trustKey];
+    for (JWPendingTrustItem *item in items) {
+        if (!accept && item.webView) {
+            NSString *sid = [self siteIdForWebView:item.webView];
+            if (sid.length > 0) {
+                self.lastRejectedAuthBySiteId[sid] = @{
+                    @"title": @"已拒绝不受信任的证书",
+                    @"detail": [NSString stringWithFormat:@"你已取消对 %@ 自签名/不受信任证书的连接。\n\n若确认该站点可信，请点击「重新加载」并在弹窗中选择信任。", rejectedHost ?: @""]
+                };
+            }
+        }
+        [item resolveAccept:accept];
+    }
+}
+
+- (void)resolvePendingBasicAuthForKey:(NSString *)realmKey credential:(NSURLCredential *)credential rejectedHost:(NSString *)rejectedHost {
+    NSArray<JWPendingBasicAuthItem *> *items = [self.pendingBasicAuthQueues[realmKey] copy];
+    [self.pendingBasicAuthQueues removeObjectForKey:realmKey];
+    for (JWPendingBasicAuthItem *item in items) {
+        if (!credential && item.webView) {
+            NSString *sid = [self siteIdForWebView:item.webView];
+            if (sid.length > 0) {
+                self.lastRejectedAuthBySiteId[sid] = @{
+                    @"title": @"需要身份验证",
+                    @"detail": [NSString stringWithFormat:@"访问 %@ 需要 HTTP 账号密码验证。\n\n请点击「重新加载」重新输入凭据。", rejectedHost ?: @""]
+                };
+            }
+        }
+        [item resolveWithCredential:credential];
+    }
+}
+
+- (void)handleServerTrustChallenge:(NSURLAuthenticationChallenge *)challenge
+                           webView:(WKWebView *)webView
+                             guard:(JWAuthChallengeCompletionGuard *)guard {
+    SecTrustRef serverTrust = challenge.protectionSpace.serverTrust;
+    if (!serverTrust) {
+        [guard invokeWithDisposition:NSURLSessionAuthChallengePerformDefaultHandling credential:nil];
+        return;
+    }
+
+    NSString *host = challenge.protectionSpace.host.lowercaseString ?: @"";
+    NSInteger port = challenge.protectionSpace.port;
+    CFRetain(serverTrust);
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.trustEvalQueue, ^{
+        CFErrorRef evalErr = NULL;
+        BOOL systemTrusted = SecTrustEvaluateWithError(serverTrust, &evalErr);
+        NSString *evalReason = @"";
+        if (evalErr) {
+            CFStringRef desc = CFErrorCopyDescription(evalErr);
+            if (desc) {
+                evalReason = (__bridge_transfer NSString *)desc;
+            }
+            CFRelease(evalErr);
+        }
+
+        if (systemTrusted) {
+            CFRelease(serverTrust);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [guard invokeWithDisposition:NSURLSessionAuthChallengePerformDefaultHandling credential:nil];
+            });
+            return;
+        }
+
+        NSString *fingerprint = @"";
+        NSString *subject = @"";
+        JWExtractLeafCertInfo(serverTrust, &fingerprint, &subject);
+
+        /* 封装到 JWPendingTrustItem 托管 SecTrustRef 生命周期，避免任何路径泄漏 */
+        JWPendingTrustItem *pendingItem = [[JWPendingTrustItem alloc] initWithServerTrust:serverTrust guard:guard webView:webView];
+        CFRelease(serverTrust);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) {
+                [pendingItem resolveAccept:NO];
+                return;
+            }
+
+            /* 命中已持久化信任或本次会话信任（自动覆盖同域名 HTTPS 子资源与 wss:// WebSocket） */
+            if (host.length > 0 && fingerprint.length > 0) {
+                NSString *savedFp = self.config.trustedCerts[host];
+                NSString *sessionFp = self.sessionTrustedCerts[host];
+                if ([savedFp isEqualToString:fingerprint] || [sessionFp isEqualToString:fingerprint]) {
+                    [pendingItem resolveAccept:YES];
+                    return;
+                }
+            }
+
+            NSString *trustKey = [NSString stringWithFormat:@"%@|%@", host, fingerprint];
+            NSMutableArray<JWPendingTrustItem *> *bucket = self.pendingTrustQueues[trustKey];
+            if (bucket) {
+                [bucket addObject:pendingItem];
+                return;
+            }
+            bucket = [NSMutableArray arrayWithObject:pendingItem];
+            self.pendingTrustQueues[trustKey] = bucket;
+
+            NSString *displayHost = (port > 0 && port != 443)
+                ? [NSString stringWithFormat:@"%@:%ld", host, (long)port]
+                : host;
+
+            [self enqueueAuthPrompt:^{
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (!strongSelf) return;
+
+                /* 排队等待期间若用户已信任同域名证书，直接放行不再重复弹窗 */
+                if (host.length > 0 && fingerprint.length > 0 &&
+                    ([strongSelf.config.trustedCerts[host] isEqualToString:fingerprint] ||
+                     [strongSelf.sessionTrustedCerts[host] isEqualToString:fingerprint])) {
+                    [strongSelf resolvePendingTrustForKey:trustKey accept:YES rejectedHost:displayHost];
+                    strongSelf.isPresentingAuthAlert = NO;
+                    [strongSelf drainAuthPromptQueue];
+                    return;
+                }
+
+                NSMutableString *msg = [NSMutableString stringWithFormat:@"域名：%@", displayHost.length > 0 ? displayHost : @"未知主机"];
+                if (subject.length > 0) {
+                    [msg appendFormat:@"\n证书主体：%@", subject];
+                }
+                if (fingerprint.length > 0) {
+                    [msg appendFormat:@"\nSHA-256：%@", JWFormatShortFingerprint(fingerprint)];
+                }
+                if (evalReason.length > 0) {
+                    [msg appendFormat:@"\n校验详情：%@", evalReason];
+                }
+                [msg appendString:@"\n\n仅在你确认这是自建内网或受控服务时信任此证书。"];
+
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"证书不受系统信任"
+                                                                               message:msg
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+
+                if (host.length > 0 && fingerprint.length > 0) {
+                    [alert addAction:[UIAlertAction actionWithTitle:@"永久信任此域名" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                        __strong typeof(weakSelf) s = weakSelf;
+                        if (!s) return;
+                        s.config.trustedCerts[host] = fingerprint;
+                        [s.config saveConfig];
+                        [s resolvePendingTrustForKey:trustKey accept:YES rejectedHost:displayHost];
+                        s.isPresentingAuthAlert = NO;
+                        [s drainAuthPromptQueue];
+                    }]];
+                }
+                [alert addAction:[UIAlertAction actionWithTitle:@"仅本次信任" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                    __strong typeof(weakSelf) s = weakSelf;
+                    if (!s) return;
+                    if (host.length > 0 && fingerprint.length > 0) {
+                        s.sessionTrustedCerts[host] = fingerprint;
+                    }
+                    [s resolvePendingTrustForKey:trustKey accept:YES rejectedHost:displayHost];
+                    s.isPresentingAuthAlert = NO;
+                    [s drainAuthPromptQueue];
+                }]];
+                [alert addAction:[UIAlertAction actionWithTitle:@"拒绝连接" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+                    __strong typeof(weakSelf) s = weakSelf;
+                    if (!s) return;
+                    [s resolvePendingTrustForKey:trustKey accept:NO rejectedHost:displayHost];
+                    s.isPresentingAuthAlert = NO;
+                    [s drainAuthPromptQueue];
+                }]];
+
+                [strongSelf presentAuthAlertSafely:alert retryLeft:30 onCancel:^{
+                    __strong typeof(weakSelf) s = weakSelf;
+                    if (s) [s resolvePendingTrustForKey:trustKey accept:NO rejectedHost:displayHost];
+                }];
+            }];
+        });
+    });
+}
+
+- (void)handleBasicAuthChallenge:(NSURLAuthenticationChallenge *)challenge
+                         webView:(WKWebView *)webView
+                           guard:(JWAuthChallengeCompletionGuard *)guard {
+    NSURLProtectionSpace *space = challenge.protectionSpace;
+    NSString *host = space.host.lowercaseString ?: @"";
+    NSInteger port = space.port;
+    NSString *realm = space.realm ?: @"";
+    NSString *realmKey = [NSString stringWithFormat:@"%@:%ld:%@", host, (long)port, realm];
+    NSString *displayHost = (port > 0 && port != 443 && port != 80)
+        ? [NSString stringWithFormat:@"%@:%ld", host, (long)port]
+        : host;
+
+    if (challenge.previousFailureCount == 0) {
+        NSURLCredential *cached = self.sessionBasicAuth[realmKey];
+        if (cached) {
+            [guard invokeWithDisposition:NSURLSessionAuthChallengeUseCredential credential:cached];
+            return;
+        }
+    } else {
+        [self.sessionBasicAuth removeObjectForKey:realmKey];
+    }
+
+    JWPendingBasicAuthItem *pendingItem = [[JWPendingBasicAuthItem alloc] initWithGuard:guard webView:webView];
+    NSMutableArray<JWPendingBasicAuthItem *> *bucket = self.pendingBasicAuthQueues[realmKey];
+    if (bucket) {
+        [bucket addObject:pendingItem];
+        return;
+    }
+    bucket = [NSMutableArray arrayWithObject:pendingItem];
+    self.pendingBasicAuthQueues[realmKey] = bucket;
+
+    NSInteger prevFailures = challenge.previousFailureCount;
+    NSString *proposedUser = challenge.proposedCredential.user ?: @"";
+    __weak typeof(self) weakSelf = self;
+    [self enqueueAuthPrompt:^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        if (prevFailures == 0 && strongSelf.sessionBasicAuth[realmKey]) {
+            [strongSelf resolvePendingBasicAuthForKey:realmKey credential:strongSelf.sessionBasicAuth[realmKey] rejectedHost:displayHost];
+            strongSelf.isPresentingAuthAlert = NO;
+            [strongSelf drainAuthPromptQueue];
+            return;
+        }
+
+        NSMutableString *msg = [NSMutableString stringWithFormat:@"站点：%@", displayHost.length > 0 ? displayHost : @"未知主机"];
+        if (realm.length > 0) {
+            [msg appendFormat:@"\n认证域：%@", realm];
+        }
+        if (prevFailures > 0) {
+            [msg appendString:@"\n用户名或密码错误，请重试。"];
+        }
+
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"需要身份验证"
+                                                                       message:msg
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.placeholder = @"用户名";
+            tf.text = proposedUser;
+            tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+            tf.autocorrectionType = UITextAutocorrectionTypeNo;
+            tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+        }];
+        [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.placeholder = @"密码";
+            tf.secureTextEntry = YES;
+            tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+        }];
+        [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+            __strong typeof(weakSelf) s = weakSelf;
+            if (!s) return;
+            [s resolvePendingBasicAuthForKey:realmKey credential:nil rejectedHost:displayHost];
+            s.isPresentingAuthAlert = NO;
+            [s drainAuthPromptQueue];
+        }]];
+        __weak UIAlertController *weakAlert = alert;
+        [alert addAction:[UIAlertAction actionWithTitle:@"登录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            __strong typeof(weakSelf) s = weakSelf;
+            __strong UIAlertController *al = weakAlert;
+            if (!s) return;
+            NSString *user = (al.textFields.count > 0 ? al.textFields[0].text : nil) ?: @"";
+            NSString *pass = (al.textFields.count > 1 ? al.textFields[1].text : nil) ?: @"";
+            NSURLCredential *cred = [NSURLCredential credentialWithUser:user
+                                                               password:pass
+                                                            persistence:NSURLCredentialPersistenceForSession];
+            s.sessionBasicAuth[realmKey] = cred;
+            [s resolvePendingBasicAuthForKey:realmKey credential:cred rejectedHost:displayHost];
+            s.isPresentingAuthAlert = NO;
+            [s drainAuthPromptQueue];
+        }]];
+
+        [strongSelf presentAuthAlertSafely:alert retryLeft:30 onCancel:^{
+            __strong typeof(weakSelf) s = weakSelf;
+            if (s) [s resolvePendingBasicAuthForKey:realmKey credential:nil rejectedHost:displayHost];
+        }];
+    }];
 }
 
 #pragma mark - KVO & WKWebView Delegates
@@ -1699,18 +2991,55 @@ static void JWWriteSharedSnapshotOnBgQueue(NSString *sharedText) {
     [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
 }
 
+- (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation {
+    NSString *sid = [self siteIdForWebView:webView];
+    if (sid.length > 0) {
+        [self hideErrorOverlayForSiteId:sid];
+    }
+}
+
+- (void)webView:(WKWebView *)webView didCommitNavigation:(WKNavigation *)navigation {
+    NSString *sid = [self siteIdForWebView:webView];
+    if (sid.length > 0) {
+        [self hideErrorOverlayForSiteId:sid];
+    }
+}
+
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     [webView.scrollView.refreshControl endRefreshing];
+    NSString *sid = [self siteIdForWebView:webView];
+    if (sid.length > 0) {
+        [self hideErrorOverlayForSiteId:sid];
+    }
     if (webView == self.webViews[self.config.selectedSiteId]) {
         self.progressView.hidden = YES;
     }
+    [webView evaluateJavaScript:@"if(window.__jwRecheckInputs)window.__jwRecheckInputs();"
+                        inFrame:nil
+                 inContentWorld:[WKContentWorld defaultClientWorld]
+              completionHandler:nil];
     [self scheduleApplyProtectionAsync:nil];
+}
+
+static BOOL JWShouldIgnoreNavigationError(NSError *error) {
+    if (!error) return YES;
+    if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled) {
+        return YES;
+    }
+    if ([error.domain isEqualToString:@"WebKitErrorDomain"] && (error.code == 102 || error.code == 204)) {
+        return YES;
+    }
+    return NO;
 }
 
 - (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
     [webView.scrollView.refreshControl endRefreshing];
     if (webView == self.webViews[self.config.selectedSiteId]) {
         self.progressView.hidden = YES;
+    }
+    if (JWShouldIgnoreNavigationError(error)) return;
+    if (webView.URL == nil || [webView.URL.absoluteString isEqualToString:@"about:blank"] || JWIsSSLError(error)) {
+        [self showErrorOverlayForWebView:webView error:error customTitle:nil customDetail:nil];
     }
 }
 
@@ -1719,16 +3048,43 @@ static void JWWriteSharedSnapshotOnBgQueue(NSString *sharedText) {
     if (webView == self.webViews[self.config.selectedSiteId]) {
         self.progressView.hidden = YES;
     }
+
+    NSString *sid = [self siteIdForWebView:webView];
+    if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled) {
+        NSDictionary<NSString *, NSString *> *rej = sid ? self.lastRejectedAuthBySiteId[sid] : nil;
+        if (rej && (webView.URL == nil || [webView.URL.absoluteString isEqualToString:@"about:blank"])) {
+            [self showErrorOverlayForWebView:webView error:error customTitle:rej[@"title"] customDetail:rej[@"detail"]];
+        }
+        return;
+    }
+    if (JWShouldIgnoreNavigationError(error)) return;
+    [self showErrorOverlayForWebView:webView error:error customTitle:nil customDetail:nil];
+}
+
+- (void)webView:(WKWebView *)webView
+didReceiveAuthenticationChallenge:(NSURLAuthenticationChallenge *)challenge
+completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))completionHandler {
+    JWAuthChallengeCompletionGuard *guard = [[JWAuthChallengeCompletionGuard alloc] initWithBlock:completionHandler];
+    NSString *method = challenge.protectionSpace.authenticationMethod;
+
+    if ([method isEqualToString:NSURLAuthenticationMethodServerTrust]) {
+        /* 同时涵盖主页面 HTTPS、子资源 fetch/XHR 以及 wss:// WebSocket 的 TLS 证书校验 */
+        [self handleServerTrustChallenge:challenge webView:webView guard:guard];
+        return;
+    }
+
+    if ([method isEqualToString:NSURLAuthenticationMethodHTTPBasic] ||
+        [method isEqualToString:NSURLAuthenticationMethodHTTPDigest] ||
+        [method isEqualToString:NSURLAuthenticationMethodDefault]) {
+        [self handleBasicAuthChallenge:challenge webView:webView guard:guard];
+        return;
+    }
+
+    [guard invokeWithDisposition:NSURLSessionAuthChallengePerformDefaultHandling credential:nil];
 }
 
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
-    NSString *hitId = nil;
-    for (NSString *sid in self.webViews) {
-        if (self.webViews[sid] == webView) {
-            hitId = sid;
-            break;
-        }
-    }
+    NSString *hitId = [self siteIdForWebView:webView];
     if (!hitId) return;
     if ([hitId isEqualToString:self.config.selectedSiteId] &&
         [UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
@@ -1887,6 +3243,18 @@ completionHandler:(void (^)(NSString *))completionHandler {
     [self applyDockCollapsedStateAnimated:NO];
 }
 
+- (void)manageDidUpdateAppearanceConfig {
+    [self applyAppearanceStyles];
+}
+
+- (void)manageDidUpdateTrustedCerts {
+    for (NSString *host in [self.sessionTrustedCerts.allKeys copy]) {
+        if (!self.config.trustedCerts[host]) {
+            [self.sessionTrustedCerts removeObjectForKey:host];
+        }
+    }
+}
+
 - (void)manageDidRequestApplyProtectionNow:(void (^)(NSString *summary))completion {
     [self scheduleApplyProtectionAsync:completion];
 }
@@ -1896,11 +3264,13 @@ completionHandler:(void (^)(NSString *))completionHandler {
     WKWebView *wv = self.webViews[siteId];
     NSURL *u = site ? [NSURL URLWithString:site.urlString] : nil;
     if (wv && u) {
+        [self hideErrorOverlayForSiteId:siteId];
         [wv loadRequest:[NSURLRequest requestWithURL:u]];
     }
 }
 
 - (void)manageDidClearWebsiteData {
+    [self.sessionBasicAuth removeAllObjects];
     NSSet *types = [WKWebsiteDataStore allWebsiteDataTypes];
     NSDate *since = [NSDate dateWithTimeIntervalSince1970:0];
     __weak typeof(self) weakSelf = self;

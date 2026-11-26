@@ -46,7 +46,7 @@ jobs:
           xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall -fobjc-arc \
             -miphoneos-version-min=15.0 \
             -DJW_COMMIT=\"${{ env.JW_COMMIT }}\" \
-            -framework UIKit -framework Foundation -framework WebKit -framework CoreGraphics -framework QuartzCore \
+            -framework UIKit -framework Foundation -framework WebKit -framework CoreGraphics -framework QuartzCore -framework Security \
             app/main.m -o JetWeb
           ldid -Sentitlements-app.plist JetWeb
 

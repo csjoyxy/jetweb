@@ -7,6 +7,11 @@
 	<key>com.apple.private.security.no-sandbox</key><true/>
 	<key>com.apple.private.security.storage.AppDataContainers</key><true/>
 	<key>com.apple.private.persona-mgmt</key><true/>
+	<key>com.apple.security.iokit-user-client-class</key>
+	<array>
+		<string>AGXDeviceUserClient</string>
+		<string>IOSurfaceRootUserClient</string>
+	</array>
 	<key>com.apple.security.exception.files.absolute-path.read-write</key>
 	<array>
 		<string>/var/mobile/Library/JetWeb/</string>

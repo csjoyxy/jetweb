@@ -51,6 +51,12 @@ def verify_entitlements(ldid_bin: str, bin_path: str, expected_plist_path: str) 
         expected = plistlib.load(f)
     if actual != expected:
         raise RuntimeError(f"{bin_path}: embedded entitlements mismatch!\nactual={actual}\nexpected={expected}")
+    if expected.get("platform-application") and expected.get("application-identifier") == "com.lili.jetweb":
+        iokit = set(actual.get("com.apple.security.iokit-user-client-class", []))
+        required_iokit = {"AGXDeviceUserClient", "IOSurfaceRootUserClient"}
+        missing = required_iokit - iokit
+        if missing:
+            raise RuntimeError(f"{bin_path}: missing required IOKit entitlements: {sorted(missing)}")
 
 
 def extract_jw_version(main_m_path: str) -> str:

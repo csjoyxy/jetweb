@@ -29,6 +29,7 @@
 	<key>NSPhotoLibraryUsageDescription</key><string>供网页选择图片或文件上传使用</string>
 	<key>NSPhotoLibraryAddUsageDescription</key><string>供网页保存图片到相册使用</string>
 	<key>NSLocationWhenInUseUsageDescription</key><string>供网页获取当前位置使用</string>
+	<key>NSLocalNetworkUsageDescription</key><string>供网页访问局域网或自托管内网 WebApp 服务使用</string>
 	<key>CFBundleIcons</key>
 	<dict>
 		<key>CFBundlePrimaryIcon</key>
