@@ -912,16 +912,18 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         let zeroMemPill = UIView()
         zeroMemPill.translatesAutoresizingMaskIntoConstraints = false
-        zeroMemPill.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.14)
+        zeroMemPill.backgroundColor = JWGlassPalette.chipFill(for: .emerald)
         zeroMemPill.layer.cornerRadius = 10
         zeroMemPill.layer.cornerCurve = .continuous
+        zeroMemPill.layer.borderWidth = 1.0 / UIScreen.main.scale
+        zeroMemPill.layer.borderColor = JWGlassPalette.chipBorder(for: .emerald).cgColor
         hibernatedGlassCard.contentView.addSubview(zeroMemPill)
 
         let zeroMemLabel = UILabel()
         zeroMemLabel.translatesAutoresizingMaskIntoConstraints = false
         zeroMemLabel.text = "✓ 已释放网页内存 · 当前占用 0 MB"
-        zeroMemLabel.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
-        zeroMemLabel.textColor = .systemGreen
+        zeroMemLabel.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .bold)
+        zeroMemLabel.textColor = JWGlassPalette.foreground(for: .emerald)
         zeroMemPill.addSubview(zeroMemLabel)
 
         hibernatedTitleLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -1799,26 +1801,6 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         ]
 
         var hibGroup: [JWGlassRowItem] = []
-        if targetSite.hibernated {
-            hibGroup.append(JWGlassRowItem(
-                symbol: "bolt.fill",
-                tint: .systemIndigo,
-                title: "唤醒并打开此标签",
-                trailingText: "恢复网页"
-            ) { [weak self] in
-                self?.setSiteHibernated(siteId: targetSite.id, hibernated: false)
-            })
-        } else {
-            hibGroup.append(JWGlassRowItem(
-                symbol: "moon.zzz.fill",
-                tint: .systemIndigo,
-                title: "休眠此标签（释放内存）",
-                trailingText: "保留登录态"
-            ) { [weak self] in
-                self?.setSiteHibernated(siteId: targetSite.id, hibernated: true)
-            })
-        }
-
         let otherAwakeCount = awakeSites().filter { $0.id != targetSite.id }.count
         if otherAwakeCount > 0 {
             hibGroup.append(JWGlassRowItem(
@@ -1859,6 +1841,15 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 showsChevron: true
             ) { [weak self] in
                 self?.showQuickAccountSpacePicker(for: targetSite, sourceView: sourceView)
+            },
+            JWGlassRowItem(
+                symbol: "circle.lefthalf.filled",
+                tint: .systemIndigo,
+                title: "站点外观模式",
+                trailingText: JWAppearanceHelper.label(for: targetSite.appearanceMode),
+                showsChevron: true
+            ) { [weak self] in
+                self?.showQuickAppearancePicker(for: targetSite, sourceView: sourceView)
             },
             JWGlassRowItem(
                 symbol: "eye.slash",

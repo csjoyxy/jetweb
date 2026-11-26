@@ -318,8 +318,8 @@ struct SettingsDrawerView: View {
                                 .foregroundColor(.primary)
                             if let st = hostSt, st.band >= 0 {
                                 Text("主容器 PID \(hostPid) · \(st.band >= 100 ? "前台活跃(目标\(guardian.hostBand)档)" : "实测 \(st.band) 档") · \(st.footprintMB) MB")
-                                    .font(.system(size: 11.5, weight: .medium).monospacedDigit())
-                                    .foregroundColor(hostOK ? .green : .secondary)
+                                    .font(.system(size: 11.5, weight: .semibold).monospacedDigit())
+                                    .foregroundColor(hostOK ? Color(JWGlassPalette.foreground(for: .emerald)) : .secondary)
                             } else {
                                 Text("读取内核状态中 / 需 TrollStore 安装")
                                     .font(.system(size: 11.5))
@@ -350,19 +350,19 @@ struct SettingsDrawerView: View {
                     HStack(spacing: 8) {
                         dashboardMetricTile(
                             symbol: "square.stack.3d.up.fill",
-                            tint: .blue,
+                            tint: Color(JWGlassPalette.foreground(for: .cobalt)),
                             label: "标签状态",
                             value: "\(awakeTabCount) 活 · \(hibernatedTabCount) 眠"
                         )
                         dashboardMetricTile(
                             symbol: "memorychip",
-                            tint: totalLiveMemoryMB > 1100 ? .orange : .green,
+                            tint: Color(JWGlassPalette.foreground(for: totalLiveMemoryMB > 1100 ? .amber : .emerald)),
                             label: "总内存占用",
                             value: "\(totalLiveMemoryMB) MB"
                         )
                         dashboardMetricTile(
                             symbol: config.notificationsEnabled ? "bell.badge.fill" : "bell.slash.fill",
-                            tint: .teal,
+                            tint: Color(JWGlassPalette.foreground(for: .teal)),
                             label: "后台等信",
                             value: !config.notificationsEnabled
                                 ? "已关闭"
@@ -377,7 +377,7 @@ struct SettingsDrawerView: View {
                             }
                         }
                         .padding(10)
-                        .background(Color(UIColor.systemBackground).opacity(0.46))
+                        .background(Color(UIColor.systemBackground).opacity(0.62))
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                     }
                 }
@@ -414,7 +414,7 @@ struct SettingsDrawerView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 9)
         .padding(.vertical, 8)
-        .background(Color(UIColor.systemBackground).opacity(0.50))
+        .background(Color(UIColor.systemBackground).opacity(0.65))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
@@ -441,10 +441,10 @@ struct SettingsDrawerView: View {
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
                         Capsule()
-                            .fill(Color.secondary.opacity(0.14))
+                            .fill(Color.secondary.opacity(0.16))
                             .frame(height: 4)
                         Capsule()
-                            .fill(mb > config.maxMemoryMB ? Color.orange : (effBand >= 85 ? Color.blue : Color.green))
+                            .fill(Color(JWGlassPalette.foreground(for: mb > config.maxMemoryMB ? .amber : (effBand >= 85 ? .cobalt : .emerald))))
                             .frame(width: max(6, geo.size.width * CGFloat(ratio)), height: 4)
                     }
                 }
@@ -487,12 +487,12 @@ struct SettingsDrawerView: View {
                 Text("休眠 · 0 MB")
                     .font(.system(size: 11, weight: .semibold).monospacedDigit())
             }
-            .foregroundColor(.indigo)
+            .foregroundColor(Color(JWGlassPalette.foreground(for: .indigo)))
         } else if wpid <= 0 {
             if runtime.terminatedSiteIds.contains(site.id) {
                 Text("待恢复")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.orange)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Color(JWGlassPalette.foreground(for: .amber)))
             } else {
                 Text("目标 \(effBand) 档")
                     .font(.system(size: 11, weight: .medium).monospacedDigit())
@@ -513,9 +513,12 @@ struct SettingsDrawerView: View {
                 }
                 return "\(st.band)/\(effBand)档 · \(st.footprintMB) MB"
             }()
+            let statusColor: Color = overMem
+                ? Color(JWGlassPalette.foreground(for: .amber))
+                : (badge == "OK" ? Color(JWGlassPalette.foreground(for: .emerald)) : .secondary)
             Text(summaryText)
                 .font(.system(size: 11, weight: .semibold).monospacedDigit())
-                .foregroundColor(overMem ? .orange : (badge == "OK" ? .green : .secondary))
+                .foregroundColor(statusColor)
         } else {
             Text("PID \(wpid)")
                 .font(.system(size: 11).monospacedDigit())
@@ -523,10 +526,10 @@ struct SettingsDrawerView: View {
         }
     }
 
-    private func bandBadgeColor(for effBand: Int) -> Color {
-        if effBand >= 86 { return .orange }
-        if effBand >= 75 { return .blue }
-        return .secondary
+    private func bandRole(for effBand: Int) -> JWGlassPalette.SemanticRole {
+        if effBand >= 86 { return .amber }
+        if effBand >= 75 { return .cobalt }
+        return .neutral
     }
 
     private var sitesSection: some View {
@@ -547,7 +550,6 @@ struct SettingsDrawerView: View {
             } else {
                 ForEach(config.sites) { site in
                     let effBand = config.effectiveSiteBand(for: site)
-                    let bColor = bandBadgeColor(for: effBand)
                     HStack(spacing: 11) {
                         NavigationLink(
                             destination: SiteDetailView(
@@ -577,19 +579,19 @@ struct SettingsDrawerView: View {
                                         miniTagPill(
                                             symbol: "bolt.shield.fill",
                                             text: JWPriorityHelper.shortBadge(customBand: site.customBand, globalBand: config.targetBand),
-                                            color: bColor
+                                            role: bandRole(for: effBand)
                                         )
 
                                         miniTagPill(
                                             symbol: site.isIsolatedStore ? "lock.fill" : "person.2.fill",
                                             text: site.isIsolatedStore ? "独立空间" : "共享",
-                                            color: site.isIsolatedStore ? .teal : .secondary
+                                            role: site.isIsolatedStore ? .teal : .neutral
                                         )
 
                                         if site.enabled && site.hibernated {
-                                            miniTagPill(symbol: "moon.zzz.fill", text: "已休眠", color: .indigo)
+                                            miniTagPill(symbol: "moon.zzz.fill", text: "已休眠", role: .indigo)
                                         } else if config.notificationsEnabled && site.notifyEnabled && site.enabled {
-                                            miniTagPill(symbol: "bell.fill", text: "通知", color: .blue)
+                                            miniTagPill(symbol: "bell.fill", text: "通知", role: .cobalt)
                                         }
                                     }
                                 }
@@ -629,18 +631,18 @@ struct SettingsDrawerView: View {
         }
     }
 
-    private func miniTagPill(symbol: String, text: String, color: Color) -> some View {
+    private func miniTagPill(symbol: String, text: String, role: JWGlassPalette.SemanticRole) -> some View {
         HStack(spacing: 2.5) {
             Image(systemName: symbol)
                 .font(.system(size: 8.5, weight: .bold))
             Text(text)
                 .font(.system(size: 10, weight: .semibold))
         }
-        .padding(.horizontal, 5.5)
-        .padding(.vertical, 2)
-        .background(color.opacity(0.14))
-        .foregroundColor(color)
-        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2.5)
+        .background(Color(JWGlassPalette.chipFill(for: role)))
+        .foregroundColor(Color(JWGlassPalette.foreground(for: role)))
+        .clipShape(RoundedRectangle(cornerRadius: 5.5, style: .continuous))
     }
 
     private var notificationSection: some View {

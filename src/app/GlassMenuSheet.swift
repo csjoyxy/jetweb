@@ -1,15 +1,114 @@
 import UIKit
 
-// MARK: - Deterministic Site Color Palette & Squircle Avatar
+// MARK: - High-Contrast Adaptive Glass Palette & Squircle Avatar
+
+enum JWGlassPalette {
+    enum SemanticRole {
+        case emerald
+        case amber
+        case cobalt
+        case teal
+        case indigo
+        case purple
+        case neutral
+    }
+
+    static func role(for tint: UIColor) -> SemanticRole {
+        if tint == .systemGreen { return .emerald }
+        if tint == .systemOrange || tint == .systemYellow { return .amber }
+        if tint == .systemTeal { return .teal }
+        if tint == .systemIndigo { return .indigo }
+        if tint == .systemPurple { return .purple }
+        if tint == .secondaryLabel || tint == .tertiaryLabel { return .neutral }
+        return .cobalt
+    }
+
+    /// High-contrast foreground color (>= 5.8:1 WCAG AA contrast on frosted glass in both Light & Dark modes)
+    static func foreground(for role: SemanticRole) -> UIColor {
+        return UIColor { tc in
+            let dark = (tc.userInterfaceStyle == .dark)
+            switch role {
+            case .emerald:
+                return dark
+                    ? UIColor(red: 0.34, green: 0.93, blue: 0.56, alpha: 1.0)
+                    : UIColor(red: 0.04, green: 0.44, blue: 0.20, alpha: 1.0)
+            case .amber:
+                return dark
+                    ? UIColor(red: 1.00, green: 0.75, blue: 0.26, alpha: 1.0)
+                    : UIColor(red: 0.72, green: 0.27, blue: 0.02, alpha: 1.0)
+            case .cobalt:
+                return dark
+                    ? UIColor(red: 0.46, green: 0.74, blue: 1.00, alpha: 1.0)
+                    : UIColor(red: 0.07, green: 0.34, blue: 0.82, alpha: 1.0)
+            case .teal:
+                return dark
+                    ? UIColor(red: 0.36, green: 0.88, blue: 0.92, alpha: 1.0)
+                    : UIColor(red: 0.03, green: 0.41, blue: 0.50, alpha: 1.0)
+            case .indigo:
+                return dark
+                    ? UIColor(red: 0.70, green: 0.66, blue: 1.00, alpha: 1.0)
+                    : UIColor(red: 0.27, green: 0.20, blue: 0.76, alpha: 1.0)
+            case .purple:
+                return dark
+                    ? UIColor(red: 0.84, green: 0.60, blue: 1.00, alpha: 1.0)
+                    : UIColor(red: 0.48, green: 0.18, blue: 0.74, alpha: 1.0)
+            case .neutral:
+                return dark
+                    ? UIColor(white: 0.82, alpha: 1.0)
+                    : UIColor(white: 0.26, alpha: 1.0)
+            }
+        }
+    }
+
+    static func chipFill(for role: SemanticRole) -> UIColor {
+        return UIColor { tc in
+            let dark = (tc.userInterfaceStyle == .dark)
+            switch role {
+            case .emerald:
+                return dark
+                    ? UIColor(red: 0.08, green: 0.34, blue: 0.19, alpha: 0.72)
+                    : UIColor(red: 0.90, green: 0.98, blue: 0.93, alpha: 0.92)
+            case .amber:
+                return dark
+                    ? UIColor(red: 0.38, green: 0.22, blue: 0.05, alpha: 0.74)
+                    : UIColor(red: 1.00, green: 0.95, blue: 0.88, alpha: 0.94)
+            case .cobalt:
+                return dark
+                    ? UIColor(red: 0.10, green: 0.25, blue: 0.48, alpha: 0.72)
+                    : UIColor(red: 0.91, green: 0.95, blue: 1.00, alpha: 0.92)
+            case .teal:
+                return dark
+                    ? UIColor(red: 0.07, green: 0.31, blue: 0.36, alpha: 0.72)
+                    : UIColor(red: 0.90, green: 0.97, blue: 0.99, alpha: 0.92)
+            case .indigo:
+                return dark
+                    ? UIColor(red: 0.20, green: 0.17, blue: 0.46, alpha: 0.72)
+                    : UIColor(red: 0.93, green: 0.92, blue: 1.00, alpha: 0.92)
+            case .purple:
+                return dark
+                    ? UIColor(red: 0.30, green: 0.15, blue: 0.44, alpha: 0.72)
+                    : UIColor(red: 0.96, green: 0.91, blue: 1.00, alpha: 0.92)
+            case .neutral:
+                return dark
+                    ? UIColor(white: 0.22, alpha: 0.75)
+                    : UIColor(white: 0.95, alpha: 0.90)
+            }
+        }
+    }
+
+    static func chipBorder(for role: SemanticRole) -> UIColor {
+        return foreground(for: role).withAlphaComponent(0.24)
+    }
+}
 
 enum JWSitePalette {
     static let pairs: [(top: UIColor, bottom: UIColor)] = [
-        (UIColor(red: 0.18, green: 0.49, blue: 0.96, alpha: 1.0), UIColor(red: 0.30, green: 0.28, blue: 0.90, alpha: 1.0)), // Cobalt -> Indigo
-        (UIColor(red: 0.08, green: 0.68, blue: 0.62, alpha: 1.0), UIColor(red: 0.06, green: 0.48, blue: 0.68, alpha: 1.0)), // Emerald -> Teal
-        (UIColor(red: 0.53, green: 0.33, blue: 0.96, alpha: 1.0), UIColor(red: 0.76, green: 0.24, blue: 0.72, alpha: 1.0)), // Violet -> Orchid
-        (UIColor(red: 0.95, green: 0.50, blue: 0.16, alpha: 1.0), UIColor(red: 0.90, green: 0.27, blue: 0.36, alpha: 1.0)), // Amber -> Coral
-        (UIColor(red: 0.14, green: 0.62, blue: 0.92, alpha: 1.0), UIColor(red: 0.16, green: 0.38, blue: 0.86, alpha: 1.0)), // Sky -> Ocean
-        (UIColor(red: 0.20, green: 0.72, blue: 0.42, alpha: 1.0), UIColor(red: 0.09, green: 0.52, blue: 0.46, alpha: 1.0))  // Mint -> Forest
+        (UIColor(red: 0.18, green: 0.49, blue: 0.96, alpha: 1.0), UIColor(red: 0.30, green: 0.28, blue: 0.90, alpha: 1.0)),
+        (UIColor(red: 0.08, green: 0.68, blue: 0.62, alpha: 1.0), UIColor(red: 0.06, green: 0.48, blue: 0.68, alpha: 1.0)),
+        (UIColor(red: 0.53, green: 0.33, blue: 0.96, alpha: 1.0), UIColor(red: 0.76, green: 0.24, blue: 0.72, alpha: 1.0)),
+        (UIColor(red: 0.95, green: 0.50, blue: 0.16, alpha: 1.0), UIColor(red: 0.90, green: 0.27, blue: 0.36, alpha: 1.0)),
+        (UIColor(red: 0.14, green: 0.62, blue: 0.92, alpha: 1.0), UIColor(red: 0.16, green: 0.38, blue: 0.86, alpha: 1.0)),
+        (UIColor(red: 0.20, green: 0.72, blue: 0.42, alpha: 1.0), UIColor(red: 0.09, green: 0.52, blue: 0.46, alpha: 1.0))
     ]
 
     static func gradientPair(for key: String) -> (top: UIColor, bottom: UIColor) {
@@ -121,27 +220,27 @@ struct JWGlassRowItem {
     let action: () -> Void
 }
 
-// MARK: - Interactive Pressable Controls
+// MARK: - Interactive Pressable Controls (Exact Balanced Tile Size)
 
 private final class JWGlassTileControl: UIControl {
     private let iconView = UIImageView()
     private let titleLabel = UILabel()
     private let subLabel = UILabel()
     private var tapAction: (() -> Void)?
-    private var itemTint: UIColor = .systemBlue
+    private var itemRole: JWGlassPalette.SemanticRole = .cobalt
     private var itemActive: Bool = false
 
-    init(item: JWGlassTileItem, onInvoke: @escaping (@escaping () -> Void) -> Void) {
+    init(item: JWGlassTileItem, fixedHeight: CGFloat, onInvoke: @escaping (@escaping () -> Void) -> Void) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-        layer.cornerRadius = 15
+        layer.cornerRadius = 16
         layer.cornerCurve = .continuous
         isEnabled = item.isEnabled
-        itemTint = item.tint
+        itemRole = JWGlassPalette.role(for: item.tint)
         itemActive = item.isActive
         tapAction = { onInvoke(item.action) }
 
-        let cfg = UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+        let cfg = UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.image = UIImage(systemName: item.symbol, withConfiguration: cfg)
         iconView.contentMode = .scaleAspectFit
@@ -149,7 +248,7 @@ private final class JWGlassTileControl: UIControl {
 
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.text = item.title
-        titleLabel.font = .systemFont(ofSize: 11.5, weight: .semibold)
+        titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         titleLabel.textAlignment = .center
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.isUserInteractionEnabled = false
@@ -166,17 +265,17 @@ private final class JWGlassTileControl: UIControl {
         vStack.translatesAutoresizingMaskIntoConstraints = false
         vStack.axis = .vertical
         vStack.alignment = .center
-        vStack.spacing = 3
-        vStack.setCustomSpacing(1, after: titleLabel)
+        vStack.spacing = 4
+        vStack.setCustomSpacing(1.5, after: titleLabel)
         vStack.isUserInteractionEnabled = false
         addSubview(vStack)
 
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(greaterThanOrEqualToConstant: 62),
-            iconView.heightAnchor.constraint(equalToConstant: 20),
+            heightAnchor.constraint(equalToConstant: fixedHeight),
+            iconView.heightAnchor.constraint(equalToConstant: 21),
             vStack.centerYAnchor.constraint(equalTo: centerYAnchor),
-            vStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            vStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6)
+            vStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
+            vStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5)
         ])
 
         applyVisualState()
@@ -189,9 +288,9 @@ private final class JWGlassTileControl: UIControl {
 
     override var isHighlighted: Bool {
         didSet {
-            UIView.animate(withDuration: 0.14, delay: 0, options: [.allowUserInteraction, .curveEaseOut]) {
+            UIView.animate(withDuration: 0.13, delay: 0, options: [.allowUserInteraction, .curveEaseOut]) {
                 self.transform = self.isHighlighted ? CGAffineTransform(scaleX: 0.94, y: 0.94) : .identity
-                self.alpha = self.isHighlighted ? 0.82 : (self.isEnabled ? 1.0 : 0.38)
+                self.alpha = self.isHighlighted ? 0.80 : (self.isEnabled ? 1.0 : 0.38)
             }
         }
     }
@@ -204,15 +303,17 @@ private final class JWGlassTileControl: UIControl {
     private func applyVisualState() {
         let isDark = (traitCollection.userInterfaceStyle == .dark)
         layer.borderWidth = 1.0 / UIScreen.main.scale
+
         if itemActive {
-            backgroundColor = itemTint.withAlphaComponent(isDark ? 0.30 : 0.16)
-            layer.borderColor = itemTint.withAlphaComponent(isDark ? 0.52 : 0.35).cgColor
-            iconView.tintColor = itemTint
-            titleLabel.textColor = itemTint
-            subLabel.textColor = itemTint.withAlphaComponent(0.85)
+            let fg = JWGlassPalette.foreground(for: itemRole)
+            backgroundColor = JWGlassPalette.chipFill(for: itemRole)
+            layer.borderColor = JWGlassPalette.chipBorder(for: itemRole).cgColor
+            iconView.tintColor = fg
+            titleLabel.textColor = fg
+            subLabel.textColor = fg.withAlphaComponent(0.85)
         } else {
-            backgroundColor = UIColor.secondarySystemFill.withAlphaComponent(isDark ? 0.58 : 0.72)
-            layer.borderColor = UIColor.white.withAlphaComponent(isDark ? 0.10 : 0.55).cgColor
+            backgroundColor = UIColor.secondarySystemGroupedBackground.withAlphaComponent(isDark ? 0.56 : 0.78)
+            layer.borderColor = UIColor.white.withAlphaComponent(isDark ? 0.09 : 0.65).cgColor
             iconView.tintColor = .label
             titleLabel.textColor = .label
             subLabel.textColor = .secondaryLabel
@@ -238,8 +339,11 @@ private final class JWGlassRowControl: UIControl {
         badge.translatesAutoresizingMaskIntoConstraints = false
         badge.layer.cornerRadius = 8
         badge.layer.cornerCurve = .continuous
-        let effTint: UIColor = item.isDestructive ? .systemRed : item.tint
-        badge.backgroundColor = effTint.withAlphaComponent(0.15)
+        let role = JWGlassPalette.role(for: item.tint)
+        let fgColor: UIColor = item.isDestructive ? .systemRed : JWGlassPalette.foreground(for: role)
+        badge.backgroundColor = item.isDestructive
+            ? UIColor.systemRed.withAlphaComponent(0.14)
+            : JWGlassPalette.chipFill(for: role)
         badge.isUserInteractionEnabled = false
         addSubview(badge)
 
@@ -247,7 +351,7 @@ private final class JWGlassRowControl: UIControl {
         iconView.translatesAutoresizingMaskIntoConstraints = false
         let cfg = UIImage.SymbolConfiguration(pointSize: 13.5, weight: .semibold)
         iconView.image = UIImage(systemName: item.symbol, withConfiguration: cfg)
-        iconView.tintColor = effTint
+        iconView.tintColor = fgColor
         iconView.contentMode = .scaleAspectFit
         badge.addSubview(iconView)
 
@@ -300,11 +404,11 @@ private final class JWGlassRowControl: UIControl {
         }
 
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
+            heightAnchor.constraint(equalToConstant: 46),
             badge.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 13),
             badge.centerYAnchor.constraint(equalTo: centerYAnchor),
-            badge.widthAnchor.constraint(equalToConstant: 30),
-            badge.heightAnchor.constraint(equalToConstant: 30),
+            badge.widthAnchor.constraint(equalToConstant: 29),
+            badge.heightAnchor.constraint(equalToConstant: 29),
 
             iconView.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
             iconView.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
@@ -416,7 +520,7 @@ final class JWGlassSheetController: UIViewController {
         view.addSubview(shadowWrap)
 
         glassCard.translatesAutoresizingMaskIntoConstraints = false
-        glassCard.layer.cornerRadius = 28
+        glassCard.layer.cornerRadius = 26
         glassCard.layer.cornerCurve = .continuous
         glassCard.clipsToBounds = true
         shadowWrap.addSubview(glassCard)
@@ -439,16 +543,21 @@ final class JWGlassSheetController: UIViewController {
         let bodyStack = UIStackView()
         bodyStack.translatesAutoresizingMaskIntoConstraints = false
         bodyStack.axis = .vertical
-        bodyStack.spacing = 12
+        bodyStack.spacing = 10
         scrollView.addSubview(bodyStack)
 
         if !tiles.isEmpty {
+            let hasSub = tiles.contains { !$0.subtitle.isEmpty }
+            let tileH: CGFloat = hasSub ? 72 : 68
             let tileRow = UIStackView()
+            tileRow.translatesAutoresizingMaskIntoConstraints = false
             tileRow.axis = .horizontal
             tileRow.distribution = .fillEqually
+            tileRow.alignment = .fill
             tileRow.spacing = 8
+            tileRow.heightAnchor.constraint(equalToConstant: tileH).isActive = true
             for t in tiles {
-                let ctrl = JWGlassTileControl(item: t) { [weak self] action in
+                let ctrl = JWGlassTileControl(item: t, fixedHeight: tileH) { [weak self] action in
                     self?.dismissAndInvoke(action)
                 }
                 tileRow.addArrangedSubview(ctrl)
@@ -460,11 +569,11 @@ final class JWGlassSheetController: UIViewController {
         for group in sections where !group.isEmpty {
             let groupCard = UIView()
             groupCard.translatesAutoresizingMaskIntoConstraints = false
-            groupCard.backgroundColor = UIColor.secondarySystemGroupedBackground.withAlphaComponent(isDark ? 0.52 : 0.72)
-            groupCard.layer.cornerRadius = 17
+            groupCard.backgroundColor = UIColor.secondarySystemGroupedBackground.withAlphaComponent(isDark ? 0.56 : 0.78)
+            groupCard.layer.cornerRadius = 16
             groupCard.layer.cornerCurve = .continuous
             groupCard.layer.borderWidth = 1.0 / UIScreen.main.scale
-            groupCard.layer.borderColor = UIColor.white.withAlphaComponent(isDark ? 0.08 : 0.55).cgColor
+            groupCard.layer.borderColor = UIColor.white.withAlphaComponent(isDark ? 0.09 : 0.65).cgColor
             groupCard.clipsToBounds = true
 
             let rowsStack = UIStackView()
@@ -491,13 +600,17 @@ final class JWGlassSheetController: UIViewController {
         }
 
         let contentHeightConstraint = scrollView.heightAnchor.constraint(equalTo: bodyStack.heightAnchor)
-        contentHeightConstraint.priority = .defaultHigh
+        contentHeightConstraint.priority = UILayoutPriority(995)
+
+        /* Gently pull shadowWrap toward minimum intrinsic height so short sheets never stretch upward */
+        let compactSheetConstraint = shadowWrap.heightAnchor.constraint(equalToConstant: 0)
+        compactSheetConstraint.priority = UILayoutPriority(50)
 
         cardBottomConstraint = shadowWrap.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -10)
         let lead = shadowWrap.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12)
-        lead.priority = .defaultHigh
+        lead.priority = UILayoutPriority(999)
         let trail = shadowWrap.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
-        trail.priority = .defaultHigh
+        trail.priority = UILayoutPriority(999)
 
         NSLayoutConstraint.activate([
             dimView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -508,9 +621,10 @@ final class JWGlassSheetController: UIViewController {
             shadowWrap.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             lead,
             trail,
-            shadowWrap.widthAnchor.constraint(lessThanOrEqualToConstant: 450),
-            shadowWrap.topAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.topAnchor, constant: 24),
+            shadowWrap.widthAnchor.constraint(lessThanOrEqualToConstant: 440),
+            shadowWrap.topAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.topAnchor, constant: 28),
             cardBottomConstraint,
+            compactSheetConstraint,
 
             glassCard.topAnchor.constraint(equalTo: shadowWrap.topAnchor),
             glassCard.leadingAnchor.constraint(equalTo: shadowWrap.leadingAnchor),
@@ -527,9 +641,9 @@ final class JWGlassSheetController: UIViewController {
             headerView.trailingAnchor.constraint(equalTo: glassCard.contentView.trailingAnchor, constant: -16),
 
             scrollView.topAnchor.constraint(equalTo: headerView.bottomAnchor, constant: 12),
-            scrollView.leadingAnchor.constraint(equalTo: glassCard.contentView.leadingAnchor, constant: 14),
-            scrollView.trailingAnchor.constraint(equalTo: glassCard.contentView.trailingAnchor, constant: -14),
-            scrollView.bottomAnchor.constraint(equalTo: glassCard.contentView.bottomAnchor, constant: -14),
+            scrollView.leadingAnchor.constraint(equalTo: glassCard.contentView.leadingAnchor, constant: 13),
+            scrollView.trailingAnchor.constraint(equalTo: glassCard.contentView.trailingAnchor, constant: -13),
+            scrollView.bottomAnchor.constraint(equalTo: glassCard.contentView.bottomAnchor, constant: -13),
             contentHeightConstraint,
 
             bodyStack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
@@ -560,7 +674,7 @@ final class JWGlassSheetController: UIViewController {
 
         let closeBtn = UIButton(type: .system)
         closeBtn.translatesAutoresizingMaskIntoConstraints = false
-        closeBtn.backgroundColor = UIColor.secondarySystemFill.withAlphaComponent(0.8)
+        closeBtn.backgroundColor = UIColor.tertiarySystemFill.withAlphaComponent(0.9)
         closeBtn.layer.cornerRadius = 14
         let xCfg = UIImage.SymbolConfiguration(pointSize: 11.5, weight: .bold)
         closeBtn.setImage(UIImage(systemName: "xmark", withConfiguration: xCfg), for: .normal)
@@ -572,7 +686,7 @@ final class JWGlassSheetController: UIViewController {
         textStack.translatesAutoresizingMaskIntoConstraints = false
         textStack.axis = .vertical
         textStack.alignment = .leading
-        textStack.spacing = 4
+        textStack.spacing = 4.5
         container.addSubview(textStack)
 
         let titleLbl = UILabel()
@@ -595,7 +709,7 @@ final class JWGlassSheetController: UIViewController {
         if !chips.isEmpty {
             let chipRow = UIStackView()
             chipRow.axis = .horizontal
-            chipRow.spacing = 5
+            chipRow.spacing = 5.5
             chipRow.alignment = .center
             for ch in chips {
                 chipRow.addArrangedSubview(makeChipView(ch))
@@ -610,14 +724,14 @@ final class JWGlassSheetController: UIViewController {
             avatar.heightAnchor.constraint(equalToConstant: 40),
 
             closeBtn.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            closeBtn.topAnchor.constraint(equalTo: container.topAnchor, constant: 2),
+            closeBtn.centerYAnchor.constraint(equalTo: container.centerYAnchor),
             closeBtn.widthAnchor.constraint(equalToConstant: 28),
             closeBtn.heightAnchor.constraint(equalToConstant: 28),
 
             textStack.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 11),
             textStack.trailingAnchor.constraint(lessThanOrEqualTo: closeBtn.leadingAnchor, constant: -8),
-            textStack.topAnchor.constraint(equalTo: container.topAnchor),
-            textStack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            textStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 1),
+            textStack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -1),
             container.heightAnchor.constraint(greaterThanOrEqualToConstant: 42)
         ])
 
@@ -625,33 +739,39 @@ final class JWGlassSheetController: UIViewController {
     }
 
     private func makeChipView(_ chip: JWGlassChipItem) -> UIView {
+        let role = JWGlassPalette.role(for: chip.tint)
+        let fgColor = JWGlassPalette.foreground(for: role)
+
         let pill = UIView()
         pill.translatesAutoresizingMaskIntoConstraints = false
-        pill.backgroundColor = chip.tint.withAlphaComponent(0.14)
+        pill.backgroundColor = JWGlassPalette.chipFill(for: role)
         pill.layer.cornerRadius = 7
         pill.layer.cornerCurve = .continuous
+        pill.layer.borderWidth = 1.0 / UIScreen.main.scale
+        pill.layer.borderColor = JWGlassPalette.chipBorder(for: role).cgColor
 
         let iv = UIImageView()
         iv.translatesAutoresizingMaskIntoConstraints = false
         let cfg = UIImage.SymbolConfiguration(pointSize: 9.5, weight: .bold)
         iv.image = UIImage(systemName: chip.symbol, withConfiguration: cfg)
-        iv.tintColor = chip.tint
+        iv.tintColor = fgColor
 
         let lbl = UILabel()
         lbl.translatesAutoresizingMaskIntoConstraints = false
         lbl.text = chip.text
-        lbl.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold)
-        lbl.textColor = chip.tint
+        lbl.font = .monospacedDigitSystemFont(ofSize: 11, weight: .bold)
+        lbl.textColor = fgColor
+        lbl.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         pill.addSubview(iv)
         pill.addSubview(lbl)
 
         NSLayoutConstraint.activate([
-            pill.heightAnchor.constraint(equalToConstant: 19),
-            iv.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 6),
+            pill.heightAnchor.constraint(equalToConstant: 21),
+            iv.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 6.5),
             iv.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
             lbl.leadingAnchor.constraint(equalTo: iv.trailingAnchor, constant: 3.5),
-            lbl.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -6.5),
+            lbl.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -7),
             lbl.centerYAnchor.constraint(equalTo: pill.centerYAnchor)
         ])
         return pill
@@ -678,7 +798,7 @@ final class JWGlassSheetController: UIViewController {
         super.viewDidLayoutSubviews()
         shadowWrap.layer.shadowPath = UIBezierPath(
             roundedRect: shadowWrap.bounds,
-            cornerRadius: 28
+            cornerRadius: 26
         ).cgPath
     }
 
