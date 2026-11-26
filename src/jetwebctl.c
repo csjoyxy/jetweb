@@ -233,11 +233,15 @@ static void set_elevated_inactive_floor(pid_t pid, int enable) {
 }
 
 /*
- * Align inactive memory limit (memlimit_inactive) so XNU's memorystatus_kill_hiwat_proc
- * does not prematurely kill protected WebContent / Networking / GPU / Host processes
- * via low default XPC inactive high-water-marks when leaving foreground.
+ * Align both active (foreground) and inactive (background) memory limits as non-fatal
+ * soft high-water-marks (attr = 0):
+ * - Clears MEMORYSTATUS_MEMLIMIT_ATTR_FATAL on memlimit_active so transient JS/DOM spikes
+ *   (e.g. scrolling long conversations or SPA hydration hitting 550~750 MB before GC)
+ *   trigger WebKit's MemoryPressureHandler GC instead of an instant kernel PERPROCESSLIMIT kill;
+ * - Raises memlimit_inactive so FG->BG transitions are not killed by low default XPC HWMs;
+ * - Caps background over-budget WebContent to max_mb soft HWM so true leaks are reclaimed first.
  */
-static void ensure_inactive_memlimit(pid_t pid, jw_target_kind_t kind, int32_t max_mb, int over_mem) {
+static void ensure_memlimits(pid_t pid, jw_target_kind_t kind, int32_t max_mb, int over_mem, int is_foreground) {
     memorystatus_memlimit_properties_t mm;
     memset(&mm, 0, sizeof(mm));
     if (memorystatus_control(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES,
@@ -245,44 +249,52 @@ static void ensure_inactive_memlimit(pid_t pid, jw_target_kind_t kind, int32_t m
         return;
     }
 
-    uint32_t clean_active_attr = mm.memlimit_active_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL;
-    uint32_t clean_inactive_attr = mm.memlimit_inactive_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL;
+    uint32_t active_fatal = mm.memlimit_active_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL;
+    uint32_t inactive_fatal = mm.memlimit_inactive_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL;
 
-    if (over_mem) {
-        /* Over-budget WebContent: set non-fatal inactive HWM to max_mb so kernel reclaims it first under pressure */
-        int32_t cap_mb = max_mb;
-        if (mm.memlimit_inactive == cap_mb && clean_inactive_attr == 0) {
-            return;
-        }
-        mm.memlimit_inactive = cap_mb;
-        mm.memlimit_inactive_attr = 0;
-        if (mm.memlimit_active > 0 && mm.memlimit_active < cap_mb) {
-            mm.memlimit_active = cap_mb;
-        }
-        mm.memlimit_active_attr = clean_active_attr;
-        (void)memorystatus_control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES,
-                                   (int32_t)pid, 0, &mm, sizeof(mm));
+    int32_t target_active;
+    if (kind == JW_TARGET_WEBCONTENT) {
+        target_active = max_mb + 320;
+        if (target_active < 800) target_active = 800;
+        if (target_active > 1400) target_active = 1400;
+    } else {
+        target_active = (max_mb + 256 > 768) ? (max_mb + 256) : 768;
+    }
+
+    int32_t target_inactive;
+    if (!is_foreground && over_mem) {
+        target_inactive = max_mb;
+    } else if (kind == JW_TARGET_WEBCONTENT) {
+        target_inactive = max_mb + 160;
+    } else {
+        target_inactive = (max_mb > 512) ? max_mb : 512;
+    }
+
+    int need_active_raise = (mm.memlimit_active > 0 && mm.memlimit_active < target_active);
+    int need_inactive_change;
+    if (!is_foreground && over_mem) {
+        need_inactive_change = (mm.memlimit_inactive != target_inactive);
+    } else {
+        need_inactive_change = (mm.memlimit_inactive > 0 && mm.memlimit_inactive < target_inactive);
+    }
+
+    if (!active_fatal && !inactive_fatal && !need_active_raise && !need_inactive_change) {
         return;
     }
 
-    int32_t desired_inactive = (kind == JW_TARGET_WEBCONTENT)
-        ? (max_mb + 64)
-        : ((max_mb > 512) ? max_mb : 512);
-
-    int need_raise = (mm.memlimit_inactive > 0 && mm.memlimit_inactive < desired_inactive);
-    int need_clear_fatal = (clean_inactive_attr != 0 && mm.memlimit_inactive > 0 && mm.memlimit_inactive < 1024);
-    if (!need_raise && !need_clear_fatal) {
-        return;
+    if (need_active_raise) {
+        mm.memlimit_active = target_active;
     }
-
-    if (need_raise) {
-        mm.memlimit_inactive = desired_inactive;
+    if (need_inactive_change) {
+        mm.memlimit_inactive = target_inactive;
     }
-    mm.memlimit_inactive_attr = 0; /* non-fatal soft high-water-mark */
-    if (mm.memlimit_active > 0 && mm.memlimit_active < mm.memlimit_inactive) {
+    if (mm.memlimit_active > 0 && mm.memlimit_inactive > 0 && mm.memlimit_active < mm.memlimit_inactive) {
         mm.memlimit_active = mm.memlimit_inactive;
     }
-    mm.memlimit_active_attr = clean_active_attr;
+
+    /* Non-fatal soft high-water-marks on both active & inactive ledgers */
+    mm.memlimit_active_attr = 0;
+    mm.memlimit_inactive_attr = 0;
 
     (void)memorystatus_control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES,
                                (int32_t)pid, 0, &mm, sizeof(mm));
@@ -478,13 +490,14 @@ static void apply_protection_batch(int default_band, int max_mb, int pid_argc, c
         }
         uint64_t fp = read_phys_footprint_mb(pid);
         int over_mem = (kind == JW_TARGET_WEBCONTENT && fp > (uint64_t)max_mb) ? 1 : 0;
+        int is_fg = (cur >= JW_BAND_FOREGROUND) ? 1 : 0;
 
-        /* Pre-align inactive memory limit even while in foreground (>=100) so FG->BG transition is safe */
-        ensure_inactive_memlimit(pid, kind, max_mb, over_mem);
+        /* Align both active (spike buffer, non-fatal) and inactive memory limits */
+        ensure_memlimits(pid, kind, max_mb, over_mem, is_fg);
 
-        /* Never demote foreground processes (>=100); pre-arm elevated inactive floor unless over_mem */
-        if (cur >= JW_BAND_FOREGROUND) {
-            set_elevated_inactive_floor(pid, over_mem ? 0 : 1);
+        /* Never demote foreground processes (>=100); pre-arm elevated inactive floor */
+        if (is_fg) {
+            set_elevated_inactive_floor(pid, 1);
             if (!quiet) printf("FG pid=%d cur=%d fp=%llu\n", pid_i, (int)cur, (unsigned long long)fp);
             if (summary_out) {
                 snprintf(item, sizeof(item), "%d:FG(%d,%lluM)", pid_i, (int)cur, (unsigned long long)fp);

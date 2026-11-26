@@ -201,6 +201,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private var knownIsolatedStoreIds: Set<String> = []
     private var errorOverlays: [String: ErrorOverlayView] = [:]
     private var progressObservations: [String: NSKeyValueObservation] = [:]
+    private var urlObservations: [String: NSKeyValueObservation] = [:]
+    private var lastKnownURLBySiteId: [String: String] = [:]
 
     private var terminatedSiteIds: Set<String> = [] {
         didSet { runtime.terminatedSiteIds = terminatedSiteIds }
@@ -727,6 +729,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             self.progressView.isHidden = (p >= 1.0 || p <= 0.01)
             self.progressView.setProgress(p, animated: true)
         }
+        urlObservations[capturedId] = wv.observe(\.url, options: [.new]) { [weak self] webView, _ in
+            guard let self = self,
+                  let curURL = webView.url,
+                  let scheme = curURL.scheme?.lowercased(),
+                  (scheme == "http" || scheme == "https") else { return }
+            self.lastKnownURLBySiteId[capturedId] = curURL.absoluteString
+        }
 
         webContainerView.insertSubview(wv, belowSubview: emptyStateView)
         NSLayoutConstraint.activate([
@@ -759,8 +768,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let effBand = config.effectiveSiteBand(for: site)
         JWLog("WEBKIT", "Create WebView site=\(site.title) store=\(shortStore) band=\(effBand) appearance=\(site.appearanceMode)")
 
-        if let url = URL(string: site.urlString) {
+        let initialURLStr = lastKnownURLBySiteId[site.id] ?? site.urlString
+        if let url = URL(string: initialURLStr) {
             wv.load(URLRequest(url: url))
+        } else if let homeURL = URL(string: site.urlString) {
+            wv.load(URLRequest(url: homeURL))
         }
         return wv
     }
@@ -770,6 +782,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         old.stopLoading()
         old.configuration.userContentController.removeScriptMessageHandler(forName: "jwDiag")
         progressObservations.removeValue(forKey: siteId)?.invalidate()
+        urlObservations.removeValue(forKey: siteId)?.invalidate()
         old.navigationDelegate = nil
         old.uiDelegate = nil
         old.removeFromSuperview()
@@ -792,6 +805,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     }
 
     private func syncWebViewsWithConfig(preferredSelectId: String?) {
+        let allConfiguredIds = Set(config.sites.map { $0.id })
+        for savedSid in Array(lastKnownURLBySiteId.keys) where !allConfiguredIds.contains(savedSid) {
+            lastKnownURLBySiteId.removeValue(forKey: savedSid)
+        }
+
         var referencedIsoStores = Set<String>()
         for s in config.sites {
             let dsId = JWDataStoreHelper.normalize(s.dataStoreId)
@@ -808,6 +826,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         for s in awake {
             let desiredStoreId = JWDataStoreHelper.normalize(s.dataStoreId)
             if let currentStoreId = webViewStoreIds[s.id], currentStoreId != desiredStoreId {
+                lastKnownURLBySiteId.removeValue(forKey: s.id)
                 teardownWebView(forSiteId: s.id)
             }
             if webViews[s.id] == nil {
@@ -881,6 +900,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func reloadSiteFromHomeOrCurrent(siteId: String, forceHome: Bool) {
         guard !siteId.isEmpty else { return }
+        if forceHome {
+            lastKnownURLBySiteId.removeValue(forKey: siteId)
+        }
         if let cur = site(forId: siteId), cur.hibernated {
             setSiteHibernated(siteId: siteId, hibernated: false)
             return
@@ -889,14 +911,34 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let failedURL = errorOverlays[siteId]?.failedURLString ?? ""
         hideErrorOverlay(forSiteId: siteId)
 
-        if !forceHome,
-           let curURL = wv.url,
-           !curURL.absoluteString.isEmpty,
-           curURL.absoluteString != "about:blank" {
-            wv.reload()
-        } else if !forceHome, !failedURL.isEmpty, let fu = URL(string: failedURL) {
-            wv.load(URLRequest(url: fu))
-        } else if let homeStr = site(forId: siteId)?.urlString, let homeURL = URL(string: homeStr) {
+        if !forceHome {
+            let livePID = JWBridgeWebViewContentPID(wv)
+            let remembered = lastKnownURLBySiteId[siteId] ?? ""
+            let curStr = wv.url?.absoluteString ?? ""
+
+            /*
+             * When recovering from a terminated WebContent process (livePID <= 0) or when
+             * SPA history.pushState changed the URL beyond the last full document load,
+             * explicitly load `remembered` so SPA routes (e.g. /u/0/remote/<convId>) aren't
+             * reset back to the root entry page by `wv.reload()`.
+             */
+            if !remembered.isEmpty,
+               (livePID <= 0 || curStr.isEmpty || curStr == "about:blank" || curStr != remembered),
+               let remURL = URL(string: remembered) {
+                wv.load(URLRequest(url: remURL))
+                return
+            }
+            if !curStr.isEmpty && curStr != "about:blank" {
+                wv.reload()
+                return
+            }
+            if !failedURL.isEmpty, let fu = URL(string: failedURL) {
+                wv.load(URLRequest(url: fu))
+                return
+            }
+        }
+
+        if let homeStr = site(forId: siteId)?.urlString, let homeURL = URL(string: homeStr) {
             wv.load(URLRequest(url: homeURL))
         }
     }
@@ -1559,6 +1601,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func clearDataForSite(siteId: String) {
         guard let targetSite = site(forId: siteId) else { return }
+        lastKnownURLBySiteId.removeValue(forKey: siteId)
         let shouldReload = !targetSite.hibernated
         let dsId = JWDataStoreHelper.normalize(targetSite.dataStoreId)
         clearBasicAuth(forStoreId: dsId)
@@ -1611,6 +1654,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func clearAllWebsiteData() {
         sessionBasicAuth.removeAll()
+        lastKnownURLBySiteId.removeAll()
         let types = WKWebsiteDataStore.allWebsiteDataTypes()
         let since = Date(timeIntervalSince1970: 0)
         var stores: [WKWebsiteDataStore] = [.default()]
@@ -2187,6 +2231,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         if let sid = siteId(for: webView) {
             hideErrorOverlay(forSiteId: sid)
         }
+        refreshRuntimeWebPIDMap()
+        scheduleApplyProtectionAsync(completion: nil)
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
