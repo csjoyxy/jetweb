@@ -783,6 +783,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         cfg.defaultWebpagePreferences.allowsContentJavaScript = true
         cfg.userContentController.addUserScript(WebScripts.compatPolyfillScript())
         cfg.userContentController.addUserScript(WebScripts.inputContrastFixScript())
+        cfg.userContentController.addUserScript(WebScripts.scrollAnchorStabilizerScript())
         cfg.userContentController.addUserScript(WebScripts.diagnosticJSErrorScript())
         cfg.userContentController.addUserScript(WebScripts.conversationMonitorScript())
         cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwDiag")
@@ -794,10 +795,6 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         wv.uiDelegate = self
         wv.allowsBackForwardNavigationGestures = true
         wv.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1"
-
-        let rc = UIRefreshControl()
-        rc.addTarget(self, action: #selector(handlePullToRefresh(_:)), for: .valueChanged)
-        wv.scrollView.refreshControl = rc
 
         let capturedId = site.id
         progressObservations[capturedId] = wv.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
@@ -1671,16 +1668,6 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     @objc private func reloadCurrentSite() {
         reloadSiteFromHomeOrCurrent(siteId: config.selectedSiteId, forceHome: false)
-    }
-
-    @objc private func handlePullToRefresh(_ rc: UIRefreshControl) {
-        for (sid, wv) in webViews where wv.scrollView.refreshControl === rc {
-            reloadSiteFromHomeOrCurrent(siteId: sid, forceHome: false)
-            break
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            rc.endRefreshing()
-        }
     }
 
     @objc private func openManageSheet() {

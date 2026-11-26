@@ -764,4 +764,704 @@ enum WebScripts {
             in: .page
         )
     }
+
+    /// iOS 15–26 WebKit lacks CSS Scroll Anchoring (`overflow-anchor: auto`), causing jarring viewport
+    /// jumps when chat WebApps prepend older history (`Loading older messages...`), unmount spinners,
+    /// or resize dynamic blocks above the current reading line (and when iOS rubber-band/momentum
+    /// clobbers one-shot `scrollTop` adjustments). This isolated-world stabilizer anchors the visible
+    /// reading paragraph across DOM prepends and async height updates without interfering with native
+    /// 60fps scrolling, bottom streaming auto-follow, or explicit navigation clicks.
+    static func scrollAnchorStabilizerScript() -> WKUserScript {
+        let js = #"""
+        (function(){
+        'use strict';
+        if(window.__jwScrollAnchorInstalled)return;
+        window.__jwScrollAnchorInstalled=true;
+
+        try{
+          if(window.CSS&&typeof CSS.supports==='function'&&CSS.supports('overflow-anchor','auto')){
+            return;
+          }
+        }catch(_){}
+
+        var INLINE_TAGS={
+          SPAN:1,A:1,CODE:1,STRONG:1,B:1,EM:1,I:1,SMALL:1,SUB:1,SUP:1,
+          MARK:1,ABBR:1,TIME:1,SVG:1,PATH:1,G:1,CIRCLE:1,RECT:1,IMG:1,
+          BUTTON:1,INPUT:1,TEXTAREA:1,LABEL:1
+        };
+
+        var activeScroller=null;
+        var anchorEl=null;
+        var anchorContentY=0;
+        var anchorTextKey='';
+        var lastKnownScrollTop=0;
+        var lastKnownScrollHeight=0;
+        var lastKnownClientHeight=0;
+        var lastSnapshotAt=0;
+        var scrollIdleTimer=null;
+
+        var isApplyingScroll=false;
+        var isTouching=false;
+        var lastTouchY=0;
+        var suppressUntil=0;
+        var bootUntil=Date.now()+1800;
+        var lastHref=location.href;
+
+        var prependGuardStartedAt=0;
+        var prependGuardUntil=0;
+        var lockedRelTop=0;
+        var guardRafId=0;
+        var postMutateRafId=0;
+
+        var resizeObs=null;
+        var observedResizeNodes=new WeakSet();
+
+        function normText(s){
+          return String(s||'').replace(/\s+/g,' ').trim();
+        }
+
+        function isRootScroller(sc){
+          return !sc||sc===document.scrollingElement||sc===document.documentElement||sc===document.body;
+        }
+
+        function getViewportRect(sc){
+          if(isRootScroller(sc)){
+            return{
+              top:0,
+              left:0,
+              width:window.innerWidth||(document.documentElement?document.documentElement.clientWidth:375)||375,
+              height:window.innerHeight||(document.documentElement?document.documentElement.clientHeight:667)||667
+            };
+          }
+          return sc.getBoundingClientRect();
+        }
+
+        function getScrollTop(sc){
+          if(isRootScroller(sc)){
+            return window.pageYOffset||(document.documentElement?document.documentElement.scrollTop:0)||(document.body?document.body.scrollTop:0)||0;
+          }
+          return sc.scrollTop;
+        }
+
+        function getClientHeight(sc,vp){
+          if(isRootScroller(sc))return vp.height;
+          return sc.clientHeight||vp.height;
+        }
+
+        function isVerticallyScrollable(el){
+          if(!el||el.nodeType!==1)return false;
+          if(el===document.documentElement||el===document.body){
+            var se=document.scrollingElement||document.documentElement;
+            return !!(se&&se.scrollHeight>window.innerHeight+16);
+          }
+          if(el.clientHeight<80||el.scrollHeight<=el.clientHeight+12)return false;
+          var cs=getComputedStyle(el);
+          if(!cs)return false;
+          var oy=cs.overflowY;
+          return oy==='auto'||oy==='scroll'||oy==='overlay';
+        }
+
+        function findScrollableAncestor(start){
+          var cur=start,depth=0;
+          while(cur&&depth<28){
+            if(cur.nodeType===1&&isVerticallyScrollable(cur)){
+              if(cur===document.body||cur===document.documentElement){
+                return document.scrollingElement||document.documentElement;
+              }
+              return cur;
+            }
+            var next=cur.parentElement;
+            if(!next&&cur.getRootNode){
+              var rn=cur.getRootNode();
+              if(rn&&rn.host)next=rn.host;
+            }
+            cur=next;
+            depth++;
+          }
+          var se=document.scrollingElement||document.documentElement;
+          if(se&&se.scrollHeight>(window.innerHeight+16))return se;
+          return null;
+        }
+
+        function ensureScrollerOverscrollContained(sc){
+          if(!sc||isRootScroller(sc)||!sc.style)return;
+          try{
+            if(!sc.style.overscrollBehaviorY){
+              sc.style.overscrollBehaviorY='contain';
+            }
+          }catch(_){}
+        }
+
+        function observeScrollerResizes(sc){
+          if(!sc||typeof ResizeObserver!=='function')return;
+          if(!resizeObs){
+            resizeObs=new ResizeObserver(function(){
+              if(!activeScroller||isApplyingScroll)return;
+              stabilizeIfNeeded('resize');
+            });
+          }
+          try{
+            if(!isRootScroller(sc)&&!observedResizeNodes.has(sc)){
+              observedResizeNodes.add(sc);
+              resizeObs.observe(sc);
+            }
+            var kids=sc.children;
+            if(kids){
+              var n=Math.min(kids.length,4);
+              for(var i=0;i<n;i++){
+                var c=kids[i];
+                if(c&&c.nodeType===1&&!observedResizeNodes.has(c)){
+                  observedResizeNodes.add(c);
+                  resizeObs.observe(c);
+                }
+              }
+            }
+          }catch(_){}
+        }
+
+        function isSpinnerOrFloatingOverlay(el,sc,vp){
+          var cur=el,d=0;
+          while(cur&&cur!==sc&&cur.nodeType===1&&d<14){
+            var role=(cur.getAttribute('role')||'').toLowerCase();
+            if(role==='progressbar'||role==='status'||cur.getAttribute('aria-busy')==='true')return true;
+            var cs=getComputedStyle(cur);
+            if(cs){
+              if(cs.position==='fixed'||cs.position==='sticky')return true;
+              if(cs.position==='absolute'){
+                var ar=cur.getBoundingClientRect();
+                if(ar.width<vp.width*0.62)return true;
+              }
+            }
+            cur=cur.parentElement;
+            d++;
+          }
+          var txt=normText(el.textContent||'');
+          if(txt.length<4)return true;
+          if(/^(loading|正在加载|加载中|fetching|please wait)\b/i.test(txt)&&txt.length<64)return true;
+          return false;
+        }
+
+        function resolveBlockAnchorFromHit(hit,sc,vp){
+          if(!hit||hit===sc||!sc.contains(hit))return null;
+          var cur=hit,d=0;
+          while(cur&&cur!==sc&&cur.nodeType===1&&INLINE_TAGS[cur.tagName]&&d<10){
+            cur=cur.parentElement;
+            d++;
+          }
+          if(!cur||cur===sc||cur.nodeType!==1)return null;
+
+          /* If hit landed on a tall multi-message wrapper gap, drill down to the visible child block */
+          var downDepth=0;
+          while(cur&&cur.children&&cur.children.length>=2&&downDepth<10){
+            var cr0=cur.getBoundingClientRect();
+            if(cr0.height<=vp.height*0.72)break;
+            var bestChild=null;
+            var lim=Math.min(cur.children.length,80);
+            for(var i=0;i<lim;i++){
+              var ch=cur.children[i];
+              var chr=ch.getBoundingClientRect();
+              if(chr.height>=14&&chr.bottom>(vp.top+44)&&chr.top<(vp.top+vp.height*0.65)){
+                if(!isSpinnerOrFloatingOverlay(ch,sc,vp)){
+                  bestChild=ch;
+                  break;
+                }
+              }
+            }
+            if(bestChild)cur=bestChild;
+            else break;
+            downDepth++;
+          }
+
+          /* Climb if block is still too tiny (< 14px) */
+          var upDepth=0;
+          while(cur&&cur!==sc&&cur.nodeType===1&&upDepth<6){
+            var r=cur.getBoundingClientRect();
+            if(r.height>=14&&r.width>=48)break;
+            cur=cur.parentElement;
+            upDepth++;
+          }
+          if(!cur||cur===sc||cur.nodeType!==1)return null;
+
+          var rect=cur.getBoundingClientRect();
+          if(rect.height<14||rect.width<48)return null;
+          /* Reject giant list wrapper containing >= 6 children so we never anchor to the whole scroll list */
+          if(rect.height>vp.height*1.55&&cur.children&&cur.children.length>=6&&cur.tagName!=='PRE'&&cur.tagName!=='P'){
+            return null;
+          }
+          if(isSpinnerOrFloatingOverlay(cur,sc,vp))return null;
+
+          var txt=normText(cur.textContent||'');
+          if(txt.length<4)return null;
+          return{
+            el:cur,
+            relTop:rect.top-vp.top,
+            textKey:txt.slice(0,48)
+          };
+        }
+
+        function pickAnchor(sc,vp){
+          var xs=[
+            vp.left+Math.round(vp.width*0.36),
+            vp.left+Math.round(vp.width*0.52)
+          ];
+          var ys=[
+            vp.top+Math.min(104,Math.round(vp.height*0.20)),
+            vp.top+Math.min(164,Math.round(vp.height*0.31)),
+            vp.top+Math.min(228,Math.round(vp.height*0.44))
+          ];
+          for(var yi=0;yi<ys.length;yi++){
+            var py=ys[yi];
+            if(py<=2||py>=window.innerHeight-4)continue;
+            for(var xi=0;xi<xs.length;xi++){
+              var px=xs[xi];
+              var hit=null;
+              try{hit=document.elementFromPoint(px,py);}catch(_){}
+              if(!hit)continue;
+              var cand=resolveBlockAnchorFromHit(hit,sc,vp);
+              if(cand)return cand;
+            }
+          }
+          return null;
+        }
+
+        function reacquireAnchorByText(sc,textKey){
+          if(!sc||!textKey||textKey.length<6)return null;
+          try{
+            var nodes=sc.querySelectorAll('p,li,pre,h1,h2,h3,h4,blockquote,div');
+            var lim=Math.min(nodes.length,450);
+            var best=null;
+            var bestH=1e9;
+            for(var i=0;i<lim;i++){
+              var el=nodes[i];
+              if(el.children&&el.children.length>8)continue;
+              var t=normText(el.textContent||'');
+              if(t.length>=textKey.length&&t.slice(0,textKey.length)===textKey){
+                var r=el.getBoundingClientRect();
+                if(r.height>=12&&r.height<bestH){
+                  best=el;
+                  bestH=r.height;
+                }
+              }
+            }
+            return best;
+          }catch(_){
+            return null;
+          }
+        }
+
+        function refreshAnchorSnapshot(sc,forceRepick){
+          if(!sc||!sc.isConnected)return;
+          var vp=getViewportRect(sc);
+          if(vp.height<80||vp.width<80)return;
+          var st=getScrollTop(sc);
+          var sh=sc.scrollHeight;
+          var ch=getClientHeight(sc,vp);
+
+          lastKnownScrollTop=st;
+          lastKnownScrollHeight=sh;
+          lastKnownClientHeight=ch;
+          lastSnapshotAt=Date.now();
+
+          if(!forceRepick&&anchorEl&&anchorEl.isConnected){
+            var r=anchorEl.getBoundingClientRect();
+            var rel=r.top-vp.top;
+            if(r.height>=14&&rel>=28&&rel<=vp.height*0.54){
+              anchorContentY=rel+st;
+              return;
+            }
+          }
+
+          var picked=pickAnchor(sc,vp);
+          if(picked){
+            anchorEl=picked.el;
+            anchorContentY=picked.relTop+st;
+            anchorTextKey=picked.textKey;
+          }else{
+            anchorEl=null;
+            anchorTextKey='';
+          }
+        }
+
+        function applyScrollDeltaInstant(sc,delta){
+          if(!sc||Math.abs(delta)<1)return;
+          isApplyingScroll=true;
+          var targetNode=isRootScroller(sc)?(document.scrollingElement||document.documentElement):sc;
+          var prevBehavior=(targetNode&&targetNode.style)?targetNode.style.scrollBehavior:'';
+          try{
+            if(targetNode&&targetNode.style){
+              targetNode.style.setProperty('scroll-behavior','auto','important');
+            }
+            var curTop=getScrollTop(sc);
+            var nextTop=Math.max(0,curTop+delta);
+            if(isRootScroller(sc)){
+              window.scrollTo(0,nextTop);
+            }else{
+              sc.scrollTop=nextTop;
+            }
+          }catch(_){}
+          finally{
+            if(targetNode&&targetNode.style){
+              if(prevBehavior)targetNode.style.scrollBehavior=prevBehavior;
+              else targetNode.style.removeProperty('scroll-behavior');
+            }
+            isApplyingScroll=false;
+          }
+        }
+
+        function armPrependGuard(sc,relTopNow){
+          prependGuardStartedAt=Date.now();
+          prependGuardUntil=prependGuardStartedAt+420;
+          lockedRelTop=relTopNow;
+          if(guardRafId)cancelAnimationFrame(guardRafId);
+          var tick=function(){
+            guardRafId=0;
+            if(!activeScroller||activeScroller!==sc||!sc.isConnected)return;
+            if(Date.now()>=prependGuardUntil||Date.now()<suppressUntil)return;
+            if(anchorEl&&anchorEl.isConnected){
+              var vp=getViewportRect(sc);
+              var curRel=anchorEl.getBoundingClientRect().top-vp.top;
+              var curSt=getScrollTop(sc);
+              var curContentY=curRel+curSt;
+              var dContentY=curContentY-anchorContentY;
+              if(Math.abs(dContentY)>=2){
+                var fix=curRel-lockedRelTop;
+                if(Math.abs(fix)>=1.5){
+                  applyScrollDeltaInstant(sc,fix);
+                }
+                var fixedRel=anchorEl.getBoundingClientRect().top-vp.top;
+                lastKnownScrollTop=getScrollTop(sc);
+                lastKnownScrollHeight=sc.scrollHeight;
+                anchorContentY=fixedRel+lastKnownScrollTop;
+              }else{
+                var elapsed=Date.now()-prependGuardStartedAt;
+                var clobberLimit=(!isTouching&&elapsed<95)?48:140;
+                var jump=curRel-lockedRelTop;
+                if(Math.abs(jump)>=clobberLimit){
+                  applyScrollDeltaInstant(sc,jump);
+                  var restoredRel=anchorEl.getBoundingClientRect().top-vp.top;
+                  lastKnownScrollTop=getScrollTop(sc);
+                  anchorContentY=restoredRel+lastKnownScrollTop;
+                }else{
+                  lockedRelTop=curRel;
+                  lastKnownScrollTop=curSt;
+                  anchorContentY=curRel+curSt;
+                }
+              }
+            }
+            guardRafId=requestAnimationFrame(tick);
+          };
+          guardRafId=requestAnimationFrame(tick);
+        }
+
+        function stabilizeIfNeeded(reason){
+          var sc=activeScroller;
+          if(!sc||!sc.isConnected||isApplyingScroll)return;
+          if(location.href!==lastHref){
+            lastHref=location.href;
+            anchorEl=null;
+            prependGuardUntil=0;
+            bootUntil=Date.now()+1600;
+            return;
+          }
+          var now=Date.now();
+          if(now<bootUntil||now<suppressUntil){
+            refreshAnchorSnapshot(sc,false);
+            return;
+          }
+
+          var vp=getViewportRect(sc);
+          var ch=getClientHeight(sc,vp);
+          if(ch<80)return;
+
+          /* Keyboard / viewport resize (> 44px): refresh anchor without fighting iOS keyboard scroll */
+          if(lastKnownClientHeight>0&&Math.abs(ch-lastKnownClientHeight)>44){
+            observeScrollerResizes(sc);
+            refreshAnchorSnapshot(sc,false);
+            return;
+          }
+
+          /* Page wasn't scrollable yet before this mutation (initial hydration) */
+          if(lastKnownScrollHeight<=ch+20){
+            observeScrollerResizes(sc);
+            refreshAnchorSnapshot(sc,true);
+            return;
+          }
+
+          /* Do not hold back bottom auto-follow when user was pinned at the bottom of a long chat */
+          var prevMaxScroll=lastKnownScrollHeight-lastKnownClientHeight;
+          if(prevMaxScroll>60&&lastKnownScrollTop>160&&(prevMaxScroll-lastKnownScrollTop)<110){
+            refreshAnchorSnapshot(sc,false);
+            return;
+          }
+
+          var expectedRelTop=(now<prependGuardUntil)?lockedRelTop:(anchorContentY-lastKnownScrollTop);
+          /* Ensure anchor was actually near the user's viewport right before mutation */
+          if(expectedRelTop<-ch*0.5||expectedRelTop>ch*1.15){
+            refreshAnchorSnapshot(sc,true);
+            return;
+          }
+
+          if(!anchorEl||!anchorEl.isConnected){
+            var reacquired=reacquireAnchorByText(sc,anchorTextKey);
+            if(reacquired){
+              anchorEl=reacquired;
+            }else{
+              var dH=sc.scrollHeight-lastKnownScrollHeight;
+              if(dH>80&&lastKnownScrollTop<420&&anchorTextKey.length>=6){
+                var savedTargetRel=expectedRelTop;
+                var savedKey=anchorTextKey;
+                applyScrollDeltaInstant(sc,dH);
+                lastKnownScrollTop=getScrollTop(sc);
+                lastKnownScrollHeight=sc.scrollHeight;
+                requestAnimationFrame(function(){
+                  if(!sc.isConnected)return;
+                  var vp2=getViewportRect(sc);
+                  var found2=reacquireAnchorByText(sc,savedKey);
+                  if(found2){
+                    anchorEl=found2;
+                    var r2=found2.getBoundingClientRect();
+                    var curRel2=r2.top-vp2.top;
+                    var fix2=curRel2-savedTargetRel;
+                    if(Math.abs(fix2)>=2){
+                      applyScrollDeltaInstant(sc,fix2);
+                    }
+                    var finalRel=found2.getBoundingClientRect().top-vp2.top;
+                    lastKnownScrollTop=getScrollTop(sc);
+                    lastKnownScrollHeight=sc.scrollHeight;
+                    anchorContentY=finalRel+lastKnownScrollTop;
+                    armPrependGuard(sc,finalRel);
+                  }else{
+                    refreshAnchorSnapshot(sc,true);
+                  }
+                });
+                return;
+              }
+              refreshAnchorSnapshot(sc,true);
+              return;
+            }
+          }
+
+          var rNow=anchorEl.getBoundingClientRect();
+          if(rNow.height<4){
+            refreshAnchorSnapshot(sc,true);
+            return;
+          }
+          var curRelTop=rNow.top-vp.top;
+          var curSt=getScrollTop(sc);
+          var curContentY=curRelTop+curSt;
+          var dContentY=curContentY-anchorContentY;
+
+          if(Math.abs(dContentY)<2){
+            lastKnownScrollHeight=sc.scrollHeight;
+            return;
+          }
+
+          var visualDelta=curRelTop-expectedRelTop;
+          if(Math.abs(visualDelta)>=1.5){
+            applyScrollDeltaInstant(sc,visualDelta);
+          }
+
+          var afterRect=anchorEl.getBoundingClientRect();
+          var afterRelTop=afterRect.top-vp.top;
+          lastKnownScrollTop=getScrollTop(sc);
+          lastKnownScrollHeight=sc.scrollHeight;
+          lastKnownClientHeight=ch;
+          anchorContentY=afterRelTop+lastKnownScrollTop;
+
+          if(Math.abs(dContentY)>=40){
+            observeScrollerResizes(sc);
+            armPrependGuard(sc,expectedRelTop);
+          }
+        }
+
+        /* Passive touch & scroll tracking */
+        var touchStartY=0;
+        document.addEventListener('touchstart',function(ev){
+          if(!ev.touches||ev.touches.length!==1)return;
+          isTouching=true;
+          touchStartY=ev.touches[0].clientY;
+          lastTouchY=touchStartY;
+          var sc=findScrollableAncestor(ev.target);
+          if(sc){
+            ensureScrollerOverscrollContained(sc);
+            observeScrollerResizes(sc);
+            if(sc!==activeScroller){
+              activeScroller=sc;
+              prependGuardUntil=0;
+              refreshAnchorSnapshot(sc,true);
+            }else if(!anchorEl||!anchorEl.isConnected){
+              refreshAnchorSnapshot(sc,true);
+            }
+          }
+        },{capture:true,passive:true});
+
+        document.addEventListener('touchmove',function(ev){
+          if(!isTouching||!ev.touches||ev.touches.length!==1)return;
+          var y=ev.touches[0].clientY;
+          var dy=y-lastTouchY;
+          lastTouchY=y;
+          if(Math.abs(y-touchStartY)>10&&(bootUntil>0||suppressUntil>0)){
+            bootUntil=0;
+            suppressUntil=0;
+            if(activeScroller&&(!anchorEl||!anchorEl.isConnected)){
+              refreshAnchorSnapshot(activeScroller,true);
+            }
+          }
+          if(Date.now()<prependGuardUntil){
+            lockedRelTop+=dy;
+          }
+        },{capture:true,passive:true});
+
+        function onTouchEnd(){
+          isTouching=false;
+          if(activeScroller&&Date.now()>=prependGuardUntil){
+            refreshAnchorSnapshot(activeScroller,false);
+          }
+        }
+        document.addEventListener('touchend',onTouchEnd,{capture:true,passive:true});
+        document.addEventListener('touchcancel',onTouchEnd,{capture:true,passive:true});
+
+        /* Suppress anchoring on intentional navigation / scroll-to-bottom / disclosure clicks */
+        document.addEventListener('click',function(ev){
+          var cur=ev&&ev.target,d=0;
+          while(cur&&cur.nodeType===1&&d<7){
+            var tag=cur.tagName;
+            var role=(cur.getAttribute('role')||'').toLowerCase();
+            if(tag==='BUTTON'||tag==='A'||tag==='SUMMARY'||role==='button'||role==='tab'||role==='menuitem'||role==='option'){
+              var label=normText((cur.getAttribute('aria-label')||'')+' '+(cur.getAttribute('title')||'')+' '+(cur.textContent||''));
+              if(/load\s*(older|more|previous|earlier)|加载(更多|更早|历史)|历史消息|查看更多/i.test(label)){
+                if(activeScroller)refreshAnchorSnapshot(activeScroller,false);
+              }else{
+                suppressUntil=Date.now()+650;
+                prependGuardUntil=0;
+                anchorEl=null;
+              }
+              break;
+            }
+            cur=cur.parentElement;
+            d++;
+          }
+        },true);
+
+        document.addEventListener('keydown',function(ev){
+          if(ev&&ev.key==='Enter'&&!ev.shiftKey&&!ev.isComposing){
+            var t=ev.target;
+            if(t&&(t.tagName==='TEXTAREA'||t.tagName==='INPUT'||t.isContentEditable)){
+              suppressUntil=Date.now()+900;
+              prependGuardUntil=0;
+              anchorEl=null;
+            }
+          }
+        },true);
+
+        document.addEventListener('scroll',function(ev){
+          if(isApplyingScroll)return;
+          var target=ev.target;
+          var sc=null;
+          if(target===document||target===document.documentElement||target===document.body){
+            sc=document.scrollingElement||document.documentElement;
+          }else if(target&&target.nodeType===1){
+            if(target.clientHeight<80||target.scrollHeight<=target.clientHeight+12)return;
+            sc=target;
+          }
+          if(!sc)return;
+
+          if(sc!==activeScroller){
+            activeScroller=sc;
+            prependGuardUntil=0;
+            ensureScrollerOverscrollContained(sc);
+            observeScrollerResizes(sc);
+            refreshAnchorSnapshot(sc,true);
+            return;
+          }
+
+          if(Math.abs(sc.scrollHeight-lastKnownScrollHeight)>=2){
+            stabilizeIfNeeded('scroll-sh');
+            return;
+          }
+
+          var now=Date.now();
+          if(now<prependGuardUntil&&anchorEl&&anchorEl.isConnected){
+            var vp=getViewportRect(sc);
+            var curRel=anchorEl.getBoundingClientRect().top-vp.top;
+            var curSt=getScrollTop(sc);
+            var curContentY=curRel+curSt;
+            if(Math.abs(curContentY-anchorContentY)>=2){
+              stabilizeIfNeeded('scroll-guard-layout');
+              return;
+            }
+            var elapsed=now-prependGuardStartedAt;
+            var clobberLimit=(!isTouching&&elapsed<95)?48:140;
+            var diff=curRel-lockedRelTop;
+            if(Math.abs(diff)>=clobberLimit){
+              applyScrollDeltaInstant(sc,diff);
+              var fixedRel=anchorEl.getBoundingClientRect().top-vp.top;
+              lastKnownScrollTop=getScrollTop(sc);
+              anchorContentY=fixedRel+lastKnownScrollTop;
+              return;
+            }
+            lockedRelTop=curRel;
+            lastKnownScrollTop=curSt;
+            anchorContentY=curRel+curSt;
+            return;
+          }
+
+          lastKnownScrollTop=getScrollTop(sc);
+          if(now-lastSnapshotAt>=90){
+            refreshAnchorSnapshot(sc,false);
+          }
+          if(scrollIdleTimer)clearTimeout(scrollIdleTimer);
+          scrollIdleTimer=setTimeout(function(){
+            scrollIdleTimer=null;
+            if(activeScroller&&Date.now()>=prependGuardUntil){
+              refreshAnchorSnapshot(activeScroller,false);
+            }
+          },130);
+        },{capture:true,passive:true});
+
+        function installMutationHook(){
+          if(!document.documentElement)return;
+          var mo=new MutationObserver(function(mutations){
+            if(!activeScroller||isApplyingScroll)return;
+            if(location.href!==lastHref){
+              stabilizeIfNeeded('href');
+              return;
+            }
+            var relevant=false;
+            var rootSc=isRootScroller(activeScroller);
+            for(var i=0;i<mutations.length;i++){
+              var m=mutations[i];
+              if(!m.target)continue;
+              if(rootSc||m.target===activeScroller||activeScroller.contains(m.target)){
+                relevant=true;
+                break;
+              }
+            }
+            if(!relevant)return;
+            stabilizeIfNeeded('mutation');
+            if(!postMutateRafId){
+              postMutateRafId=requestAnimationFrame(function(){
+                postMutateRafId=0;
+                stabilizeIfNeeded('post-mutation-raf');
+              });
+            }
+          });
+          mo.observe(document.documentElement,{childList:true,subtree:true});
+        }
+
+        if(document.documentElement){
+          installMutationHook();
+        }else{
+          window.addEventListener('DOMContentLoaded',installMutationHook,{once:true});
+        }
+        })();
+        """#
+        return WKUserScript(
+            source: js,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false,
+            in: .defaultClient
+        )
+    }
 }
+
