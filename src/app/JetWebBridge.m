@@ -479,7 +479,7 @@ NSString *JWBridgeResolveDataContainerPath(void) {
             } @catch (__unused NSException *ex) {}
         }
 
-        /* 2. Fallback: scan /var/mobile/Containers/Data/Application/*/.com.apple.mobile_container_manager.metadata.plist */
+        // 2. Fallback: scan /var/mobile/Containers/Data/Application/<UUID>/.com.apple.mobile_container_manager.metadata.plist
         if (resolved.length == 0) {
             NSString *appsRoot = @"/var/mobile/Containers/Data/Application";
             NSArray<NSString *> *uuidDirs = [fm contentsOfDirectoryAtPath:appsRoot error:nil];
@@ -581,7 +581,8 @@ BOOL JWBridgeSyncProcessLockdownState(int overrideMode) {
 
     SEL setSel = NSSelectorFromString(@"_setCaptivePortalModeEnabledGloballyForTesting:");
     SEL clearSel = NSSelectorFromString(@"_clearCaptivePortalModeEnabledGloballyForTesting");
-    Class poolCls = [WKProcessPool class];
+    Class poolCls = NSClassFromString(@"WKProcessPool");
+    if (!poolCls) return NO;
 
     if (overrideMode == 1) {
         if ([poolCls respondsToSelector:setSel]) {
