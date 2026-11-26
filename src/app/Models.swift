@@ -10,6 +10,13 @@ enum JWConstants {
     static let maxSites = 8
     static let defaultBand = 85
     static let defaultMaxMB = 450
+    static let minSiteBand = 30
+    static let maxSiteBand = 92
+
+    static let bandPresetCore = 88
+    static let bandPresetFrequent = 80
+    static let bandPresetSecondary = 70
+    static let bandPresetDisposable = 35
 
     static let appearanceInherit = "inherit"
     static let appearanceSystem = "system"
@@ -112,6 +119,46 @@ enum JWURLHelper {
     }
 }
 
+enum JWPriorityHelper {
+    /// 0 means follow global targetBand; otherwise clamped to [30, 92].
+    static func normalizeCustomBand(_ raw: Int?) -> Int {
+        guard let raw = raw, raw > 0 else { return 0 }
+        return min(JWConstants.maxSiteBand, max(JWConstants.minSiteBand, raw))
+    }
+
+    static func clampSiteBand(_ band: Int) -> Int {
+        return min(JWConstants.maxSiteBand, max(JWConstants.minSiteBand, band))
+    }
+
+    static func tierDescription(customBand: Int, globalBand: Int) -> String {
+        let norm = normalizeCustomBand(customBand)
+        if norm == 0 {
+            let eff = clampSiteBand(globalBand)
+            return "跟随全局 (\(eff)档)"
+        }
+        switch norm {
+        case JWConstants.bandPresetCore:
+            return "核心常驻 (\(norm)档)"
+        case JWConstants.bandPresetFrequent:
+            return "常用保活 (\(norm)档)"
+        case JWConstants.bandPresetSecondary:
+            return "次要备选 (\(norm)档)"
+        case JWConstants.bandPresetDisposable:
+            return "随用随清 (\(norm)档)"
+        default:
+            return "自定义 (\(norm)档)"
+        }
+    }
+
+    static func shortBadge(customBand: Int, globalBand: Int) -> String {
+        let norm = normalizeCustomBand(customBand)
+        if norm == 0 {
+            return "\(clampSiteBand(globalBand))档"
+        }
+        return "\(norm)档·专属"
+    }
+}
+
 struct SiteItem: Identifiable, Equatable {
     var id: String
     var title: String
@@ -119,6 +166,10 @@ struct SiteItem: Identifiable, Equatable {
     var enabled: Bool
     var appearanceMode: String
     var dataStoreId: String
+    /// 0 = 跟随全局默认档位；30...92 = 单站点专属进程档位
+    var customBand: Int
+    /// true = 已手动休眠释放内存（底栏保留标签与登录态，点击即唤醒）
+    var hibernated: Bool
 
     init(
         id: String = UUID().uuidString,
@@ -126,7 +177,9 @@ struct SiteItem: Identifiable, Equatable {
         urlString: String = "",
         enabled: Bool = true,
         appearanceMode: String = JWConstants.appearanceInherit,
-        dataStoreId: String = JWConstants.dataStoreDefault
+        dataStoreId: String = JWConstants.dataStoreDefault,
+        customBand: Int = 0,
+        hibernated: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -134,6 +187,8 @@ struct SiteItem: Identifiable, Equatable {
         self.enabled = enabled
         self.appearanceMode = JWAppearanceHelper.normalizeSite(appearanceMode)
         self.dataStoreId = JWDataStoreHelper.normalize(dataStoreId)
+        self.customBand = JWPriorityHelper.normalizeCustomBand(customBand)
+        self.hibernated = hibernated
     }
 
     var isIsolatedStore: Bool {
@@ -147,13 +202,17 @@ struct SiteItem: Identifiable, Equatable {
         let enabled = (dict["enabled"] as? NSNumber)?.boolValue ?? (dict["enabled"] as? Bool) ?? true
         let appearance = JWAppearanceHelper.normalizeSite(dict["appearanceMode"] as? String)
         let dsId = JWDataStoreHelper.normalize(dict["dataStoreId"] as? String)
+        let rawBand = (dict["customBand"] as? NSNumber)?.intValue ?? (dict["customBand"] as? Int) ?? 0
+        let hibernated = (dict["hibernated"] as? NSNumber)?.boolValue ?? (dict["hibernated"] as? Bool) ?? false
         return SiteItem(
             id: sid,
             title: rawTitle.isEmpty ? url : rawTitle,
             urlString: url,
             enabled: enabled,
             appearanceMode: appearance,
-            dataStoreId: dsId
+            dataStoreId: dsId,
+            customBand: rawBand,
+            hibernated: hibernated
         )
     }
 
@@ -164,7 +223,9 @@ struct SiteItem: Identifiable, Equatable {
             "url": urlString,
             "enabled": enabled,
             "appearanceMode": JWAppearanceHelper.normalizeSite(appearanceMode),
-            "dataStoreId": JWDataStoreHelper.normalize(dataStoreId)
+            "dataStoreId": JWDataStoreHelper.normalize(dataStoreId),
+            "customBand": JWPriorityHelper.normalizeCustomBand(customBand),
+            "hibernated": hibernated
         ]
     }
 }
@@ -225,6 +286,29 @@ final class AppConfig: ObservableObject {
     @Published var appearanceMode: String = JWConstants.appearanceSystem
     @Published var trustedCerts: [String: String] = [:]
     @Published var debugLoggingEnabled: Bool = true
+
+    func effectiveSiteBand(for site: SiteItem) -> Int {
+        let norm = JWPriorityHelper.normalizeCustomBand(site.customBand)
+        if norm > 0 {
+            return norm
+        }
+        return JWPriorityHelper.clampSiteBand(targetBand)
+    }
+
+    /// Computes automatic guardian bands so Networking/GPU (+1, max 94) and Host (+2, max 95)
+    /// always sit above the highest awake site band, preventing parent/socket kills before secondary tabs.
+    func computedGuardianBands() -> (auxBand: Int, hostBand: Int) {
+        let awakeSites = sites.filter { $0.enabled && !$0.hibernated }
+        let maxSite: Int
+        if let m = awakeSites.map({ effectiveSiteBand(for: $0) }).max() {
+            maxSite = m
+        } else {
+            maxSite = JWPriorityHelper.clampSiteBand(targetBand)
+        }
+        let aux = min(94, maxSite + 1)
+        let host = min(95, max(targetBand, maxSite + 2))
+        return (aux, host)
+    }
 
     func effectiveAppearanceMode(for site: SiteItem?) -> String {
         if let site = site {

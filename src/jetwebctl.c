@@ -392,15 +392,62 @@ static void append_summary_item(char *buf, size_t cap, size_t *off_io, const cha
     }
 }
 
-static void apply_protection_batch(int band, int max_mb, int pid_argc, char *pid_argv[],
+#define JW_BAND_MAX_WEBCONTENT 92
+#define JW_BAND_MAX_WEBKIT_AUX 94
+
+static int parse_pid_spec(const char *s, int default_band, pid_t *out_pid, int *out_band) {
+    if (!s || !*s || !out_pid || !out_band) return -1;
+    const char *colon = strchr(s, ':');
+    if (!colon) {
+        int pid_i = 0;
+        if (parse_positive_int(s, &pid_i) != 0) return -1;
+        *out_pid = (pid_t)pid_i;
+        *out_band = default_band;
+        return 0;
+    }
+    size_t pid_len = (size_t)(colon - s);
+    if (pid_len == 0 || pid_len >= 16) return -1;
+    char pid_buf[16];
+    memcpy(pid_buf, s, pid_len);
+    pid_buf[pid_len] = '\0';
+    int pid_i = 0;
+    if (parse_positive_int(pid_buf, &pid_i) != 0) return -1;
+
+    int b = default_band;
+    if (*(colon + 1) != '\0') {
+        if (parse_positive_int(colon + 1, &b) != 0) return -1;
+    }
+    if (b < JW_BAND_BACKGROUND) b = JW_BAND_BACKGROUND;
+    if (b > JW_BAND_MAX_PROTECT) b = JW_BAND_MAX_PROTECT;
+    *out_pid = (pid_t)pid_i;
+    *out_band = b;
+    return 0;
+}
+
+static int clamp_band_for_kind(int band, jw_target_kind_t kind) {
+    if (band < JW_BAND_BACKGROUND) band = JW_BAND_BACKGROUND;
+    if (kind == JW_TARGET_WEBCONTENT && band > JW_BAND_MAX_WEBCONTENT) {
+        return JW_BAND_MAX_WEBCONTENT;
+    }
+    if (kind == JW_TARGET_WEBKIT_AUX && band > JW_BAND_MAX_WEBKIT_AUX) {
+        return JW_BAND_MAX_WEBKIT_AUX;
+    }
+    if (band > JW_BAND_MAX_PROTECT) {
+        return JW_BAND_MAX_PROTECT;
+    }
+    return band;
+}
+
+static void apply_protection_batch(int default_band, int max_mb, int pid_argc, char *pid_argv[],
                                    int quiet, char *summary_out, size_t summary_cap) {
     size_t sum_off = 0;
     if (summary_out && summary_cap > 0) summary_out[0] = '\0';
 
     for (int i = 0; i < pid_argc; i++) {
-        int pid_i = 0;
-        if (parse_positive_int(pid_argv[i], &pid_i) != 0) continue;
-        pid_t pid = (pid_t)pid_i;
+        pid_t pid = 0;
+        int raw_target_band = default_band;
+        if (parse_pid_spec(pid_argv[i], default_band, &pid, &raw_target_band) != 0) continue;
+        int pid_i = (int)pid;
         char item[64];
 
         char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
@@ -417,6 +464,8 @@ static void apply_protection_batch(int band, int max_mb, int pid_argc, char *pid
             if (!quiet) printf("SKIP_PATH pid=%d\n", pid_i);
             continue;
         }
+
+        int target_band = clamp_band_for_kind(raw_target_band, kind);
 
         int32_t cur = -1;
         if (read_priority(pid, &cur) != 0) {
@@ -462,9 +511,9 @@ static void apply_protection_batch(int band, int max_mb, int pid_argc, char *pid
             continue;
         }
 
-        /* Always reinforce assertion priority & floor even if cur == band */
-        if (set_priority_band(pid, band, 1) == 0) {
-            int32_t after = band;
+        /* Always reinforce assertion priority & floor even if cur == target_band */
+        if (set_priority_band(pid, target_band, 1) == 0) {
+            int32_t after = target_band;
             (void)read_priority(pid, &after);
             if (!quiet) {
                 printf("OK pid=%d before=%d after=%d fp=%llu\n",
@@ -532,9 +581,10 @@ int main(int argc, char *argv[]) {
 
     if (argc >= 3 && strcmp(argv[1], "--query") == 0) {
         for (int i = 2; i < argc; i++) {
-            int pid_i = 0;
-            if (parse_positive_int(argv[i], &pid_i) != 0) continue;
-            pid_t pid = (pid_t)pid_i;
+            pid_t pid = 0;
+            int unused_band = 85;
+            if (parse_pid_spec(argv[i], 85, &pid, &unused_band) != 0) continue;
+            int pid_i = (int)pid;
             char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
             if (proc_pidpath((int)pid, path, sizeof(path)) <= 0) {
                 printf("GONE pid=%d\n", pid_i);

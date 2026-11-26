@@ -8,6 +8,7 @@ final class HubRuntimeState: ObservableObject {
     @Published var helperBannerText: String = ""
 
     var onSyncStructure: ((String?) -> Void)?
+    var onSetHibernated: ((String, Bool) -> Void)?
     var onUpdateAppearance: (() -> Void)?
     var onUpdateTrustedCerts: (() -> Void)?
     var onApplyProtectionNow: (() -> Void)?
@@ -16,6 +17,163 @@ final class HubRuntimeState: ObservableObject {
     var onClearSiteData: ((String) -> Void)?
     var onClearAllWebsiteData: (() -> Void)?
     var buildDiagnosticHeader: (() -> String)?
+}
+
+// MARK: - Reusable Per-Site Priority Editor (Presets + Custom 30~92 Input)
+
+private enum SiteBandPresetChoice: String {
+    case followGlobal = "global"
+    case core88 = "88"
+    case frequent80 = "80"
+    case secondary70 = "70"
+    case disposable35 = "35"
+    case custom = "custom"
+
+    static func from(customBand: Int) -> SiteBandPresetChoice {
+        let norm = JWPriorityHelper.normalizeCustomBand(customBand)
+        switch norm {
+        case 0: return .followGlobal
+        case JWConstants.bandPresetCore: return .core88
+        case JWConstants.bandPresetFrequent: return .frequent80
+        case JWConstants.bandPresetSecondary: return .secondary70
+        case JWConstants.bandPresetDisposable: return .disposable35
+        default: return .custom
+        }
+    }
+}
+
+struct SitePriorityEditorSection: View {
+    @Binding var customBand: Int
+    let globalBand: Int
+    var onChanged: (() -> Void)? = nil
+
+    @State private var choice: SiteBandPresetChoice = .followGlobal
+    @State private var customText: String = "82"
+    @State private var didInit: Bool = false
+
+    private var clampedGlobal: Int {
+        JWPriorityHelper.clampSiteBand(globalBand)
+    }
+
+    var body: some View {
+        Section(
+            header: Text("进程保活等级（主次先后顺序）"),
+            footer: Text("iOS 内存紧张时严格从低档位往高档位回收。单站点范围 30~92 档；网络/GPU 与 JetWeb 主进程会自动压阵在最高标签之上 (+1/+2 档，上限 95)，防止主容器先被杀。")
+        ) {
+            Picker("保活分档", selection: Binding(
+                get: { choice },
+                set: { newChoice in
+                    choice = newChoice
+                    applyChoice(newChoice)
+                }
+            )) {
+                Text("跟随全局默认（\(clampedGlobal) 档）").tag(SiteBandPresetChoice.followGlobal)
+                Text("🔥 核心常驻（88 档 · 最后回收）").tag(SiteBandPresetChoice.core88)
+                Text("⭐️ 常用保活（80 档 · 高优常驻）").tag(SiteBandPresetChoice.frequent80)
+                Text("📌 次要备选（70 档 · 优先让路）").tag(SiteBandPresetChoice.secondary70)
+                Text("🍃 随用随清（35 档 · 内存紧先清）").tag(SiteBandPresetChoice.disposable35)
+                Text("🎛 自定义精确档位（30 ~ 92）").tag(SiteBandPresetChoice.custom)
+            }
+
+            if choice == .custom {
+                HStack {
+                    Text("自定义档位 (30~92)")
+                        .font(.subheadline)
+                    Spacer()
+                    TextField("30~92", text: $customText)
+                        .keyboardType(.numberPad)
+                        .multilineTextAlignment(.trailing)
+                        .font(.body.monospacedDigit().weight(.semibold))
+                        .frame(width: 72)
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 8)
+                        .background(Color(UIColor.tertiarySystemFill))
+                        .cornerRadius(6)
+                        .onChange(of: customText) { val in
+                            let digits = val.filter { $0.isNumber }
+                            if digits != val {
+                                customText = digits
+                            }
+                            if let n = Int(digits), (JWConstants.minSiteBand...JWConstants.maxSiteBand).contains(n) {
+                                if customBand != n {
+                                    customBand = n
+                                    onChanged?()
+                                }
+                            }
+                        }
+                }
+
+                Stepper(
+                    value: Binding(
+                        get: {
+                            let cur = JWPriorityHelper.normalizeCustomBand(customBand)
+                            return cur > 0 ? cur : clampedGlobal
+                        },
+                        set: { newVal in
+                            let clamped = JWPriorityHelper.clampSiteBand(newVal)
+                            customBand = clamped
+                            customText = "\(clamped)"
+                            onChanged?()
+                        }
+                    ),
+                    in: JWConstants.minSiteBand...JWConstants.maxSiteBand
+                ) {
+                    let eff = JWPriorityHelper.normalizeCustomBand(customBand) > 0
+                        ? JWPriorityHelper.normalizeCustomBand(customBand)
+                        : clampedGlobal
+                    Text("步进微调：当前生效 \(eff) 档")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .onAppear {
+            if !didInit {
+                syncFromBinding()
+                didInit = true
+            }
+        }
+        .onChange(of: customBand) { _ in
+            let expected = SiteBandPresetChoice.from(customBand: customBand)
+            if choice != .custom || customBand == 0 {
+                choice = expected
+            }
+            if customBand > 0 && customText != "\(customBand)" {
+                customText = "\(customBand)"
+            }
+        }
+    }
+
+    private func syncFromBinding() {
+        choice = SiteBandPresetChoice.from(customBand: customBand)
+        let norm = JWPriorityHelper.normalizeCustomBand(customBand)
+        customText = "\(norm > 0 ? norm : clampedGlobal)"
+    }
+
+    private func applyChoice(_ c: SiteBandPresetChoice) {
+        switch c {
+        case .followGlobal:
+            customBand = 0
+        case .core88:
+            customBand = JWConstants.bandPresetCore
+            customText = "\(JWConstants.bandPresetCore)"
+        case .frequent80:
+            customBand = JWConstants.bandPresetFrequent
+            customText = "\(JWConstants.bandPresetFrequent)"
+        case .secondary70:
+            customBand = JWConstants.bandPresetSecondary
+            customText = "\(JWConstants.bandPresetSecondary)"
+        case .disposable35:
+            customBand = JWConstants.bandPresetDisposable
+            customText = "\(JWConstants.bandPresetDisposable)"
+        case .custom:
+            let cur = JWPriorityHelper.normalizeCustomBand(customBand)
+            let initial = cur > 0 ? cur : clampedGlobal
+            customBand = initial
+            customText = "\(initial)"
+        }
+        onChanged?()
+    }
 }
 
 // MARK: - Settings Root Drawer (SwiftUI)
@@ -89,11 +247,12 @@ struct SettingsDrawerView: View {
     }
 
     private var liveProcessSection: some View {
-        Section(
+        let guardian = config.computedGuardianBands()
+        return Section(
             header: Text("实时进程与保活档位"),
             footer: Text(
                 runtime.helperBannerText.isEmpty
-                ? "切标签或退后台时，JetWeb 会以断言级优先级将主进程与各标签 WebContent 锁入目标档位并抬高非活跃内存上限，防白屏重刷。"
+                ? "各标签按专属档位分级保活（主进程压阵 \(guardian.hostBand) 档 · 网络/GPU \(guardian.auxBand) 档）；底栏长按标签可随时「🌙 休眠释放内存」。"
                 : runtime.helperBannerText
             )
         ) {
@@ -102,10 +261,11 @@ struct SettingsDrawerView: View {
                     .font(.subheadline)
                 Spacer()
                 if let st = runtime.liveStatuses[hostPid], st.band >= 0 {
-                    let note = st.band >= 100 ? " (前台)" : (st.band >= config.targetBand ? " (已保活)" : "")
+                    let ok = (st.band >= guardian.hostBand || st.band >= 100)
+                    let note = st.band >= 100 ? " (前台·目标\(guardian.hostBand))" : (ok ? " (已保活)" : "")
                     Text("档位 \(st.band)\(note) · \(st.footprintMB) MB")
                         .font(.footnote.monospacedDigit())
-                        .foregroundColor((st.band >= config.targetBand || st.band >= 100) ? .green : .secondary)
+                        .foregroundColor(ok ? .green : .secondary)
                 } else {
                     Text("读取中 / 需 TrollStore 安装")
                         .font(.footnote)
@@ -138,31 +298,42 @@ struct SettingsDrawerView: View {
 
     @ViewBuilder
     private func siteStatusView(for site: SiteItem) -> some View {
+        let effBand = config.effectiveSiteBand(for: site)
         let wpid = runtime.webPIDsBySiteId[site.id] ?? 0
         if !site.enabled {
-            Text("已暂停")
+            Text("已隐藏")
                 .font(.footnote)
                 .foregroundColor(Color(UIColor.tertiaryLabel))
+        } else if site.hibernated {
+            Text("🌙 已休眠 · 0 MB")
+                .font(.footnote)
+                .foregroundColor(.purple)
         } else if wpid <= 0 {
             if runtime.terminatedSiteIds.contains(site.id) {
                 Text("已被回收（切回自动恢复）")
                     .font(.footnote)
                     .foregroundColor(.orange)
             } else {
-                Text("待加载")
+                Text("待加载 (目标\(effBand)档)")
                     .font(.footnote)
                     .foregroundColor(.secondary)
             }
         } else if let st = runtime.liveStatuses[wpid], st.band >= 0 {
-            let badge = st.displayBadge(targetBand: config.targetBand, maxMB: config.maxMemoryMB)
+            let badge = st.displayBadge(targetBand: effBand, maxMB: config.maxMemoryMB)
             let overMem = (badge == "OVER_MEM")
-            let note: String = {
-                if overMem { return " (超内存限额)" }
-                if st.band >= 100 { return " (前台)" }
-                if st.band >= config.targetBand { return " (已保活)" }
-                return ""
+            let summaryText: String = {
+                if overMem {
+                    return "PID \(wpid) · 档位 \(st.band) (超限) · \(st.footprintMB) MB"
+                }
+                if st.band >= 100 {
+                    return "PID \(wpid) · 100档(前台/目标\(effBand)) · \(st.footprintMB) MB"
+                }
+                if st.band >= effBand {
+                    return "PID \(wpid) · \(st.band)档(已保活) · \(st.footprintMB) MB"
+                }
+                return "PID \(wpid) · \(st.band)/\(effBand)档 · \(st.footprintMB) MB"
             }()
-            Text("PID \(wpid) · 档位 \(st.band)\(note) · \(st.footprintMB) MB")
+            Text(summaryText)
                 .font(.footnote.monospacedDigit())
                 .foregroundColor(overMem ? .orange : (badge == "OK" ? .green : .secondary))
         } else {
@@ -172,10 +343,16 @@ struct SettingsDrawerView: View {
         }
     }
 
+    private func bandBadgeColor(for effBand: Int) -> Color {
+        if effBand >= 86 { return .orange }
+        if effBand >= 75 { return .green }
+        return .secondary
+    }
+
     private var sitesSection: some View {
         Section(
-            header: Text("常驻 WebApp 与多账号空间 (\(config.sites.count)/\(JWConstants.maxSites))"),
-            footer: Text("点击站点可修改网址、切换「独立账号空间」（同网站登录多个账号互不串号）或一键复制新账号分身。")
+            header: Text("常驻 WebApp、专属档位与多账号 (\(config.sites.count)/\(JWConstants.maxSites))"),
+            footer: Text("点击站点可单独设置保活档位（30~92 区分主次）、切换独立账号空间或休眠释放内存。")
         ) {
             if config.sites.isEmpty {
                 Button {
@@ -189,6 +366,8 @@ struct SettingsDrawerView: View {
                 }
             } else {
                 ForEach(config.sites) { site in
+                    let effBand = config.effectiveSiteBand(for: site)
+                    let bColor = bandBadgeColor(for: effBand)
                     HStack(spacing: 10) {
                         NavigationLink(
                             destination: SiteDetailView(
@@ -206,6 +385,14 @@ struct SettingsDrawerView: View {
                                     .foregroundColor(.secondary)
                                     .lineLimit(1)
                                 HStack(spacing: 6) {
+                                    Text(JWPriorityHelper.shortBadge(customBand: site.customBand, globalBand: config.targetBand))
+                                        .font(.system(size: 10.5, weight: .semibold))
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(bColor.opacity(0.15))
+                                        .foregroundColor(bColor)
+                                        .cornerRadius(4)
+
                                     Text(site.isIsolatedStore ? "独立账号" : "默认共享")
                                         .font(.system(size: 10.5, weight: .semibold))
                                         .padding(.horizontal, 6)
@@ -217,6 +404,16 @@ struct SettingsDrawerView: View {
                                         .foregroundColor(site.isIsolatedStore ? .blue : .secondary)
                                         .cornerRadius(4)
 
+                                    if site.enabled && site.hibernated {
+                                        Text("🌙 休眠中")
+                                            .font(.system(size: 10.5, weight: .medium))
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.purple.opacity(0.14))
+                                            .foregroundColor(.purple)
+                                            .cornerRadius(4)
+                                    }
+
                                     let mode = JWAppearanceHelper.normalizeSite(site.appearanceMode)
                                     if mode != JWConstants.appearanceInherit {
                                         Text(JWAppearanceHelper.label(for: mode))
@@ -224,7 +421,7 @@ struct SettingsDrawerView: View {
                                             .padding(.horizontal, 6)
                                             .padding(.vertical, 2)
                                             .background(Color.purple.opacity(0.14))
-                                            .foregroundColor(site.isIsolatedStore ? .purple : .purple)
+                                            .foregroundColor(.purple)
                                             .cornerRadius(4)
                                     }
                                 }
@@ -238,6 +435,9 @@ struct SettingsDrawerView: View {
                             set: { newVal in
                                 if let i = config.sites.firstIndex(where: { $0.id == site.id }) {
                                     config.sites[i].enabled = newVal
+                                    if newVal {
+                                        config.sites[i].hibernated = false
+                                    }
                                     config.save()
                                     runtime.onSyncStructure?(nil)
                                 }
@@ -262,7 +462,7 @@ struct SettingsDrawerView: View {
 
     private var policyAndToolsSection: some View {
         Section(
-            header: Text("外观、证书、保活与诊断"),
+            header: Text("全局默认策略与诊断"),
             footer: Text("JetWeb v\(JWBridgeVersion()) (\(JWBridgeGitCommit())) · Swift (UIKit + SwiftUI) + C Root Helper · 单标签超内存上限自动退回 30 档保护 4GB 内存")
         ) {
             Picker("全局外观模式", selection: Binding(
@@ -287,7 +487,7 @@ struct SettingsDrawerView: View {
                 }
             }
 
-            Picker("后台保活目标档位", selection: Binding(
+            Picker("全局默认保活档位", selection: Binding(
                 get: { config.targetBand },
                 set: { newBand in
                     config.targetBand = newBand
@@ -295,11 +495,11 @@ struct SettingsDrawerView: View {
                     runtime.onApplyProtectionNow?()
                 }
             )) {
+                Text("70 档").tag(70)
                 Text("75 档").tag(75)
-                Text("80 档").tag(80)
-                Text("85 档（推荐）").tag(85)
+                Text("80 档（推荐）").tag(80)
+                Text("85 档").tag(85)
                 Text("90 档").tag(90)
-                Text("95 档").tag(95)
             }
 
             Picker("单网页内存安全上限", selection: Binding(
@@ -346,6 +546,7 @@ struct AddSiteSheet: View {
     @State private var urlInput: String = ""
     @State private var useIsolatedStore: Bool = true
     @State private var userTouchedStoreToggle: Bool = false
+    @State private var customBand: Int = 0
     @State private var appearanceMode: String = JWConstants.appearanceInherit
     @State private var showingInvalidURLAlert = false
 
@@ -368,6 +569,11 @@ struct AddSiteSheet: View {
                             }
                         }
                 }
+
+                SitePriorityEditorSection(
+                    customBand: $customBand,
+                    globalBand: config.targetBand
+                )
 
                 Section(
                     header: Text("账号与登录态隔离"),
@@ -440,18 +646,20 @@ struct AddSiteSheet: View {
             urlString: normURL,
             enabled: true,
             appearanceMode: appearanceMode,
-            dataStoreId: dsId
+            dataStoreId: dsId,
+            customBand: customBand,
+            hibernated: false
         )
         config.sites.append(item)
         config.selectedSiteId = item.id
         config.save()
-        JWLog("STORE", "Added site=\(item.title) isolated=\(useIsolatedStore)")
+        JWLog("STORE", "Added site=\(item.title) isolated=\(useIsolatedStore) customBand=\(item.customBand)")
         runtime.onSyncStructure?(item.id)
         presentationMode.wrappedValue.dismiss()
     }
 }
 
-// MARK: - Site Detail & Multi-Account Editor View
+// MARK: - Site Detail, Priority & Multi-Account Editor View
 
 struct SiteDetailView: View {
     let siteId: String
@@ -485,9 +693,27 @@ struct SiteDetailView: View {
                     }
                 }
 
+                SitePriorityEditorSection(
+                    customBand: Binding(
+                        get: {
+                            guard let i = siteIndex else { return 0 }
+                            return config.sites[i].customBand
+                        },
+                        set: { newBand in
+                            guard let i = siteIndex else { return }
+                            config.sites[i].customBand = JWPriorityHelper.normalizeCustomBand(newBand)
+                            config.save()
+                        }
+                    ),
+                    globalBand: config.targetBand,
+                    onChanged: {
+                        runtime.onApplyProtectionNow?()
+                    }
+                )
+
                 Section(
                     header: Text("多账号与数据空间"),
-                    footer: Text("「独立账号空间」拥有专属持久 Cookie、LocalStorage 与 IndexedDB，重启手机也不会丢登录态。若此前添加的同网站标签共用了旧账号，点击下方切换为独立空间即可登录新账号。")
+                    footer: Text("「独立账号空间」拥有专属持久 Cookie、LocalStorage 与 IndexedDB，重启手机也不会丢登录态。")
                 ) {
                     HStack {
                         Text("当前空间")
@@ -499,6 +725,7 @@ struct SiteDetailView: View {
                     if site.isIsolatedStore {
                         Button("重置为全新独立账号空间（换登另一新号）") {
                             config.sites[idx].dataStoreId = UUID().uuidString
+                            config.sites[idx].hibernated = false
                             config.save()
                             JWLog("STORE", "Rotated isolated store for site=\(site.title)")
                             runtime.onSyncStructure?(site.id)
@@ -506,6 +733,7 @@ struct SiteDetailView: View {
                         }
                         Button("切回默认共享空间") {
                             config.sites[idx].dataStoreId = JWConstants.dataStoreDefault
+                            config.sites[idx].hibernated = false
                             config.save()
                             JWLog("STORE", "Switched site=\(site.title) to default store")
                             runtime.onSyncStructure?(site.id)
@@ -514,6 +742,7 @@ struct SiteDetailView: View {
                     } else {
                         Button("切换为独立账号空间（不与原账号串号）") {
                             config.sites[idx].dataStoreId = UUID().uuidString
+                            config.sites[idx].hibernated = false
                             config.save()
                             JWLog("STORE", "Switched site=\(site.title) to isolated store")
                             runtime.onSyncStructure?(site.id)
@@ -537,8 +766,8 @@ struct SiteDetailView: View {
                 }
 
                 Section(
-                    header: Text("显示与操作"),
-                    footer: Text("遇到深色模式下输入框白底白字时，可单独设为「强制浅色」。")
+                    header: Text("内存释放与外观"),
+                    footer: Text("休眠会立即销毁网页渲染进程释放内存，底栏保留标签且不丢登录态，下次点击即唤醒。")
                 ) {
                     Picker("外观模式", selection: Binding(
                         get: { JWAppearanceHelper.normalizeSite(config.sites[idx].appearanceMode) },
@@ -555,9 +784,25 @@ struct SiteDetailView: View {
                     }
 
                     if site.enabled {
-                        Button("重新加载此站点") {
-                            runtime.onReloadSite?(site.id)
-                            presentationMode.wrappedValue.dismiss()
+                        if site.hibernated {
+                            Button {
+                                runtime.onSetHibernated?(site.id, false)
+                                presentationMode.wrappedValue.dismiss()
+                            } label: {
+                                Label("⚡️ 唤醒并打开此标签", systemImage: "bolt.fill")
+                            }
+                        } else {
+                            Button {
+                                runtime.onSetHibernated?(site.id, true)
+                                alertMessage = "已休眠「\(site.title)」并释放渲染内存。"
+                            } label: {
+                                Label("🌙 休眠此标签（释放内存，保留登录态）", systemImage: "moon.zzz.fill")
+                                    .foregroundColor(.purple)
+                            }
+                            Button("重新加载此站点") {
+                                runtime.onReloadSite?(site.id)
+                                presentationMode.wrappedValue.dismiss()
+                            }
                         }
                     }
                 }
@@ -566,7 +811,7 @@ struct SiteDetailView: View {
                     .foregroundColor(.secondary)
             }
         }
-        .navigationTitle("站点与账号设置")
+        .navigationTitle("站点、档位与账号")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             if !loadedInitial, let idx = siteIndex {
@@ -617,7 +862,9 @@ struct SiteDetailView: View {
             urlString: site.urlString,
             enabled: true,
             appearanceMode: site.appearanceMode,
-            dataStoreId: UUID().uuidString
+            dataStoreId: UUID().uuidString,
+            customBand: site.customBand,
+            hibernated: false
         )
         config.sites.append(clone)
         config.selectedSiteId = clone.id

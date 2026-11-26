@@ -9,8 +9,8 @@
 
 ## 核心特性
 
-1. **多站点单容器常驻 + 同站多账号分身**：支持在本机自由添加/编辑/排序最多 8 个常用 WebApp（配置仅保存在 `/var/mobile/Library/JetWeb/config.json`，不进入代码仓库），标签间 **0ms 秒切不白屏**；每个标签可任选「默认共享空间」或「独立账号空间」（独立持久 Cookie / LocalStorage / IndexedDB，同网站可同时登录多个账号互不串号）。
-2. **外壳 + `WebContent` 断言级提档与非活跃内存护航**：内置纯 C 短时 root 助手 `jetwebctl`（任务完成即退，零常驻后台耗电），以断言级优先级（`MEMORYSTATUS_SET_PRIORITY_ASSERTION` + 非活跃保底）及非致命 `memlimit_inactive` 同步保护主进程与 `WebContent` / `Networking` / `GPU` 进程，并通过独立 `--bg-guard` 覆盖退后台后 0.6s～55s 系统降档窗口。
+1. **多站点单容器常驻 + 同站多账号分身 + 长按休眠释放内存**：支持在本机自由添加/编辑/排序最多 8 个常用 WebApp（配置仅保存在 `/var/mobile/Library/JetWeb/config.json`，不进入代码仓库），标签间 **0ms 秒切不白屏**；每个标签可任选「默认共享空间」或「独立账号空间」（同网站可同时登录多个账号互不串号）；底栏长按任意标签可一键**「🌙 休眠释放内存」**（立即销毁 `WebContent` 进程释放内存至 `0 MB`，完整保留登录态与底栏入口，点击即唤醒）。
+2. **单站点自定义保活等级（30~92 档）+ 金字塔压阵护航**：支持为每个站点预设或手动输入精确进程等级（`30 ~ 92` 档，区分主次先后回收顺序），自动将 `Networking/GPU`（`+1` 档，上限 `94`）与 `JetWeb` 主容器（`+2` 档，上限 `95`）压阵在最高活跃标签之上；内置纯 C 短时 root 助手 `jetwebctl` 以 `pid:band` 断言级优先级与非致命 `memlimit_inactive` 同步护航，并通过独立 `--bg-guard` 覆盖退后台后 0.6s～55s 系统降档窗口。
 3. **4GB 内存安全阀**：单标签渲染进程物理内存超过设定上限（默认 `450 MB`）时自动停止保活并退回 `30` 档，避免异常网页撑爆整机内存。
 4. **外观兜底、自签名证书与内置诊断日志**：支持全局/单站点浅色与深色切换及输入框对比度自动兜底，支持内网自签名 HTTPS / `wss://` 按域名信任与分空间 HTTP Basic Auth，内置滚动诊断日志查看器支持一键复制与导出。
 5. **与 [JetPilot](https://github.com/csjoyxy/jetpilot) 联动**：同步写出 `/var/mobile/Library/JetPilot/webhub_pids.txt` 供联动巡检。

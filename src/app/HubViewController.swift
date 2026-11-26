@@ -103,6 +103,7 @@ private final class PendingBasicAuthItem {
 
 final class SitePillControl: UIControl {
     var siteId: String = ""
+    var onLongPress: ((SitePillControl) -> Void)?
     private let dotView = UIView()
     private let titleLabel = UILabel()
 
@@ -123,9 +124,13 @@ final class SitePillControl: UIControl {
         titleLabel.isUserInteractionEnabled = false
         addSubview(titleLabel)
 
+        let lp = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
+        lp.minimumPressDuration = 0.42
+        addGestureRecognizer(lp)
+
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 30),
-            widthAnchor.constraint(lessThanOrEqualToConstant: 158),
+            widthAnchor.constraint(lessThanOrEqualToConstant: 176),
             dotView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             dotView.centerYAnchor.constraint(equalTo: centerYAnchor),
             dotView.widthAnchor.constraint(equalToConstant: 7),
@@ -140,19 +145,37 @@ final class SitePillControl: UIControl {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func configure(title: String, active: Bool, aliveState: String, isolated: Bool) {
+    @objc private func handleLongPress(_ gr: UILongPressGestureRecognizer) {
+        if gr.state == .began {
+            onLongPress?(self)
+        }
+    }
+
+    func configure(title: String, active: Bool, aliveState: String, isolated: Bool, hibernated: Bool = false, customBand: Int = 0) {
         let baseTitle = title.isEmpty ? "网页" : title
-        titleLabel.text = isolated ? "\(baseTitle) · 独" : baseTitle
+        var display = hibernated ? "🌙 \(baseTitle)" : baseTitle
+        if isolated {
+            display += " · 独"
+        }
+        if customBand > 0 {
+            display += " · \(customBand)"
+        }
+        titleLabel.text = display
+        alpha = hibernated ? (active ? 0.92 : 0.65) : 1.0
 
         if active {
-            backgroundColor = .systemBlue
+            backgroundColor = hibernated ? .systemIndigo : .systemBlue
             titleLabel.textColor = .white
         } else {
             backgroundColor = UIColor.secondarySystemFill.withAlphaComponent(0.85)
-            titleLabel.textColor = .label
+            titleLabel.textColor = hibernated ? .secondaryLabel : .label
         }
 
-        if aliveState == "OK" || aliveState == "FG" {
+        if hibernated {
+            dotView.backgroundColor = active
+                ? UIColor(red: 0.85, green: 0.78, blue: 1.0, alpha: 1.0)
+                : .systemIndigo
+        } else if aliveState == "OK" || aliveState == "FG" {
             dotView.backgroundColor = active
                 ? UIColor(red: 0.35, green: 1.0, blue: 0.55, alpha: 1.0)
                 : .systemGreen
@@ -205,6 +228,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private let webContainerView = UIView()
     private let progressView = UIProgressView(progressViewStyle: .bar)
     private let emptyStateView = UIView()
+    private let hibernatedStateView = UIView()
+    private let hibernatedTitleLabel = UILabel()
+    private let hibernatedSubLabel = UILabel()
 
     private var dockBar: UIVisualEffectView!
     private let tabsScrollView = UIScrollView()
@@ -290,6 +316,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             }
             self.syncWebViewsWithConfig(preferredSelectId: selectId)
             self.applyDockCollapsedState(animated: false)
+        }
+        runtime.onSetHibernated = { [weak self] siteId, hibernated in
+            self?.setSiteHibernated(siteId: siteId, hibernated: hibernated)
         }
         runtime.onUpdateAppearance = { [weak self] in
             self?.applyAppearanceStyles()
@@ -445,7 +474,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         let emptySub = UILabel()
         emptySub.translatesAutoresizingMaskIntoConstraints = false
-        emptySub.text = "把常用的桌面级 WebApp 放进同一容器：\n秒切不白屏、同站多账号独立空间、后台自动提档保活"
+        emptySub.text = "把常用的桌面级 WebApp 放进同一容器：\n秒切不白屏、同站多账号独立空间、分档保活与一键休眠"
         emptySub.font = .systemFont(ofSize: 14)
         emptySub.textColor = .secondaryLabel
         emptySub.numberOfLines = 0
@@ -479,6 +508,65 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             addFirstBtn.topAnchor.constraint(equalTo: emptySub.bottomAnchor, constant: 20),
             addFirstBtn.centerXAnchor.constraint(equalTo: emptyStateView.centerXAnchor),
             addFirstBtn.bottomAnchor.constraint(equalTo: emptyStateView.bottomAnchor)
+        ])
+
+        hibernatedStateView.translatesAutoresizingMaskIntoConstraints = false
+        hibernatedStateView.isHidden = true
+        webContainerView.addSubview(hibernatedStateView)
+
+        hibernatedTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        hibernatedTitleLabel.text = "🌙 标签已休眠"
+        hibernatedTitleLabel.font = .systemFont(ofSize: 20, weight: .bold)
+        hibernatedTitleLabel.numberOfLines = 2
+        hibernatedTitleLabel.textAlignment = .center
+        hibernatedStateView.addSubview(hibernatedTitleLabel)
+
+        hibernatedSubLabel.translatesAutoresizingMaskIntoConstraints = false
+        hibernatedSubLabel.text = "已销毁该标签的网页进程并释放全部运行内存（0 MB）。\n账号 Cookie 与本地登录态完整保留，随时可一键唤醒。"
+        hibernatedSubLabel.font = .systemFont(ofSize: 14)
+        hibernatedSubLabel.textColor = .secondaryLabel
+        hibernatedSubLabel.numberOfLines = 0
+        hibernatedSubLabel.textAlignment = .center
+        hibernatedStateView.addSubview(hibernatedSubLabel)
+
+        let wakeBtn = UIButton(type: .system)
+        wakeBtn.translatesAutoresizingMaskIntoConstraints = false
+        var wakeCfg = UIButton.Configuration.filled()
+        wakeCfg.title = "⚡️ 立即唤醒并加载网页"
+        wakeCfg.baseBackgroundColor = .systemIndigo
+        wakeCfg.cornerStyle = .capsule
+        wakeCfg.contentInsets = NSDirectionalEdgeInsets(top: 11, leading: 24, bottom: 11, trailing: 24)
+        wakeBtn.configuration = wakeCfg
+        wakeBtn.addTarget(self, action: #selector(wakeSelectedSiteTapped), for: .touchUpInside)
+        hibernatedStateView.addSubview(wakeBtn)
+
+        let hibManageBtn = UIButton(type: .system)
+        hibManageBtn.translatesAutoresizingMaskIntoConstraints = false
+        hibManageBtn.setTitle("打开工作台设置", for: .normal)
+        hibManageBtn.titleLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+        hibManageBtn.addTarget(self, action: #selector(openManageSheet), for: .touchUpInside)
+        hibernatedStateView.addSubview(hibManageBtn)
+
+        NSLayoutConstraint.activate([
+            hibernatedStateView.centerXAnchor.constraint(equalTo: webContainerView.centerXAnchor),
+            hibernatedStateView.centerYAnchor.constraint(equalTo: webContainerView.centerYAnchor),
+            hibernatedStateView.leadingAnchor.constraint(greaterThanOrEqualTo: webContainerView.leadingAnchor, constant: 28),
+            hibernatedStateView.trailingAnchor.constraint(lessThanOrEqualTo: webContainerView.trailingAnchor, constant: -28),
+
+            hibernatedTitleLabel.topAnchor.constraint(equalTo: hibernatedStateView.topAnchor),
+            hibernatedTitleLabel.leadingAnchor.constraint(equalTo: hibernatedStateView.leadingAnchor),
+            hibernatedTitleLabel.trailingAnchor.constraint(equalTo: hibernatedStateView.trailingAnchor),
+
+            hibernatedSubLabel.topAnchor.constraint(equalTo: hibernatedTitleLabel.bottomAnchor, constant: 10),
+            hibernatedSubLabel.leadingAnchor.constraint(equalTo: hibernatedStateView.leadingAnchor),
+            hibernatedSubLabel.trailingAnchor.constraint(equalTo: hibernatedStateView.trailingAnchor),
+
+            wakeBtn.topAnchor.constraint(equalTo: hibernatedSubLabel.bottomAnchor, constant: 20),
+            wakeBtn.centerXAnchor.constraint(equalTo: hibernatedStateView.centerXAnchor),
+
+            hibManageBtn.topAnchor.constraint(equalTo: wakeBtn.bottomAnchor, constant: 12),
+            hibManageBtn.centerXAnchor.constraint(equalTo: hibernatedStateView.centerXAnchor),
+            hibManageBtn.bottomAnchor.constraint(equalTo: hibernatedStateView.bottomAnchor)
         ])
 
         floatingPill = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
@@ -575,6 +663,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         return config.sites.filter { $0.enabled }
     }
 
+    private func awakeSites() -> [SiteItem] {
+        return config.sites.filter { $0.enabled && !$0.hibernated }
+    }
+
     private func site(forId siteId: String) -> SiteItem? {
         return config.sites.first(where: { $0.id == siteId })
     }
@@ -664,7 +756,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         applyAppearanceStyle(to: wv, for: site)
 
         let shortStore = JWDataStoreHelper.isIsolated(normStoreId) ? String(normStoreId.prefix(8)) : "default"
-        JWLog("WEBKIT", "Create WebView site=\(site.title) store=\(shortStore) appearance=\(site.appearanceMode)")
+        let effBand = config.effectiveSiteBand(for: site)
+        JWLog("WEBKIT", "Create WebView site=\(site.title) store=\(shortStore) band=\(effBand) appearance=\(site.appearanceMode)")
 
         if let url = URL(string: site.urlString) {
             wv.load(URLRequest(url: url))
@@ -709,9 +802,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
 
         let enabled = enabledSites()
-        let validIds = Set(enabled.map { $0.id })
+        let awake = awakeSites()
+        let awakeIds = Set(awake.map { $0.id })
 
-        for s in enabled {
+        for s in awake {
             let desiredStoreId = JWDataStoreHelper.normalize(s.dataStoreId)
             if let currentStoreId = webViewStoreIds[s.id], currentStoreId != desiredStoreId {
                 teardownWebView(forSiteId: s.id)
@@ -721,7 +815,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             }
         }
 
-        for existingId in Array(webViews.keys) where !validIds.contains(existingId) {
+        for existingId in Array(webViews.keys) where !awakeIds.contains(existingId) {
             teardownWebView(forSiteId: existingId)
         }
 
@@ -736,18 +830,20 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         if enabled.isEmpty {
             config.selectedSiteId = ""
             emptyStateView.isHidden = false
+            hibernatedStateView.isHidden = true
             progressView.isHidden = true
+            floatingLabel.text = "◉ 展开"
         } else {
             emptyStateView.isHidden = true
             if let preferred = preferredSelectId, enabled.contains(where: { $0.id == preferred }) {
                 config.selectedSiteId = preferred
                 config.save()
             } else if !enabled.contains(where: { $0.id == config.selectedSiteId }),
-                      let first = enabled.first {
-                config.selectedSiteId = first.id
+                      let next = awake.first ?? enabled.first {
+                config.selectedSiteId = next.id
                 config.save()
             }
-            selectSite(byId: config.selectedSiteId)
+            selectSite(byId: config.selectedSiteId, triggerWaves: false)
         }
 
         refreshRuntimeWebPIDMap()
@@ -784,7 +880,12 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     }
 
     private func reloadSiteFromHomeOrCurrent(siteId: String, forceHome: Bool) {
-        guard !siteId.isEmpty, let wv = webViews[siteId] else { return }
+        guard !siteId.isEmpty else { return }
+        if let cur = site(forId: siteId), cur.hibernated {
+            setSiteHibernated(siteId: siteId, hibernated: false)
+            return
+        }
+        guard let wv = webViews[siteId] else { return }
         let failedURL = errorOverlays[siteId]?.failedURLString ?? ""
         hideErrorOverlay(forSiteId: siteId)
 
@@ -811,26 +912,129 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: false)
     }
 
-    private func selectSite(byId siteId: String) {
-        guard !siteId.isEmpty, let targetWV = webViews[siteId] else { return }
+    private func selectSite(byId siteId: String, triggerWaves: Bool = true) {
+        guard !siteId.isEmpty, let curSite = site(forId: siteId), curSite.enabled else { return }
         config.selectedSiteId = siteId
         config.save()
 
-        for (sid, wv) in webViews {
-            let isSel = (sid == siteId)
-            wv.isHidden = !isSel
-            wv.isUserInteractionEnabled = isSel
+        if let targetWV = webViews[siteId], !curSite.hibernated {
+            hibernatedStateView.isHidden = true
+            for (sid, wv) in webViews {
+                let isSel = (sid == siteId)
+                wv.isHidden = !isSel
+                wv.isUserInteractionEnabled = isSel
+            }
+            webContainerView.bringSubviewToFront(targetWV)
+            let p = Float(targetWV.estimatedProgress)
+            progressView.isHidden = (!targetWV.isLoading || p >= 1.0 || p <= 0.01)
+            progressView.setProgress(p, animated: false)
+            recoverWebViewIfTerminated(siteId: siteId)
+            floatingLabel.text = "◉ \(curSite.title)"
+        } else {
+            for (_, wv) in webViews {
+                wv.isHidden = true
+                wv.isUserInteractionEnabled = false
+            }
+            progressView.isHidden = true
+            let spaceLabel = JWDataStoreHelper.label(for: curSite.dataStoreId)
+            let tierText = JWPriorityHelper.tierDescription(customBand: curSite.customBand, globalBand: config.targetBand)
+            hibernatedTitleLabel.text = "🌙 \(curSite.title) 已休眠"
+            hibernatedSubLabel.text = "已销毁该标签的网页进程并释放全部运行内存（0 MB）。\n登录空间（\(spaceLabel)）与保活预设（\(tierText)）完整保留。"
+            hibernatedStateView.isHidden = false
+            webContainerView.bringSubviewToFront(hibernatedStateView)
+            floatingLabel.text = "🌙 \(curSite.title)"
         }
-        webContainerView.bringSubviewToFront(targetWV)
-        let p = Float(targetWV.estimatedProgress)
-        progressView.isHidden = (!targetWV.isLoading || p >= 1.0 || p <= 0.01)
-        progressView.setProgress(p, animated: false)
-        recoverWebViewIfTerminated(siteId: siteId)
 
-        let curSite = site(forId: siteId)
-        floatingLabel.text = "◉ \(curSite?.title ?? "展开")"
-        rebuildTabPills()
-        schedulePostStateChangeProtectionWaves()
+        if triggerWaves {
+            rebuildTabPills()
+            schedulePostStateChangeProtectionWaves()
+        }
+    }
+
+    private func setSiteHibernated(siteId: String, hibernated: Bool) {
+        guard let idx = config.sites.firstIndex(where: { $0.id == siteId }) else { return }
+        let title = config.sites[idx].title
+
+        if !hibernated {
+            config.sites[idx].enabled = true
+            config.sites[idx].hibernated = false
+            config.selectedSiteId = siteId
+            config.save()
+            JWLog("HIBERNATE", "Waking site=\(title) and restoring WebView")
+            syncWebViewsWithConfig(preferredSelectId: siteId)
+            applyDockCollapsedState(animated: false)
+            return
+        }
+
+        let prevPID = JWBridgeWebViewContentPID(webViews[siteId])
+        let prevMB = (prevPID > 0) ? (lastProcStatuses[prevPID]?.footprintMB ?? 0) : 0
+        config.sites[idx].hibernated = true
+
+        var nextSelected = config.selectedSiteId
+        if config.selectedSiteId == siteId {
+            if let nextAwake = config.sites.first(where: { $0.enabled && !$0.hibernated }) {
+                nextSelected = nextAwake.id
+            } else {
+                nextSelected = siteId
+            }
+        }
+        config.selectedSiteId = nextSelected
+        config.save()
+        JWLog("HIBERNATE", "Hibernated site=\(title) prevPID=\(prevPID) freed~\(prevMB)MB")
+        syncWebViewsWithConfig(preferredSelectId: nextSelected)
+    }
+
+    private func hibernateOtherSites(keepingSiteId: String) {
+        var count = 0
+        for i in config.sites.indices where config.sites[i].enabled {
+            if config.sites[i].id == keepingSiteId {
+                config.sites[i].hibernated = false
+            } else if !config.sites[i].hibernated {
+                config.sites[i].hibernated = true
+                count += 1
+            }
+        }
+        config.selectedSiteId = keepingSiteId
+        config.save()
+        JWLog("HIBERNATE", "Hibernated \(count) other tab(s), keeping siteId=\(keepingSiteId)")
+        syncWebViewsWithConfig(preferredSelectId: keepingSiteId)
+    }
+
+    private func hibernateAllSites() {
+        var count = 0
+        for i in config.sites.indices where config.sites[i].enabled && !config.sites[i].hibernated {
+            config.sites[i].hibernated = true
+            count += 1
+        }
+        config.save()
+        JWLog("HIBERNATE", "Hibernated ALL \(count) awake tab(s) to free WebContent memory")
+        syncWebViewsWithConfig(preferredSelectId: config.selectedSiteId)
+    }
+
+    @objc private func wakeSelectedSiteTapped() {
+        guard !config.selectedSiteId.isEmpty else { return }
+        setSiteHibernated(siteId: config.selectedSiteId, hibernated: false)
+    }
+
+    private func confirmDeleteSite(_ targetSite: SiteItem) {
+        let extraNote = targetSite.isIsolatedStore
+            ? "删除后将永久移除该站点及其独立账号空间的登录态，不可撤销。"
+            : "删除后将从工作台永久移除该站点。"
+        let alert = UIAlertController(
+            title: "彻底删除「\(targetSite.title)」？",
+            message: "\(extraNote)\n（如只是暂时不用想释放内存，建议选择「🌙 休眠此标签」）",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        alert.addAction(UIAlertAction(title: "彻底删除", style: .destructive) { [weak self] _ in
+            guard let self = self else { return }
+            self.config.sites.removeAll { $0.id == targetSite.id }
+            self.config.save()
+            JWLog("SITE", "Deleted site=\(targetSite.title)")
+            self.syncWebViewsWithConfig(preferredSelectId: nil)
+            self.applyDockCollapsedState(animated: false)
+        })
+        present(alert, animated: true)
     }
 
     private func rebuildTabPills() {
@@ -852,27 +1056,49 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let pill = SitePillControl(frame: .zero)
             pill.siteId = s.id
             let wpid = JWBridgeWebViewContentPID(webViews[s.id])
+            let effBand = config.effectiveSiteBand(for: s)
             let badge: String
-            if wpid > 0, let st = lastProcStatuses[wpid] {
-                badge = st.displayBadge(targetBand: config.targetBand, maxMB: config.maxMemoryMB)
+            if !s.hibernated, wpid > 0, let st = lastProcStatuses[wpid] {
+                badge = st.displayBadge(targetBand: effBand, maxMB: config.maxMemoryMB)
             } else {
                 badge = ""
             }
             let active = (s.id == config.selectedSiteId)
-            pill.configure(title: s.title, active: active, aliveState: badge, isolated: s.isIsolatedStore)
+            pill.configure(
+                title: s.title,
+                active: active,
+                aliveState: badge,
+                isolated: s.isIsolatedStore,
+                hibernated: s.hibernated,
+                customBand: JWPriorityHelper.normalizeCustomBand(s.customBand)
+            )
             pill.addTarget(self, action: #selector(tabPillTapped(_:)), for: .touchUpInside)
+            pill.onLongPress = { [weak self] pressedPill in
+                self?.handleTabPillLongPress(pressedPill)
+            }
             tabsStackView.addArrangedSubview(pill)
         }
     }
 
-    // MARK: - Quick Tab Menu, Multi-Account Actions & Sheets
+    // MARK: - Quick Tab Menu, Long-Press Close/Hibernate, Per-Site Priority & Multi-Account Actions
 
     @objc private func tabPillTapped(_ sender: SitePillControl) {
+        guard let tappedSite = site(forId: sender.siteId) else { return }
+        if tappedSite.hibernated {
+            setSiteHibernated(siteId: tappedSite.id, hibernated: false)
+            return
+        }
         if sender.siteId == config.selectedSiteId {
             showCurrentSiteQuickMenu(sourceView: sender)
         } else {
             selectSite(byId: sender.siteId)
         }
+    }
+
+    private func handleTabPillLongPress(_ sender: SitePillControl) {
+        guard let targetSite = site(forId: sender.siteId) else { return }
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        showTabLongPressMenu(for: targetSite, sourceView: sender)
     }
 
     private func configureCenteredPopover(_ sheet: UIAlertController, sourceView: UIView?) {
@@ -885,6 +1111,155 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             pop.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
             pop.permittedArrowDirections = []
         }
+    }
+
+    private func showTabLongPressMenu(for targetSite: SiteItem, sourceView: UIView?) {
+        let spaceLabel = JWDataStoreHelper.label(for: targetSite.dataStoreId)
+        let tierText = JWPriorityHelper.tierDescription(customBand: targetSite.customBand, globalBand: config.targetBand)
+        let wpid = JWBridgeWebViewContentPID(webViews[targetSite.id])
+        let st = (wpid > 0) ? lastProcStatuses[wpid] : nil
+
+        let statusDesc: String
+        if targetSite.hibernated {
+            statusDesc = "状态：🌙 已休眠（占用 0 MB · 登录态已保留）\n保活等级：\(tierText) · \(spaceLabel)"
+        } else if let st = st {
+            statusDesc = "运行占用：\(st.footprintMB) MB（当前 \(st.band) 档）\n保活等级：\(tierText) · \(spaceLabel)"
+        } else {
+            statusDesc = "保活等级：\(tierText) · \(spaceLabel)"
+        }
+
+        let sheet = UIAlertController(
+            title: targetSite.title,
+            message: statusDesc,
+            preferredStyle: .actionSheet
+        )
+
+        if targetSite.hibernated {
+            sheet.addAction(UIAlertAction(title: "⚡️ 唤醒并打开此标签", style: .default) { [weak self] _ in
+                self?.setSiteHibernated(siteId: targetSite.id, hibernated: false)
+            })
+        } else {
+            sheet.addAction(UIAlertAction(title: "🌙 休眠此标签（释放内存，保留登录态）", style: .default) { [weak self] _ in
+                self?.setSiteHibernated(siteId: targetSite.id, hibernated: true)
+            })
+        }
+
+        let otherAwakeCount = awakeSites().filter { $0.id != targetSite.id }.count
+        if otherAwakeCount > 0 {
+            sheet.addAction(UIAlertAction(title: "🧹 休眠其他 \(otherAwakeCount) 个标签（仅留此标签）", style: .default) { [weak self] _ in
+                self?.hibernateOtherSites(keepingSiteId: targetSite.id)
+            })
+        }
+
+        if awakeSites().count >= 2 {
+            sheet.addAction(UIAlertAction(title: "💤 全部标签休眠（释放全部网页内存）", style: .default) { [weak self] _ in
+                self?.hibernateAllSites()
+            })
+        }
+
+        sheet.addAction(UIAlertAction(title: "🎯 保活等级：\(tierText)", style: .default) { [weak self] _ in
+            self?.showQuickPriorityPicker(for: targetSite, sourceView: sourceView)
+        })
+
+        sheet.addAction(UIAlertAction(title: "复制为独立新账号分身", style: .default) { [weak self] _ in
+            self?.promptCloneIsolatedSite(from: targetSite)
+        })
+
+        sheet.addAction(UIAlertAction(title: "隐藏此标签（移出底栏，设置可恢复）", style: .default) { [weak self] _ in
+            guard let self = self,
+                  let idx = self.config.sites.firstIndex(where: { $0.id == targetSite.id }) else { return }
+            self.config.sites[idx].enabled = false
+            self.config.save()
+            JWLog("SITE", "Hid site from dock site=\(targetSite.title)")
+            self.syncWebViewsWithConfig(preferredSelectId: nil)
+            self.applyDockCollapsedState(animated: false)
+        })
+
+        sheet.addAction(UIAlertAction(title: "彻底删除此站点…", style: .destructive) { [weak self] _ in
+            self?.confirmDeleteSite(targetSite)
+        })
+
+        sheet.addAction(UIAlertAction(title: "取消", style: .cancel))
+        configureCenteredPopover(sheet, sourceView: sourceView)
+        present(sheet, animated: true)
+    }
+
+    private func applyUpdatedSiteCustomBand(siteId: String, newCustomBand: Int) {
+        guard let idx = config.sites.firstIndex(where: { $0.id == siteId }) else { return }
+        let norm = JWPriorityHelper.normalizeCustomBand(newCustomBand)
+        config.sites[idx].customBand = norm
+        config.save()
+        let eff = config.effectiveSiteBand(for: config.sites[idx])
+        JWLog("PRIORITY", "Updated site=\(config.sites[idx].title) customBand=\(norm) effectiveBand=\(eff)")
+        rebuildTabPills()
+        scheduleApplyProtectionAsync { [weak self] summary in
+            self?.runtime.helperBannerText = summary
+            self?.queryLiveStatusesAsync()
+        }
+    }
+
+    private func showQuickPriorityPicker(for site: SiteItem, sourceView: UIView?) {
+        let curNorm = JWPriorityHelper.normalizeCustomBand(site.customBand)
+        let clampedGlobal = JWPriorityHelper.clampSiteBand(config.targetBand)
+        let sheet = UIAlertController(
+            title: "\(site.title) · 进程保活等级",
+            message: "iOS 内存吃紧时按档位从低到高依次回收（范围 30~92 档；网络与主进程自动压阵在最高标签之上 +1/+2 档）。",
+            preferredStyle: .actionSheet
+        )
+
+        let presets: [(band: Int, title: String)] = [
+            (0, "跟随全局默认（\(clampedGlobal) 档）"),
+            (JWConstants.bandPresetCore, "🔥 核心常驻（88 档 · 最后回收）"),
+            (JWConstants.bandPresetFrequent, "⭐️ 常用保活（80 档 · 高优常驻）"),
+            (JWConstants.bandPresetSecondary, "📌 次要备选（70 档 · 优先让路）"),
+            (JWConstants.bandPresetDisposable, "🍃 随用随清（35 档 · 内存紧先清）")
+        ]
+
+        for preset in presets {
+            let prefix = (curNorm == preset.band) ? "✓ " : ""
+            sheet.addAction(UIAlertAction(title: prefix + preset.title, style: .default) { [weak self] _ in
+                self?.applyUpdatedSiteCustomBand(siteId: site.id, newCustomBand: preset.band)
+            })
+        }
+
+        let isCustomOther = curNorm > 0 && !presets.contains(where: { $0.band == curNorm })
+        let customPrefix = isCustomOther ? "✓ " : ""
+        let customLabel = isCustomOther
+            ? "🎛 自定义精确档位（当前 \(curNorm) 档，点击修改）"
+            : "🎛 手动输入精确档位 (30 ~ 92)…"
+
+        sheet.addAction(UIAlertAction(title: customPrefix + customLabel, style: .default) { [weak self] _ in
+            self?.promptCustomBandInput(for: site)
+        })
+
+        sheet.addAction(UIAlertAction(title: "取消", style: .cancel))
+        configureCenteredPopover(sheet, sourceView: sourceView)
+        present(sheet, animated: true)
+    }
+
+    private func promptCustomBandInput(for site: SiteItem) {
+        let currentEff = config.effectiveSiteBand(for: site)
+        let alert = UIAlertController(
+            title: "自定义「\(site.title)」进程档位",
+            message: "请输入 \(JWConstants.minSiteBand) ~ \(JWConstants.maxSiteBand) 之间的整数。数值越大优先级越高，越晚被系统清理（网络与主容器会自动保持在最高标签 +1/+2 档）。",
+            preferredStyle: .alert
+        )
+        alert.addTextField { tf in
+            tf.placeholder = "30 ~ 92（如 82）"
+            tf.text = "\(currentEff)"
+            tf.keyboardType = .numberPad
+            tf.clearButtonMode = .whileEditing
+        }
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        alert.addAction(UIAlertAction(title: "保存并提档", style: .default) { [weak self, weak alert] _ in
+            guard let self = self else { return }
+            let rawText = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let digits = rawText.filter { $0.isNumber }
+            guard let val = Int(digits) else { return }
+            let clamped = JWPriorityHelper.clampSiteBand(val)
+            self.applyUpdatedSiteCustomBand(siteId: site.id, newCustomBand: clamped)
+        })
+        present(alert, animated: true)
     }
 
     private func showQuickAppearancePicker(for site: SiteItem, sourceView: UIView?) {
@@ -991,7 +1366,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 urlString: site.urlString,
                 enabled: true,
                 appearanceMode: site.appearanceMode,
-                dataStoreId: UUID().uuidString
+                dataStoreId: UUID().uuidString,
+                customBand: site.customBand,
+                hibernated: false
             )
             self.config.sites.append(clone)
             self.config.selectedSiteId = clone.id
@@ -1008,6 +1385,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
               let curSite = site(forId: config.selectedSiteId) else { return }
         let siteId = curSite.id
         let spaceLabel = JWDataStoreHelper.label(for: curSite.dataStoreId)
+        let tierText = JWPriorityHelper.tierDescription(customBand: curSite.customBand, globalBand: config.targetBand)
         let sheet = UIAlertController(
             title: "\(curSite.title)（\(spaceLabel)）",
             message: wv.url?.absoluteString ?? curSite.urlString,
@@ -1024,6 +1402,12 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         })
         sheet.addAction(UIAlertAction(title: "回到初始首页", style: .default) { [weak self] _ in
             self?.reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: true)
+        })
+        sheet.addAction(UIAlertAction(title: "🌙 休眠此标签（释放内存，保留登录态）", style: .default) { [weak self] _ in
+            self?.setSiteHibernated(siteId: siteId, hibernated: true)
+        })
+        sheet.addAction(UIAlertAction(title: "🎯 保活等级：\(tierText)", style: .default) { [weak self] _ in
+            self?.showQuickPriorityPicker(for: curSite, sourceView: sourceView)
         })
         sheet.addAction(UIAlertAction(title: "复制为独立新账号分身", style: .default) { [weak self] _ in
             self?.promptCloneIsolatedSite(from: curSite)
@@ -1082,9 +1466,20 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         guard gr.state == .began else { return }
         let sheet = UIAlertController(title: "快速切换常驻 WebApp", message: nil, preferredStyle: .actionSheet)
         for s in enabledSites() {
-            let prefix = (s.id == config.selectedSiteId) ? "✓ " : ""
-            sheet.addAction(UIAlertAction(title: prefix + s.title, style: .default) { [weak self] _ in
-                self?.selectSite(byId: s.id)
+            let selPrefix = (s.id == config.selectedSiteId) ? "✓ " : ""
+            let hibPrefix = s.hibernated ? "🌙 " : ""
+            let bandSuffix = s.customBand > 0 ? " (\(s.customBand)档)" : ""
+            sheet.addAction(UIAlertAction(title: "\(selPrefix)\(hibPrefix)\(s.title)\(bandSuffix)", style: .default) { [weak self] _ in
+                if s.hibernated {
+                    self?.setSiteHibernated(siteId: s.id, hibernated: false)
+                } else {
+                    self?.selectSite(byId: s.id)
+                }
+            })
+        }
+        if let cur = site(forId: config.selectedSiteId), cur.enabled && !cur.hibernated {
+            sheet.addAction(UIAlertAction(title: "🌙 休眠当前标签（释放内存）", style: .default) { [weak self] _ in
+                self?.setSiteHibernated(siteId: cur.id, hibernated: true)
             })
         }
         sheet.addAction(UIAlertAction(title: "工作台设置", style: .default) { [weak self] _ in
@@ -1164,20 +1559,21 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func clearDataForSite(siteId: String) {
         guard let targetSite = site(forId: siteId) else { return }
+        let shouldReload = !targetSite.hibernated
         let dsId = JWDataStoreHelper.normalize(targetSite.dataStoreId)
         clearBasicAuth(forStoreId: dsId)
         let types = WKWebsiteDataStore.allWebsiteDataTypes()
         let since = Date(timeIntervalSince1970: 0)
 
         if JWDataStoreHelper.isIsolated(dsId) {
-            let store = customDataStores[dsId] ?? webViews[siteId]?.configuration.websiteDataStore
+            let store = customDataStores[dsId]
+                ?? webViews[siteId]?.configuration.websiteDataStore
+                ?? websiteDataStore(for: targetSite)
             JWLog("DATA", "Clearing isolated store for site=\(targetSite.title) store=\(String(dsId.prefix(8)))")
-            if let store = store {
-                store.removeData(ofTypes: types, modifiedSince: since) { [weak self] in
+            store.removeData(ofTypes: types, modifiedSince: since) { [weak self] in
+                if shouldReload {
                     self?.reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: true)
                 }
-            } else {
-                reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: true)
             }
             return
         }
@@ -1202,9 +1598,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 }
                 if !matched.isEmpty {
                     defStore.removeData(ofTypes: types, for: matched) {
-                        self?.reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: true)
+                        if shouldReload {
+                            self?.reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: true)
+                        }
                     }
-                } else {
+                } else if shouldReload {
                     self?.reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: true)
                 }
             }
@@ -1216,6 +1614,12 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let types = WKWebsiteDataStore.allWebsiteDataTypes()
         let since = Date(timeIntervalSince1970: 0)
         var stores: [WKWebsiteDataStore] = [.default()]
+        for s in config.sites where s.isIsolatedStore {
+            let ds = websiteDataStore(for: s)
+            if !stores.contains(where: { $0 === ds }) {
+                stores.append(ds)
+            }
+        }
         for ds in customDataStores.values where !stores.contains(where: { $0 === ds }) {
             stores.append(ds)
         }
@@ -1241,12 +1645,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let ramMB = ProcessInfo.processInfo.physicalMemory / (1024 * 1024)
         let selfPid = getpid()
         let hostSt = lastProcStatuses[selfPid]
+        let guardian = config.computedGuardianBands()
 
         var lines: [String] = []
         lines.append("=== JetWeb 诊断摘要 ===")
         lines.append("版本: v\(JWBridgeVersion()) (\(JWBridgeGitCommit())) | 系统: \(dev.systemName) \(dev.systemVersion) | 物理内存: \(ramMB) MB")
-        lines.append("策略: 目标 \(config.targetBand) 档 | 单页上限 \(config.maxMemoryMB) MB | 外观: \(config.appearanceMode) | 日志: \(config.debugLoggingEnabled ? "开启" : "关闭")")
-        lines.append("主进程: PID \(selfPid) | 档位 \(hostSt?.band ?? -1) | 内存 \(hostSt?.footprintMB ?? 0) MB")
+        lines.append("策略: 全局默认 \(config.targetBand) 档 (网络压阵 \(guardian.auxBand) 档 / 主容器 \(guardian.hostBand) 档) | 单页上限 \(config.maxMemoryMB) MB | 外观: \(config.appearanceMode) | 日志: \(config.debugLoggingEnabled ? "开启" : "关闭")")
+        lines.append("主进程: PID \(selfPid) | 实测档位 \(hostSt?.band ?? -1) | 内存 \(hostSt?.footprintMB ?? 0) MB")
 
         for s in config.sites {
             let wv = webViews[s.id]
@@ -1254,8 +1659,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let npid = JWBridgeWebViewNetworkingPID(wv)
             let gpid = JWBridgeWebViewGPUPID(wv)
             let st = (wpid > 0) ? lastProcStatuses[wpid] : nil
+            let stateLabel = !s.enabled ? "隐藏" : (s.hibernated ? "已休眠" : "运行中")
+            let effBand = config.effectiveSiteBand(for: s)
+            let bandLabel = s.customBand > 0 ? "专属\(effBand)档" : "默认\(effBand)档"
             let recMark = terminatedSiteIds.contains(s.id) ? " [曾被回收]" : ""
-            lines.append("站点[\(s.enabled ? "启用" : "暂停")]: \(s.title) | \(JWDataStoreHelper.shortBadge(for: s.dataStoreId)) | WebPID=\(wpid) NetPID=\(npid) GPUPID=\(gpid) | 档位=\(st?.band ?? -1) 内存=\(st?.footprintMB ?? 0)MB\(recMark)")
+            lines.append("站点[\(stateLabel)]: \(s.title) | \(bandLabel) | \(JWDataStoreHelper.shortBadge(for: s.dataStoreId)) | WebPID=\(wpid) NetPID=\(npid) GPUPID=\(gpid) | 实测=\(st?.band ?? -1)档 内存=\(st?.footprintMB ?? 0)MB\(recMark)")
         }
         lines.append("======================")
         return lines.joined(separator: "\n")
@@ -1270,37 +1678,64 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         try? token.write(toFile: path, atomically: true, encoding: .utf8)
     }
 
-    private func collectTargetPIDStringsOnMainThread() -> (pids: [String], sharedSnapshot: String) {
-        var ordered: [Int32] = []
-        var seen = Set<Int32>()
-        func addPID(_ p: Int32) {
-            if p > 0 && !seen.contains(p) {
-                seen.insert(p)
-                ordered.append(p)
+    private func collectTargetPIDStringsOnMainThread() -> (
+        queryPIDs: [String],
+        applySpecs: [String],
+        hostBand: Int,
+        auxBand: Int,
+        sharedSnapshot: String
+    ) {
+        let guardian = config.computedGuardianBands()
+        var orderedPIDs: [Int32] = []
+        var bandByPID: [Int32: Int] = [:]
+
+        func recordPID(_ p: Int32, desiredBand: Int) {
+            guard p > 0 else { return }
+            if let existing = bandByPID[p] {
+                if desiredBand > existing {
+                    bandByPID[p] = desiredBand
+                }
+            } else {
+                orderedPIDs.append(p)
+                bandByPID[p] = desiredBand
             }
         }
 
         let selfPid = getpid()
-        addPID(selfPid)
+        recordPID(selfPid, desiredBand: guardian.hostBand)
 
-        var sharedLines = ["host_pid=\(selfPid) band=\(config.targetBand) max_mb=\(config.maxMemoryMB)"]
+        var sharedLines = [
+            "host_pid=\(selfPid) band=\(guardian.hostBand) default_site_band=\(config.targetBand) max_mb=\(config.maxMemoryMB)"
+        ]
         var webMap: [String: Int32] = [:]
 
-        for s in enabledSites() {
+        for s in awakeSites() {
             let wv = webViews[s.id]
+            let siteBand = config.effectiveSiteBand(for: s)
             let wpid = JWBridgeWebViewContentPID(wv)
             if wpid > 0 {
-                addPID(wpid)
+                recordPID(wpid, desiredBand: siteBand)
                 webMap[s.id] = wpid
-                sharedLines.append("webcontent_pid=\(wpid) site=\(s.id)")
+                sharedLines.append("webcontent_pid=\(wpid) site=\(s.id) band=\(siteBand)")
             }
-            addPID(JWBridgeWebViewProvisionalPID(wv))
-            addPID(JWBridgeWebViewNetworkingPID(wv))
-            addPID(JWBridgeWebViewGPUPID(wv))
+            recordPID(JWBridgeWebViewProvisionalPID(wv), desiredBand: siteBand)
+            recordPID(JWBridgeWebViewNetworkingPID(wv), desiredBand: guardian.auxBand)
+            recordPID(JWBridgeWebViewGPUPID(wv), desiredBand: guardian.auxBand)
         }
         runtime.webPIDsBySiteId = webMap
 
-        return (ordered.map { String($0) }, sharedLines.joined(separator: "\n") + "\n")
+        let queryPIDs = orderedPIDs.map { "\($0)" }
+        let applySpecs = orderedPIDs.map { p in
+            let b = bandByPID[p] ?? config.targetBand
+            return "\(p):\(b)"
+        }
+        return (
+            queryPIDs: queryPIDs,
+            applySpecs: applySpecs,
+            hostBand: guardian.hostBand,
+            auxBand: guardian.auxBand,
+            sharedSnapshot: sharedLines.joined(separator: "\n") + "\n"
+        )
     }
 
     private static func writeSharedSnapshotOnBgQueue(_ text: String) {
@@ -1345,7 +1780,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         protectQueue.async { [weak self] in
             HubViewController.writeSharedSnapshotOnBgQueue(collected.sharedSnapshot)
             var args = ["--query"]
-            args.append(contentsOf: collected.pids)
+            args.append(contentsOf: collected.queryPIDs)
             var code: Int32 = -1
             let out = JWBridgeRunJetWebCtl(args, &code)
             let parsed = ProcStatus.parseHelperOutput(out)
@@ -1363,11 +1798,12 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let collected = collectTargetPIDStringsOnMainThread()
         let band = config.targetBand
         let maxMB = config.maxMemoryMB
+        let hostBand = collected.hostBand
 
         protectQueue.async { [weak self] in
             HubViewController.writeSharedSnapshotOnBgQueue(collected.sharedSnapshot)
             var args = ["--apply", "\(band)", "\(maxMB)"]
-            args.append(contentsOf: collected.pids)
+            args.append(contentsOf: collected.applySpecs)
 
             var exitCode: Int32 = -1
             let out = JWBridgeRunJetWebCtl(args, &exitCode)
@@ -1377,7 +1813,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
             let summary: String
             if exitCode == 0 {
-                summary = "✓ 已同步保活档位（目标 \(band) 档 · 单页上限 \(maxMB) MB）"
+                summary = "✓ 已同步分档保活（主容器 \(hostBand) 档 · 单页上限 \(maxMB) MB）"
             } else {
                 summary = "提档助手返回码 \(exitCode)（请确认通过 TrollStore 安装）"
             }
@@ -1392,7 +1828,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 }
                 if completion != nil || exitCode != 0 || digest != self.lastLoggedApplyDigest {
                     self.lastLoggedApplyDigest = digest
-                    JWLog("JETSAM", "apply rc=\(exitCode) target=\(band) max=\(maxMB)MB -> \(compactOut.isEmpty ? "(empty)" : compactOut)")
+                    JWLog("JETSAM", "apply rc=\(exitCode) hostBand=\(hostBand) default=\(band) max=\(maxMB)MB -> \(compactOut.isEmpty ? "(empty)" : compactOut)")
                 }
                 if !parsed.isEmpty {
                     self.lastProcStatuses = parsed
@@ -1426,11 +1862,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let maxMB = self.config.maxMemoryMB
             let epochPath = AppConfig.effectiveBgEpochPath()
             let logArg = self.config.debugLoggingEnabled ? JWLogger.logFilePath : "-"
-            JWLog("BG", "Spawning detached --bg-guard epoch=\(epoch) pids=[\(collected.pids.joined(separator: ","))]")
+            JWLog("BG", "Spawning detached --bg-guard epoch=\(epoch) specs=[\(collected.applySpecs.joined(separator: ","))]")
 
             self.protectQueue.async {
                 HubViewController.writeSharedSnapshotOnBgQueue(collected.sharedSnapshot)
-                JWBridgeSpawnDetachedBgGuard(band, maxMB, epochPath, epoch, logArg, collected.pids)
+                JWBridgeSpawnDetachedBgGuard(band, maxMB, epochPath, epoch, logArg, collected.applySpecs)
             }
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
@@ -1453,12 +1889,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     }
 
     @objc private func appDidReceiveMemoryWarning() {
-        let items = enabledSites().map { s -> String in
+        let hibCount = enabledSites().filter { $0.hibernated }.count
+        let items = awakeSites().map { s -> String in
             let wpid = JWBridgeWebViewContentPID(webViews[s.id])
             let mb = (wpid > 0) ? (lastProcStatuses[wpid]?.footprintMB ?? 0) : 0
-            return "\(s.title)(\(wpid):\(mb)MB)"
+            let eff = config.effectiveSiteBand(for: s)
+            return "\(s.title)(\(wpid):\(mb)MB@\(eff))"
         }
-        JWLog("MEM-WARN", "System memory warning! tabs=[\(items.joined(separator: ", "))]")
+        JWLog("MEM-WARN", "System memory warning! awake=[\(items.joined(separator: ", "))] hibernated=\(hibCount)")
     }
 
     private func endBackgroundGuardTask() {
