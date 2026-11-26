@@ -8,6 +8,10 @@ final class HubRuntimeState: ObservableObject {
     @Published var detachedSiteIds: Set<String> = []
     @Published var isTrimmingMemory: Bool = false
     @Published var helperBannerText: String = ""
+    @Published var systemLockdownEnabled: Bool = false
+    @Published var lockdownBypassDetected: Bool = false
+    @Published var processLockdownExempted: Bool = false
+    @Published var dataContainerPath: String = ""
 
     var onSyncStructure: ((String?) -> Void)?
     var onSetHibernated: ((String, Bool) -> Void)?
@@ -23,6 +27,7 @@ final class HubRuntimeState: ObservableObject {
     var onSendTestNotification: (() -> Void)?
     var onNotificationPolicyChanged: (() -> Void)?
     var onIdleHibernatePolicyChanged: (() -> Void)?
+    var onLockdownPolicyChanged: (() -> Void)?
     var buildDiagnosticHeader: (() -> String)?
 }
 
@@ -220,6 +225,7 @@ struct SettingsDrawerView: View {
             List {
                 glassDashboardSection
                 sitesSection
+                lockdownSection
                 memoryManagementSection
                 notificationSection
                 policyAndToolsSection
@@ -626,6 +632,13 @@ struct SettingsDrawerView: View {
                                         if site.enabled && site.autoHibernateExempt {
                                             miniTagPill(symbol: "pin.fill", text: "免休眠", role: .amber)
                                         }
+
+                                        let siteLDM = JWLockdownHelper.normalizeSite(site.lockdownMode)
+                                        if siteLDM == JWConstants.siteLockdownExempt {
+                                            miniTagPill(symbol: "bolt.fill", text: "豁免锁定", role: .emerald)
+                                        } else if siteLDM == JWConstants.siteLockdownEnforce {
+                                            miniTagPill(symbol: "exclamationmark.shield.fill", text: "锁定隔离", role: .amber)
+                                        }
                                     }
                                 }
                             }
@@ -676,6 +689,52 @@ struct SettingsDrawerView: View {
         .background(Color(JWGlassPalette.chipFill(for: role)))
         .foregroundColor(Color(JWGlassPalette.foreground(for: role)))
         .clipShape(RoundedRectangle(cornerRadius: 5.5, style: .continuous))
+    }
+
+    private var lockdownSection: some View {
+        let globalLocked = config.effectiveGlobalLockdownEnabled(
+            systemLockdownEnabled: runtime.systemLockdownEnabled,
+            bypassIgnored: runtime.lockdownBypassDetected
+        )
+        return Section(
+            header: Text("锁定模式豁免与 LockdownBypass 联动"),
+            footer: Text("自动修复 no-sandbox 下 WebKit 无法识别容器白名单的问题，实时监听 LockdownBypass 开关通知热切换，无需杀后台。信任的常驻站点豁免后完整启用 JIT、WebAssembly、WebGL 与自定义图标字体；也可在单站点设置中单独对高危外站强制开启锁定隔离。")
+        ) {
+            HStack(spacing: 8) {
+                Image(systemName: globalLocked ? "exclamationmark.shield.fill" : "bolt.shield.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(Color(JWGlassPalette.foreground(for: globalLocked ? .amber : .emerald)))
+                Text("当前默认引擎")
+                Spacer()
+                Text(globalLocked ? "锁定防护中（禁 JIT/Wasm）" : "已豁免（JIT / Wasm / 图标满血）")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundColor(Color(JWGlassPalette.foreground(for: globalLocked ? .amber : .emerald)))
+            }
+
+            HStack {
+                Text("系统锁定模式 / 白名单")
+                    .font(.subheadline)
+                Spacer()
+                let sysText = runtime.systemLockdownEnabled ? "系统已开启" : "系统未开启"
+                let bypassText = runtime.lockdownBypassDetected ? "白名单已命中 ✓" : "白名单未开"
+                Text("\(sysText) · \(bypassText)")
+                    .font(.footnote.weight(.medium))
+                    .foregroundColor(runtime.lockdownBypassDetected ? Color(JWGlassPalette.foreground(for: .teal)) : .secondary)
+            }
+
+            Picker("锁定模式全局策略", selection: Binding(
+                get: { JWLockdownHelper.normalizeGlobal(config.lockdownPolicy) },
+                set: { newMode in
+                    config.lockdownPolicy = JWLockdownHelper.normalizeGlobal(newMode)
+                    config.save()
+                    runtime.onLockdownPolicyChanged?()
+                }
+            )) {
+                Text("自动联动 LockdownBypass 白名单").tag(JWConstants.lockdownAuto)
+                Text("⚡️ 始终豁免（满血运行）").tag(JWConstants.lockdownExempt)
+                Text("🔒 强制开启锁定模式").tag(JWConstants.lockdownEnforce)
+            }
+        }
     }
 
     private var memoryManagementSection: some View {
@@ -891,6 +950,7 @@ struct AddSiteSheet: View {
     @State private var customBand: Int = 0
     @State private var notifyEnabled: Bool = true
     @State private var autoHibernateExempt: Bool = false
+    @State private var lockdownMode: String = JWConstants.siteLockdownInherit
     @State private var appearanceMode: String = JWConstants.appearanceInherit
     @State private var showingInvalidURLAlert = false
 
@@ -936,9 +996,14 @@ struct AddSiteSheet: View {
                     ))
                 }
 
-                Section(header: Text("通知、免休眠与外观")) {
+                Section(header: Text("通知、免休眠、锁定防护与外观")) {
                     Toggle("🔔 接收此站点新消息通知", isOn: $notifyEnabled)
                     Toggle("📌 免自动休眠（常驻白名单）", isOn: $autoHibernateExempt)
+                    Picker("锁定模式策略", selection: $lockdownMode) {
+                        Text("跟随全局").tag(JWConstants.siteLockdownInherit)
+                        Text("⚡️ 信任豁免（满血运行）").tag(JWConstants.siteLockdownExempt)
+                        Text("🔒 强制锁定（高危外站隔离）").tag(JWConstants.siteLockdownEnforce)
+                    }
                     Picker("外观模式", selection: $appearanceMode) {
                         Text("跟随全局").tag(JWConstants.appearanceInherit)
                         Text("跟随系统").tag(JWConstants.appearanceSystem)
@@ -996,12 +1061,13 @@ struct AddSiteSheet: View {
             customBand: customBand,
             hibernated: false,
             notifyEnabled: notifyEnabled,
-            autoHibernateExempt: autoHibernateExempt
+            autoHibernateExempt: autoHibernateExempt,
+            lockdownMode: lockdownMode
         )
         config.sites.append(item)
         config.selectedSiteId = item.id
         config.save()
-        JWLog("STORE", "Added site=\(item.title) isolated=\(useIsolatedStore) customBand=\(item.customBand) notify=\(notifyEnabled) exempt=\(autoHibernateExempt)")
+        JWLog("STORE", "Added site=\(item.title) isolated=\(useIsolatedStore) customBand=\(item.customBand) notify=\(notifyEnabled) exempt=\(autoHibernateExempt) lockdown=\(lockdownMode)")
         runtime.onSyncStructure?(item.id)
         presentationMode.wrappedValue.dismiss()
     }
@@ -1117,8 +1183,8 @@ struct SiteDetailView: View {
                 }
 
                 Section(
-                    header: Text("通知、内存释放与外观"),
-                    footer: Text("开启「免自动休眠」后，该标签不受全局闲置倒计时影响；其余后台标签在流式输出结束后静置超时会自动休眠降至 0 MB，唤醒时自动恢复休眠前的对话页面。")
+                    header: Text("通知、内存释放、锁定防护与外观"),
+                    footer: Text("信任的常驻站点豁免后完整启用 JIT / Wasm 与图标字体；若访问不信任外站，可单独为此标签开启「🔒 强制锁定」隔离防护。")
                 ) {
                     Toggle("🔔 接收此站点新消息通知", isOn: Binding(
                         get: { config.sites[idx].notifyEnabled },
@@ -1137,6 +1203,19 @@ struct SiteDetailView: View {
                             runtime.onIdleHibernatePolicyChanged?()
                         }
                     ))
+
+                    Picker("锁定模式策略", selection: Binding(
+                        get: { JWLockdownHelper.normalizeSite(config.sites[idx].lockdownMode) },
+                        set: { newMode in
+                            config.sites[idx].lockdownMode = JWLockdownHelper.normalizeSite(newMode)
+                            config.save()
+                            runtime.onLockdownPolicyChanged?()
+                        }
+                    )) {
+                        Text("跟随全局").tag(JWConstants.siteLockdownInherit)
+                        Text("⚡️ 信任豁免（满血运行）").tag(JWConstants.siteLockdownExempt)
+                        Text("🔒 强制锁定（高危外站隔离）").tag(JWConstants.siteLockdownEnforce)
+                    }
 
                     Picker("外观模式", selection: Binding(
                         get: { JWAppearanceHelper.normalizeSite(config.sites[idx].appearanceMode) },
@@ -1238,7 +1317,8 @@ struct SiteDetailView: View {
             customBand: site.customBand,
             hibernated: false,
             notifyEnabled: site.notifyEnabled,
-            autoHibernateExempt: site.autoHibernateExempt
+            autoHibernateExempt: site.autoHibernateExempt,
+            lockdownMode: site.lockdownMode
         )
         config.sites.append(clone)
         config.selectedSiteId = clone.id
@@ -1335,9 +1415,9 @@ enum LogFilterCategory: String, CaseIterable, Identifiable {
         case .all:
             return true
         case .jetsam:
-            return line.contains("[JETSAM]") || line.contains("[MEM-TRIM]") || line.contains("[HIBERNATE]") || line.contains("[NOTIFY]") || line.contains("[BG]") || line.contains("[BG-GUARD]") || line.contains("[FG]") || line.contains("[MEM-WARN]") || line.contains("[BOOT]")
+            return line.contains("[JETSAM]") || line.contains("[LOCKDOWN]") || line.contains("[MEM-TRIM]") || line.contains("[HIBERNATE]") || line.contains("[NOTIFY]") || line.contains("[BG]") || line.contains("[BG-GUARD]") || line.contains("[FG]") || line.contains("[MEM-WARN]") || line.contains("[BOOT]")
         case .web:
-            return line.contains("[WEBKIT]") || line.contains("[NAV]") || line.contains("[NAV-FAIL]") || line.contains("[TERM]") || line.contains("[JS-ERR]")
+            return line.contains("[WEBKIT]") || line.contains("[LOCKDOWN]") || line.contains("[NAV]") || line.contains("[NAV-FAIL]") || line.contains("[TERM]") || line.contains("[JS-ERR]")
         case .auth:
             return line.contains("[AUTH]") || line.contains("[STORE]") || line.contains("[DATA]")
         }
@@ -1495,6 +1575,9 @@ struct DiagnosticLogView: View {
         }
         if line.contains("OVER") || line.contains("[JS-ERR]") {
             return .orange
+        }
+        if line.contains("[LOCKDOWN]") {
+            return Color(JWGlassPalette.foreground(for: .cobalt))
         }
         if line.contains("[MEM-TRIM]") || line.contains("[HIBERNATE]") {
             return Color(JWGlassPalette.foreground(for: .teal))

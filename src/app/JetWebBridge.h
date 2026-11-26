@@ -7,7 +7,7 @@
 #import <WebKit/WebKit.h>
 #import <Security/Security.h>
 
-#define JW_VERSION "0.1.0"
+#define JW_VERSION "0.2.0"
 #ifndef JW_COMMIT
 #define JW_COMMIT "dev"
 #endif
@@ -40,6 +40,16 @@ FOUNDATION_EXPORT void JWBridgeTrimWebViewMemory(WKWebView * _Nullable webView,
                                                  BOOL clearBFCache,
                                                  BOOL suspendMedia);
 FOUNDATION_EXPORT void JWBridgeReleaseHostMemory(void);
+
+FOUNDATION_EXPORT NSString *JWBridgeResolveDataContainerPath(void);
+FOUNDATION_EXPORT BOOL JWBridgeIsLockdownBypassIgnored(void);
+FOUNDATION_EXPORT BOOL JWBridgeIsSystemLockdownModeEnabled(void);
+/// overrideMode: 0 = auto (follow system + LockdownBypass cpmconfig_ignore), 1 = force exempt, 2 = force lockdown.
+/// Returns YES when process-level Lockdown Mode exemption is active (_setCaptivePortalModeEnabledGloballyForTesting:NO).
+FOUNDATION_EXPORT BOOL JWBridgeSyncProcessLockdownState(int overrideMode);
+FOUNDATION_EXPORT void JWBridgeRegisterLockdownConfigChangedHandler(void (^handler)(void));
+FOUNDATION_EXPORT void JWBridgeApplyWebpageLockdownPreference(WKWebpagePreferences * _Nullable prefs,
+                                                              BOOL lockdownEnabled);
 
 FOUNDATION_EXPORT NSDictionary<NSString *, NSString *> *JWBridgeExtractLeafCertInfo(SecTrustRef trust);
 FOUNDATION_EXPORT NSURLCredential *JWBridgeCredentialForAcceptedTrust(SecTrustRef trust);

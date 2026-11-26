@@ -27,7 +27,57 @@ enum JWConstants {
     static let appearanceLight = "light"
     static let appearanceDark = "dark"
 
+    static let lockdownAuto = "auto"
+    static let lockdownExempt = "exempt"
+    static let lockdownEnforce = "enforce"
+
+    static let siteLockdownInherit = "inherit"
+    static let siteLockdownExempt = "exempt"
+    static let siteLockdownEnforce = "enforce"
+
     static let dataStoreDefault = "default"
+}
+
+enum JWLockdownHelper {
+    static func normalizeGlobal(_ raw: String?) -> String {
+        guard let raw = raw else { return JWConstants.lockdownAuto }
+        if raw == JWConstants.lockdownExempt || raw == JWConstants.lockdownEnforce {
+            return raw
+        }
+        return JWConstants.lockdownAuto
+    }
+
+    static func normalizeSite(_ raw: String?) -> String {
+        guard let raw = raw else { return JWConstants.siteLockdownInherit }
+        if raw == JWConstants.siteLockdownExempt || raw == JWConstants.siteLockdownEnforce {
+            return raw
+        }
+        return JWConstants.siteLockdownInherit
+    }
+
+    static func bridgeOverrideMode(for globalPolicy: String) -> Int32 {
+        switch normalizeGlobal(globalPolicy) {
+        case JWConstants.lockdownExempt: return 1
+        case JWConstants.lockdownEnforce: return 2
+        default: return 0
+        }
+    }
+
+    static func globalLabel(for mode: String) -> String {
+        switch normalizeGlobal(mode) {
+        case JWConstants.lockdownExempt: return "始终豁免（满血运行）"
+        case JWConstants.lockdownEnforce: return "强制开启锁定模式"
+        default: return "自动联动白名单"
+        }
+    }
+
+    static func siteLabel(for mode: String) -> String {
+        switch normalizeSite(mode) {
+        case JWConstants.siteLockdownExempt: return "信任豁免（满血运行）"
+        case JWConstants.siteLockdownEnforce: return "强制锁定（高危隔离）"
+        default: return "跟随全局"
+        }
+    }
 }
 
 enum JWAppearanceHelper {
@@ -191,6 +241,8 @@ struct SiteItem: Identifiable, Equatable {
     var notifyEnabled: Bool
     /// true = 免自动休眠白名单（不受全局闲置倒计时影响）
     var autoHibernateExempt: Bool
+    /// 单站点锁定模式策略：inherit = 跟随全局；exempt = 信任豁免；enforce = 强制锁定模式
+    var lockdownMode: String
     /// 持久化的上次停留对话/子页面地址（重启或休眠唤醒后精准恢复）
     var lastKnownURL: String
 
@@ -205,6 +257,7 @@ struct SiteItem: Identifiable, Equatable {
         hibernated: Bool = false,
         notifyEnabled: Bool = true,
         autoHibernateExempt: Bool = false,
+        lockdownMode: String = JWConstants.siteLockdownInherit,
         lastKnownURL: String = ""
     ) {
         self.id = id
@@ -217,6 +270,7 @@ struct SiteItem: Identifiable, Equatable {
         self.hibernated = hibernated
         self.notifyEnabled = notifyEnabled
         self.autoHibernateExempt = autoHibernateExempt
+        self.lockdownMode = JWLockdownHelper.normalizeSite(lockdownMode)
         self.lastKnownURL = JWURLHelper.sanitizePersistedURL(lastKnownURL)
     }
 
@@ -235,6 +289,7 @@ struct SiteItem: Identifiable, Equatable {
         let hibernated = (dict["hibernated"] as? NSNumber)?.boolValue ?? (dict["hibernated"] as? Bool) ?? false
         let notifyEnabled = (dict["notifyEnabled"] as? NSNumber)?.boolValue ?? (dict["notifyEnabled"] as? Bool) ?? true
         let autoHibernateExempt = (dict["autoHibernateExempt"] as? NSNumber)?.boolValue ?? (dict["autoHibernateExempt"] as? Bool) ?? false
+        let lockdownMode = JWLockdownHelper.normalizeSite(dict["lockdownMode"] as? String)
         let lastKnownURL = JWURLHelper.sanitizePersistedURL(dict["lastKnownURL"] as? String)
         return SiteItem(
             id: sid,
@@ -247,6 +302,7 @@ struct SiteItem: Identifiable, Equatable {
             hibernated: hibernated,
             notifyEnabled: notifyEnabled,
             autoHibernateExempt: autoHibernateExempt,
+            lockdownMode: lockdownMode,
             lastKnownURL: lastKnownURL
         )
     }
@@ -262,7 +318,8 @@ struct SiteItem: Identifiable, Equatable {
             "customBand": JWPriorityHelper.normalizeCustomBand(customBand),
             "hibernated": hibernated,
             "notifyEnabled": notifyEnabled,
-            "autoHibernateExempt": autoHibernateExempt
+            "autoHibernateExempt": autoHibernateExempt,
+            "lockdownMode": JWLockdownHelper.normalizeSite(lockdownMode)
         ]
         let cleanLast = JWURLHelper.sanitizePersistedURL(lastKnownURL)
         if !cleanLast.isEmpty {
@@ -377,6 +434,40 @@ final class AppConfig: ObservableObject {
     @Published var idleDetachSeconds: Int = JWConstants.defaultIdleDetachSeconds
     /// 极端系统内存告警且无损脱水后仍超危时，按「低档位优先 → 最久未看」自动休眠次要非当前标签
     @Published var autoHibernateOnCriticalMemory: Bool = true
+    /// 锁定模式全局策略：auto = 自动联动 LockdownBypass 白名单；exempt = 始终豁免；enforce = 强制开启锁定模式
+    @Published var lockdownPolicy: String = JWConstants.lockdownAuto
+
+    func effectiveGlobalLockdownEnabled(systemLockdownEnabled: Bool, bypassIgnored: Bool) -> Bool {
+        switch JWLockdownHelper.normalizeGlobal(lockdownPolicy) {
+        case JWConstants.lockdownExempt:
+            return false
+        case JWConstants.lockdownEnforce:
+            return true
+        default:
+            if bypassIgnored {
+                return false
+            }
+            return systemLockdownEnabled
+        }
+    }
+
+    func effectiveSiteLockdownEnabled(
+        for site: SiteItem,
+        systemLockdownEnabled: Bool,
+        bypassIgnored: Bool
+    ) -> Bool {
+        switch JWLockdownHelper.normalizeSite(site.lockdownMode) {
+        case JWConstants.siteLockdownExempt:
+            return false
+        case JWConstants.siteLockdownEnforce:
+            return true
+        default:
+            return effectiveGlobalLockdownEnabled(
+                systemLockdownEnabled: systemLockdownEnabled,
+                bypassIgnored: bypassIgnored
+            )
+        }
+    }
 
     func hasAwakeNotifySite() -> Bool {
         guard notificationsEnabled else { return false }
@@ -526,6 +617,9 @@ final class AppConfig: ObservableObject {
         if let ahc = (root["autoHibernateOnCriticalMemory"] as? NSNumber)?.boolValue ?? (root["autoHibernateOnCriticalMemory"] as? Bool) {
             cfg.autoHibernateOnCriticalMemory = ahc
         }
+        if let lp = root["lockdownPolicy"] as? String {
+            cfg.lockdownPolicy = JWLockdownHelper.normalizeGlobal(lp)
+        }
         return cfg
     }
 
@@ -547,7 +641,8 @@ final class AppConfig: ObservableObject {
             "idleHibernateMinutes": idleHibernateMinutes,
             "autoMemoryTrimEnabled": autoMemoryTrimEnabled,
             "idleDetachSeconds": idleDetachSeconds,
-            "autoHibernateOnCriticalMemory": autoHibernateOnCriticalMemory
+            "autoHibernateOnCriticalMemory": autoHibernateOnCriticalMemory,
+            "lockdownPolicy": JWLockdownHelper.normalizeGlobal(lockdownPolicy)
         ]
         guard let json = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]) else {
             return false

@@ -3,8 +3,10 @@
  */
 
 #import "JetWebBridge.h"
+#import <CoreFoundation/CoreFoundation.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <objc/message.h>
+#include <dlfcn.h>
 #include <spawn.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -437,4 +439,238 @@ void JWBridgeTrimWebViewMemory(WKWebView *webView, BOOL clearBFCache, BOOL suspe
 void JWBridgeReleaseHostMemory(void) {
     [[NSURLCache sharedURLCache] removeAllCachedResponses];
     (void)malloc_zone_pressure_relief(NULL, 0);
+}
+
+// MARK: - iOS Lockdown Mode (CaptivePortal) Container Whitelist & Per-Webpage Bridge
+
+static NSString *sCachedDataContainerPath = nil;
+static void (^sLockdownConfigChangedBlock)(void) = nil;
+static int sLockdownDarwinObserverToken = 0;
+
+NSString *JWBridgeResolveDataContainerPath(void) {
+    @synchronized([NSBundle mainBundle]) {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL isDir = NO;
+        if (sCachedDataContainerPath.length > 0 &&
+            [fm fileExistsAtPath:sCachedDataContainerPath isDirectory:&isDir] && isDir) {
+            return sCachedDataContainerPath;
+        }
+
+        NSString *resolved = nil;
+
+        /* 1. Primary: MobileCoreServices -> LSApplicationProxy.dataContainerURL */
+        static dispatch_once_t lsOnce;
+        dispatch_once(&lsOnce, ^{
+            (void)dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
+        });
+        Class proxyCls = NSClassFromString(@"LSApplicationProxy");
+        SEL proxySel = NSSelectorFromString(@"applicationProxyForIdentifier:");
+        SEL urlSel = NSSelectorFromString(@"dataContainerURL");
+        if (proxyCls && [proxyCls respondsToSelector:proxySel]) {
+            @try {
+                id proxy = ((id (*)(id, SEL, NSString *))objc_msgSend)(proxyCls, proxySel, @"com.lili.jetweb");
+                if (proxy && [proxy respondsToSelector:urlSel]) {
+                    NSURL *containerURL = ((NSURL *(*)(id, SEL))objc_msgSend)(proxy, urlSel);
+                    NSString *cand = containerURL.path;
+                    if (cand.length > 0 && [fm fileExistsAtPath:cand isDirectory:&isDir] && isDir) {
+                        resolved = cand;
+                    }
+                }
+            } @catch (__unused NSException *ex) {}
+        }
+
+        /* 2. Fallback: scan /var/mobile/Containers/Data/Application/*/.com.apple.mobile_container_manager.metadata.plist */
+        if (resolved.length == 0) {
+            NSString *appsRoot = @"/var/mobile/Containers/Data/Application";
+            NSArray<NSString *> *uuidDirs = [fm contentsOfDirectoryAtPath:appsRoot error:nil];
+            for (NSString *uuidName in uuidDirs) {
+                NSString *candDir = [appsRoot stringByAppendingPathComponent:uuidName];
+                NSString *metaPath = [candDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+                NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
+                NSString *ident = [meta isKindOfClass:[NSDictionary class]] ? meta[@"MCMMetadataIdentifier"] : nil;
+                if ([ident isKindOfClass:[NSString class]] && [ident isEqualToString:@"com.lili.jetweb"]) {
+                    resolved = candDir;
+                    break;
+                }
+            }
+        }
+
+        /* 3. Secondary fallback if NSHomeDirectory() already points to an app container */
+        if (resolved.length == 0) {
+            NSString *home = NSHomeDirectory();
+            if ([home hasPrefix:@"/var/mobile/Containers/Data/Application/"] &&
+                [fm fileExistsAtPath:home isDirectory:&isDir] && isDir) {
+                resolved = home;
+            }
+        }
+
+        if (resolved.length > 0) {
+            sCachedDataContainerPath = [resolved copy];
+            return sCachedDataContainerPath;
+        }
+        return @"";
+    }
+}
+
+BOOL JWBridgeIsLockdownBypassIgnored(void) {
+    NSString *containerPath = JWBridgeResolveDataContainerPath();
+    if (containerPath.length == 0) return NO;
+    NSString *ignoreMarker = [containerPath stringByAppendingPathComponent:@"System/Preferences/com.apple.WebKit.cpmconfig_ignore"];
+    const char *cpath = ignoreMarker.fileSystemRepresentation;
+    return (cpath && access(cpath, F_OK) == 0) ? YES : NO;
+}
+
+static BOOL sInitialRawSystemCaptivePortalMode = NO;
+
+static void JWCaptureInitialSystemCaptivePortalModeOnce(void) {
+    static dispatch_once_t rawOnce;
+    dispatch_once(&rawOnce, ^{
+        Class sysPrefCls = NSClassFromString(@"_WKSystemPreferences");
+        SEL cpmSel = NSSelectorFromString(@"isCaptivePortalModeEnabled");
+        if (sysPrefCls && [sysPrefCls respondsToSelector:cpmSel]) {
+            @try {
+                sInitialRawSystemCaptivePortalMode = ((BOOL (*)(id, SEL))objc_msgSend)(sysPrefCls, cpmSel);
+            } @catch (__unused NSException *ex) {}
+        }
+    });
+}
+
+BOOL JWBridgeIsSystemLockdownModeEnabled(void) {
+    JWCaptureInitialSystemCaptivePortalModeOnce();
+
+    /* 1. Primary on iOS 16+: LockdownMode.framework -> [[LockdownModeManager shared] enabled]
+     *    (unmodified by +[WKProcessPool _setCaptivePortalModeEnabledGloballyForTesting:]) */
+    static dispatch_once_t ldmOnce;
+    dispatch_once(&ldmOnce, ^{
+        (void)dlopen("/System/Library/PrivateFrameworks/LockdownMode.framework/LockdownMode", RTLD_LAZY);
+    });
+    Class ldmCls = NSClassFromString(@"LockdownModeManager");
+    SEL sharedSel = NSSelectorFromString(@"shared");
+    SEL enabledSel = NSSelectorFromString(@"enabled");
+    if (ldmCls && [ldmCls respondsToSelector:sharedSel]) {
+        @try {
+            id mgr = ((id (*)(id, SEL))objc_msgSend)(ldmCls, sharedSel);
+            if (mgr && [mgr respondsToSelector:enabledSel]) {
+                return ((BOOL (*)(id, SEL))objc_msgSend)(mgr, enabledSel);
+            }
+        } @catch (__unused NSException *ex) {}
+    }
+
+    /* 2. Global preferences LDMGlobalEnabled */
+    Boolean hasKey = 0;
+    Boolean cfEnabled = CFPreferencesGetAppBooleanValue(
+        CFSTR("LDMGlobalEnabled"),
+        kCFPreferencesAnyApplication,
+        &hasKey
+    );
+    if (hasKey) {
+        return cfEnabled ? YES : NO;
+    }
+
+    NSDictionary *globalPrefs = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/.GlobalPreferences.plist"];
+    id ldmVal = [globalPrefs isKindOfClass:[NSDictionary class]] ? globalPrefs[@"LDMGlobalEnabled"] : nil;
+    if ([ldmVal respondsToSelector:@selector(boolValue)]) {
+        return [ldmVal boolValue];
+    }
+
+    return sInitialRawSystemCaptivePortalMode;
+}
+
+BOOL JWBridgeSyncProcessLockdownState(int overrideMode) {
+    JWCaptureInitialSystemCaptivePortalModeOnce();
+
+    SEL setSel = NSSelectorFromString(@"_setCaptivePortalModeEnabledGloballyForTesting:");
+    SEL clearSel = NSSelectorFromString(@"_clearCaptivePortalModeEnabledGloballyForTesting");
+    Class poolCls = [WKProcessPool class];
+
+    if (overrideMode == 1) {
+        if ([poolCls respondsToSelector:setSel]) {
+            @try {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(poolCls, setSel, NO);
+            } @catch (__unused NSException *ex) {}
+        }
+        return YES;
+    }
+
+    if (overrideMode == 2) {
+        if ([poolCls respondsToSelector:setSel]) {
+            @try {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(poolCls, setSel, YES);
+            } @catch (__unused NSException *ex) {}
+        }
+        return NO;
+    }
+
+    /* overrideMode == 0: follow system + LockdownBypass container whitelist */
+    BOOL hasBypassIgnore = JWBridgeIsLockdownBypassIgnored();
+    if (hasBypassIgnore) {
+        if ([poolCls respondsToSelector:setSel]) {
+            @try {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(poolCls, setSel, NO);
+            } @catch (__unused NSException *ex) {}
+        }
+        return YES;
+    }
+
+    if ([poolCls respondsToSelector:clearSel]) {
+        @try {
+            ((void (*)(id, SEL))objc_msgSend)(poolCls, clearSel);
+        } @catch (__unused NSException *ex) {}
+    }
+    return NO;
+}
+
+static void JWDarwinLockdownConfigChangedCallback(
+    __unused CFNotificationCenterRef center,
+    __unused void *observer,
+    __unused CFStringRef name,
+    __unused const void *object,
+    __unused CFDictionaryRef userInfo
+) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        void (^cb)(void) = nil;
+        @synchronized([NSBundle mainBundle]) {
+            cb = sLockdownConfigChangedBlock;
+        }
+        if (cb) {
+            cb();
+        }
+    });
+}
+
+void JWBridgeRegisterLockdownConfigChangedHandler(void (^handler)(void)) {
+    @synchronized([NSBundle mainBundle]) {
+        sLockdownConfigChangedBlock = [handler copy];
+    }
+    static dispatch_once_t regOnce;
+    dispatch_once(&regOnce, ^{
+        CFNotificationCenterRef darwin = CFNotificationCenterGetDarwinNotifyCenter();
+        if (darwin) {
+            CFNotificationCenterAddObserver(
+                darwin,
+                &sLockdownDarwinObserverToken,
+                JWDarwinLockdownConfigChangedCallback,
+                CFSTR("WKCaptivePortalModeContainerConfigurationChanged"),
+                NULL,
+                CFNotificationSuspensionBehaviorDeliverImmediately
+            );
+        }
+    });
+}
+
+void JWBridgeApplyWebpageLockdownPreference(WKWebpagePreferences *prefs, BOOL lockdownEnabled) {
+    if (!prefs) return;
+    SEL pubSel = NSSelectorFromString(@"setLockdownModeEnabled:");
+    if ([prefs respondsToSelector:pubSel]) {
+        @try {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(prefs, pubSel, lockdownEnabled);
+            return;
+        } @catch (__unused NSException *ex) {}
+    }
+    SEL privSel = NSSelectorFromString(@"_setCaptivePortalModeEnabled:");
+    if ([prefs respondsToSelector:privSel]) {
+        @try {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(prefs, privSel, lockdownEnabled);
+        } @catch (__unused NSException *ex) {}
+    }
 }

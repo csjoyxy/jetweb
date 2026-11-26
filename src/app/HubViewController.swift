@@ -358,6 +358,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private var webViews: [String: WKWebView] = [:]
     private var webViewStoreIds: [String: String] = [:]
+    private var webViewLockdownStates: [String: Bool] = [:]
     private var customDataStores: [String: WKWebsiteDataStore] = [:]
     private var knownIsolatedStoreIds: Set<String> = []
     private var errorOverlays: [String: ErrorOverlayView] = [:]
@@ -387,6 +388,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private var lastAutoDeepTrimUptime: TimeInterval = 0
     private var lastMemWarningUptime: TimeInterval = 0
     private var lastLoggedApplyDigest: String = ""
+    private var lastLoggedLockdownDigest: String = ""
 
     private let protectQueue = DispatchQueue(label: "com.lili.jetweb.protect")
     private let trustEvalQueue = DispatchQueue(label: "com.lili.jetweb.trust")
@@ -479,6 +481,16 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             self?.armDetachedJetsamGuardForBackgroundTransition(reason: "notify-guard-ending")
         }
         bindRuntimeCallbacks()
+
+        /*
+         * CRITICAL: Synchronize Lockdown Mode / LockdownBypass container whitelist state
+         * BEFORE instantiating the first WKWebView so the initial WebContent XPC process
+         * launches directly in full non-CaptivePortal mode (JIT + Wasm + WebGL + custom fonts).
+         */
+        syncLockdownModeEnvironment(reason: "boot-pre-webview", recreateAffectedWebViews: false)
+        JWBridgeRegisterLockdownConfigChangedHandler { [weak self] in
+            self?.syncLockdownModeEnvironment(reason: "darwin-notify", recreateAffectedWebViews: true)
+        }
 
         protectQueue.async {
             var code: Int32 = -1
@@ -628,8 +640,88 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             self.rebuildTabPills()
             self.evaluateIdleAutoHibernation(reason: "policy-updated")
         }
+        runtime.onLockdownPolicyChanged = { [weak self] in
+            self?.syncLockdownModeEnvironment(reason: "user-policy", recreateAffectedWebViews: true)
+        }
         runtime.buildDiagnosticHeader = { [weak self] in
             self?.buildDiagnosticHeaderText() ?? ""
+        }
+    }
+
+    private func syncLockdownModeEnvironment(reason: String, recreateAffectedWebViews: Bool) {
+        let overrideMode = JWLockdownHelper.bridgeOverrideMode(for: config.lockdownPolicy)
+        let procExempted = JWBridgeSyncProcessLockdownState(overrideMode)
+        let sysLDM = JWBridgeIsSystemLockdownModeEnabled()
+        let bypass = JWBridgeIsLockdownBypassIgnored()
+        let container = JWBridgeResolveDataContainerPath()
+
+        runtime.systemLockdownEnabled = sysLDM
+        runtime.lockdownBypassDetected = bypass
+        runtime.processLockdownExempted = procExempted
+        runtime.dataContainerPath = container
+
+        let digest = "\(config.lockdownPolicy)|\(sysLDM)|\(bypass)|\(procExempted)|\(container.isEmpty ? 0 : 1)"
+        let forceLog = (reason == "boot-pre-webview" || reason == "darwin-notify" || reason == "user-policy")
+        if forceLog || digest != lastLoggedLockdownDigest {
+            lastLoggedLockdownDigest = digest
+            let shortContainer = container.isEmpty ? "(none)" : URL(fileURLWithPath: container).lastPathComponent
+            JWLog("LOCKDOWN", "sync reason=\(reason) policy=\(config.lockdownPolicy) sysLDM=\(sysLDM) bypassIgnore=\(bypass) procExempt=\(procExempted) container=\(shortContainer)")
+        }
+
+        guard recreateAffectedWebViews else { return }
+
+        var recreatedTitles: [String] = []
+        var anyNowExempt = false
+        var anyNowLocked = false
+
+        for s in awakeSites() {
+            let desiredLockdown = config.effectiveSiteLockdownEnabled(
+                for: s,
+                systemLockdownEnabled: sysLDM,
+                bypassIgnored: bypass
+            )
+            if let prevLockdown = webViewLockdownStates[s.id], prevLockdown != desiredLockdown {
+                snapshotLiveURLBeforeHibernate(siteId: s.id)
+                teardownWebView(forSiteId: s.id)
+                recreatedTitles.append(s.title)
+                if desiredLockdown {
+                    anyNowLocked = true
+                } else {
+                    anyNowExempt = true
+                }
+            }
+        }
+
+        if !recreatedTitles.isEmpty {
+            pendingURLPersistWorkItem?.cancel()
+            pendingURLPersistWorkItem = nil
+            config.save()
+            JWLog("LOCKDOWN", "Live-recreating \(recreatedTitles.count) WebView(s) due to lockdown state flip [reason=\(reason)]: \(recreatedTitles.joined(separator: ", "))")
+            syncWebViewsWithConfig(preferredSelectId: config.selectedSiteId)
+
+            if UIApplication.shared.applicationState == .active {
+                if anyNowExempt && !anyNowLocked {
+                    showTopGlassToast(
+                        symbol: "bolt.shield.fill",
+                        tint: .systemGreen,
+                        text: "已豁免锁定模式 · JIT / Wasm / 图标满血生效"
+                    )
+                } else if anyNowLocked && !anyNowExempt {
+                    showTopGlassToast(
+                        symbol: "exclamationmark.shield.fill",
+                        tint: .systemOrange,
+                        text: "已切换至锁定模式隔离防护"
+                    )
+                } else {
+                    showTopGlassToast(
+                        symbol: "bolt.shield.fill",
+                        tint: .systemBlue,
+                        text: "锁定模式策略已按站点实时生效"
+                    )
+                }
+            }
+        } else {
+            rebuildTabPills()
         }
     }
 
@@ -1547,11 +1639,17 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func createWebView(for site: SiteItem) -> WKWebView {
         let normStoreId = JWDataStoreHelper.normalize(site.dataStoreId)
+        let lockdownOn = config.effectiveSiteLockdownEnabled(
+            for: site,
+            systemLockdownEnabled: runtime.systemLockdownEnabled,
+            bypassIgnored: runtime.lockdownBypassDetected
+        )
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = websiteDataStore(for: site)
         cfg.allowsInlineMediaPlayback = true
         cfg.mediaTypesRequiringUserActionForPlayback = []
         cfg.defaultWebpagePreferences.allowsContentJavaScript = true
+        JWBridgeApplyWebpageLockdownPreference(cfg.defaultWebpagePreferences, lockdownOn)
         cfg.userContentController.addUserScript(WebScripts.compatPolyfillScript())
         cfg.userContentController.addUserScript(WebScripts.inputContrastFixScript())
         cfg.userContentController.addUserScript(WebScripts.scrollAnchorStabilizerScript())
@@ -1602,12 +1700,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         ])
         errorOverlays[capturedId] = overlay
         webViewStoreIds[capturedId] = normStoreId
+        webViewLockdownStates[capturedId] = lockdownOn
 
         applyAppearanceStyle(to: wv, for: site)
 
         let shortStore = JWDataStoreHelper.isIsolated(normStoreId) ? String(normStoreId.prefix(8)) : "default"
         let effBand = config.effectiveSiteBand(for: site)
-        JWLog("WEBKIT", "Create WebView site=\(site.title) store=\(shortStore) band=\(effBand) appearance=\(site.appearanceMode)")
+        JWLog("WEBKIT", "Create WebView site=\(site.title) store=\(shortStore) band=\(effBand) lockdown=\(lockdownOn ? "ON" : "EXEMPT") appearance=\(site.appearanceMode)")
 
         let savedMem = JWURLHelper.sanitizePersistedURL(lastKnownURLBySiteId[site.id])
         let savedCfg = JWURLHelper.sanitizePersistedURL(site.lastKnownURL)
@@ -1714,6 +1813,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         old.removeFromSuperview()
         webViews.removeValue(forKey: siteId)
         webViewStoreIds.removeValue(forKey: siteId)
+        webViewLockdownStates.removeValue(forKey: siteId)
         errorOverlays.removeValue(forKey: siteId)
         terminatedSiteIds.remove(siteId)
         detachedSiteIds.remove(siteId)
@@ -1771,8 +1871,16 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         for s in awake {
             let desiredStoreId = JWDataStoreHelper.normalize(s.dataStoreId)
+            let desiredLockdown = config.effectiveSiteLockdownEnabled(
+                for: s,
+                systemLockdownEnabled: runtime.systemLockdownEnabled,
+                bypassIgnored: runtime.lockdownBypassDetected
+            )
             if let currentStoreId = webViewStoreIds[s.id], currentStoreId != desiredStoreId {
                 clearLastKnownURL(forSiteId: s.id)
+                teardownWebView(forSiteId: s.id)
+            } else if let currentLockdown = webViewLockdownStates[s.id], currentLockdown != desiredLockdown {
+                snapshotLiveURLBeforeHibernate(siteId: s.id)
                 teardownWebView(forSiteId: s.id)
             }
             if webViews[s.id] == nil {
@@ -2148,6 +2256,23 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         return config.idleHibernateMinutes > 0 ? "\(config.idleHibernateMinutes)分自动眠" : "全局已关"
     }
 
+    private func lockdownTrailingText(for site: SiteItem) -> String {
+        let norm = JWLockdownHelper.normalizeSite(site.lockdownMode)
+        let effLocked = config.effectiveSiteLockdownEnabled(
+            for: site,
+            systemLockdownEnabled: runtime.systemLockdownEnabled,
+            bypassIgnored: runtime.lockdownBypassDetected
+        )
+        switch norm {
+        case JWConstants.siteLockdownExempt:
+            return "信任豁免"
+        case JWConstants.siteLockdownEnforce:
+            return "强制锁定"
+        default:
+            return effLocked ? "跟随(锁定中)" : "跟随(已豁免)"
+        }
+    }
+
     private func presentGlassSheet(_ sheet: JWGlassSheetController) {
         guard view.window != nil, presentedViewController == nil else { return }
         let globalMode = JWAppearanceHelper.normalizeGlobal(config.appearanceMode)
@@ -2176,6 +2301,22 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             chips.append(JWGlassChipItem(symbol: "lock.shield.fill", text: "独立空间", tint: .systemTeal))
         } else {
             chips.append(JWGlassChipItem(symbol: "person.2.fill", text: "共享空间", tint: .secondaryLabel))
+        }
+
+        let showLDMChip = runtime.systemLockdownEnabled
+            || JWLockdownHelper.normalizeGlobal(config.lockdownPolicy) != JWConstants.lockdownAuto
+            || JWLockdownHelper.normalizeSite(targetSite.lockdownMode) != JWConstants.siteLockdownInherit
+        if showLDMChip {
+            let isLocked = config.effectiveSiteLockdownEnabled(
+                for: targetSite,
+                systemLockdownEnabled: runtime.systemLockdownEnabled,
+                bypassIgnored: runtime.lockdownBypassDetected
+            )
+            if isLocked {
+                chips.append(JWGlassChipItem(symbol: "exclamationmark.shield.fill", text: "锁定隔离", tint: .systemOrange))
+            } else {
+                chips.append(JWGlassChipItem(symbol: "bolt.fill", text: "豁免满血", tint: .systemGreen))
+            }
         }
 
         if targetSite.autoHibernateExempt {
@@ -2265,6 +2406,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             })
         }
 
+        let effSiteLocked = config.effectiveSiteLockdownEnabled(
+            for: targetSite,
+            systemLockdownEnabled: runtime.systemLockdownEnabled,
+            bypassIgnored: runtime.lockdownBypassDetected
+        )
         let configGroup: [JWGlassRowItem] = [
             JWGlassRowItem(
                 symbol: targetSite.autoHibernateExempt ? "pin.fill" : "clock.arrow.circlepath",
@@ -2273,6 +2419,15 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 trailingText: autoHibernateTrailingText(for: targetSite)
             ) { [weak self] in
                 self?.toggleSiteAutoHibernateExempt(siteId: targetSite.id)
+            },
+            JWGlassRowItem(
+                symbol: effSiteLocked ? "exclamationmark.shield.fill" : "bolt.fill",
+                tint: effSiteLocked ? .systemOrange : .systemGreen,
+                title: "锁定模式防护",
+                trailingText: lockdownTrailingText(for: targetSite),
+                showsChevron: true
+            ) { [weak self] in
+                self?.showQuickLockdownPicker(for: targetSite, sourceView: sourceView)
             },
             JWGlassRowItem(
                 symbol: "bolt.shield.fill",
@@ -2460,6 +2615,50 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         presentGlassSheet(sheet)
     }
 
+    private func showQuickLockdownPicker(for site: SiteItem, sourceView: UIView?) {
+        let cur = JWLockdownHelper.normalizeSite(site.lockdownMode)
+        let globalLocked = config.effectiveGlobalLockdownEnabled(
+            systemLockdownEnabled: runtime.systemLockdownEnabled,
+            bypassIgnored: runtime.lockdownBypassDetected
+        )
+        let inheritTrail = globalLocked ? "当前锁定防护" : "当前豁免满血"
+        let options: [(mode: String, symbol: String, tint: UIColor, title: String, trail: String)] = [
+            (JWConstants.siteLockdownInherit, "sparkles", .systemBlue, "跟随全局策略", inheritTrail),
+            (JWConstants.siteLockdownExempt, "bolt.fill", .systemGreen, "信任豁免（满血运行）", "启用 JIT / Wasm / 字体"),
+            (JWConstants.siteLockdownEnforce, "exclamationmark.shield.fill", .systemOrange, "强制锁定（高危外站隔离）", "CaptivePortal 隔离")
+        ]
+
+        let rows: [JWGlassRowItem] = options.map { opt in
+            JWGlassRowItem(
+                symbol: opt.symbol,
+                tint: opt.tint,
+                title: opt.title,
+                trailingText: opt.trail,
+                isSelected: opt.mode == cur
+            ) { [weak self] in
+                guard let self = self,
+                      let idx = self.config.sites.firstIndex(where: { $0.id == site.id }) else { return }
+                self.config.sites[idx].lockdownMode = opt.mode
+                self.config.save()
+                self.syncLockdownModeEnvironment(reason: "user-policy", recreateAffectedWebViews: true)
+            }
+        }
+
+        let sysDesc = runtime.systemLockdownEnabled ? "系统锁定已开" : "系统锁定未开"
+        let bypassDesc = runtime.lockdownBypassDetected ? "LockdownBypass 白名单已命中 ✓" : "白名单未开"
+        let sheet = JWGlassSheetController(
+            icon: .symbol(
+                name: "bolt.shield.fill",
+                top: UIColor(red: 0.12, green: 0.64, blue: 0.42, alpha: 1.0),
+                bottom: UIColor(red: 0.14, green: 0.44, blue: 0.88, alpha: 1.0)
+            ),
+            title: "\(site.title) · 锁定模式策略",
+            subtitle: "\(sysDesc) · \(bypassDesc) · 切换后自动原位重载生效",
+            sections: [rows]
+        )
+        presentGlassSheet(sheet)
+    }
+
     private func showQuickAccountSpacePicker(for site: SiteItem, sourceView: UIView?) {
         let isIso = site.isIsolatedStore
         let mainRows: [JWGlassRowItem] = [
@@ -2568,7 +2767,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 customBand: site.customBand,
                 hibernated: false,
                 notifyEnabled: site.notifyEnabled,
-                autoHibernateExempt: site.autoHibernateExempt
+                autoHibernateExempt: site.autoHibernateExempt,
+                lockdownMode: site.lockdownMode
             )
             self.config.sites.append(clone)
             self.config.selectedSiteId = clone.id
@@ -2657,6 +2857,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             }
         ]
 
+        let effCurLocked = config.effectiveSiteLockdownEnabled(
+            for: curSite,
+            systemLockdownEnabled: runtime.systemLockdownEnabled,
+            bypassIgnored: runtime.lockdownBypassDetected
+        )
         let sitePolicyGroup: [JWGlassRowItem] = [
             JWGlassRowItem(
                 symbol: curSite.autoHibernateExempt ? "pin.fill" : "clock.arrow.circlepath",
@@ -2665,6 +2870,15 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 trailingText: autoHibernateTrailingText(for: curSite)
             ) { [weak self] in
                 self?.toggleSiteAutoHibernateExempt(siteId: siteId)
+            },
+            JWGlassRowItem(
+                symbol: effCurLocked ? "exclamationmark.shield.fill" : "bolt.fill",
+                tint: effCurLocked ? .systemOrange : .systemGreen,
+                title: "锁定模式防护",
+                trailingText: lockdownTrailingText(for: curSite),
+                showsChevron: true
+            ) { [weak self] in
+                self?.showQuickLockdownPicker(for: curSite, sourceView: sourceView)
             },
             JWGlassRowItem(
                 symbol: "bolt.shield.fill",
@@ -3031,7 +3245,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         var lines: [String] = []
         lines.append("=== JetWeb 诊断摘要 ===")
         let detachDesc = config.idleDetachSeconds > 0 ? "\(config.idleDetachSeconds)s" : "关闭"
+        let globalLocked = config.effectiveGlobalLockdownEnabled(
+            systemLockdownEnabled: runtime.systemLockdownEnabled,
+            bypassIgnored: runtime.lockdownBypassDetected
+        )
+        let containerTag = runtime.dataContainerPath.isEmpty ? "未解析" : "已就绪"
         lines.append("版本: v\(JWBridgeVersion()) (\(JWBridgeGitCommit())) | 系统: \(dev.systemName) \(dev.systemVersion) | 物理内存: \(ramMB) MB")
+        lines.append("锁定模式: 系统=\(runtime.systemLockdownEnabled ? "开启" : "未开") | LockdownBypass白名单=\(runtime.lockdownBypassDetected ? "已命中" : "未命中")(容器:\(containerTag)) | 策略=\(config.lockdownPolicy) | 默认引擎=\(globalLocked ? "锁定防护中" : "已豁免满血")")
         lines.append("策略: 全局默认 \(config.targetBand) 档 (网络压阵 \(guardian.auxBand) 档 / 主容器 \(guardian.hostBand) 档) | 单页上限 \(config.maxMemoryMB) MB | 自动脱水: \(config.autoMemoryTrimEnabled ? "开" : "关") | 离屏省显存: \(detachDesc) | 闲置休眠: \(idleSummary) | 告警休眠: \(config.autoHibernateOnCriticalMemory ? "开" : "关") | 通知: \(notifySummary) | 外观: \(config.appearanceMode)")
         lines.append("主进程: PID \(selfPid) | 实测档位 \(hostSt?.band ?? -1) | 内存 \(hostSt?.footprintMB ?? 0) MB")
 
@@ -3044,10 +3264,16 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let stateLabel = !s.enabled ? "隐藏" : (s.hibernated ? "已休眠" : (detachedSiteIds.contains(s.id) ? "离屏保活" : "运行中"))
             let effBand = config.effectiveSiteBand(for: s)
             let bandLabel = s.customBand > 0 ? "专属\(effBand)档" : "默认\(effBand)档"
+            let siteLocked = config.effectiveSiteLockdownEnabled(
+                for: s,
+                systemLockdownEnabled: runtime.systemLockdownEnabled,
+                bypassIgnored: runtime.lockdownBypassDetected
+            )
+            let ldmTag = siteLocked ? "🔒锁定" : "⚡️豁免"
             let notifyBadge = s.notifyEnabled ? "🔔" : "🔕"
             let exemptBadge = s.autoHibernateExempt ? " 📌免眠" : ""
             let recMark = terminatedSiteIds.contains(s.id) ? " [曾被回收]" : ""
-            lines.append("站点[\(stateLabel)]: \(s.title) \(notifyBadge)\(exemptBadge) | \(bandLabel) | \(JWDataStoreHelper.shortBadge(for: s.dataStoreId)) | WebPID=\(wpid) NetPID=\(npid) GPUPID=\(gpid) | 实测=\(st?.band ?? -1)档 内存=\(st?.footprintMB ?? 0)MB\(recMark)")
+            lines.append("站点[\(stateLabel)]: \(s.title) \(notifyBadge)\(exemptBadge) | \(ldmTag) | \(bandLabel) | \(JWDataStoreHelper.shortBadge(for: s.dataStoreId)) | WebPID=\(wpid) NetPID=\(npid) GPUPID=\(gpid) | 实测=\(st?.band ?? -1)档 内存=\(st?.footprintMB ?? 0)MB\(recMark)")
         }
         lines.append("======================")
         return lines.joined(separator: "\n")
@@ -3593,6 +3819,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         unreadSiteIds.remove(config.selectedSiteId)
         JWLog("FG", "WillEnterForeground newEpoch=\(bgEpoch) terminatedCount=\(terminatedSiteIds.count) detachedCount=\(detachedSiteIds.count)")
         applyAppearanceStyles()
+        syncLockdownModeEnvironment(reason: "enter-fg", recreateAffectedWebViews: true)
         evaluateIdleAutoHibernation(reason: "enter-fg")
         if !config.selectedSiteId.isEmpty {
             touchSiteActivity(siteId: config.selectedSiteId)
