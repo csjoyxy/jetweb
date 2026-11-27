@@ -265,7 +265,12 @@ final class JWNotificationManager: NSObject, UNUserNotificationCenterDelegate {
               let info = note.userInfo,
               let typeVal = info[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: typeVal) else { return }
-        if type == .ended, let deadline = listenDeadline, deadline.timeIntervalSinceNow > 5 {
+        if type == .began {
+            if UIApplication.shared.applicationState != .active {
+                JWLog("NOTIFY", "Audio interrupted in BG -> arming Jetsam --bg-guard")
+                onBackgroundListenWillStopForSuspend?()
+            }
+        } else if type == .ended, let deadline = listenDeadline, deadline.timeIntervalSinceNow > 5 {
             try? AVAudioSession.sharedInstance().setActive(true)
             audioPlayer?.play()
         }

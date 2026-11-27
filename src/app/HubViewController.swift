@@ -380,7 +380,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         didSet { runtime.isTrimmingMemory = isTrimmingMemory }
     }
     private var lastProcStatuses: [Int32: ProcStatus] = [:] {
-        didSet { runtime.liveStatuses = lastProcStatuses }
+        didSet {
+            if presentedViewController != nil {
+                runtime.liveStatuses = lastProcStatuses
+            }
+        }
     }
     private var lastActiveUptimeBySiteId: [String: TimeInterval] = [:]
     private var lastStreamingUptimeBySiteId: [String: TimeInterval] = [:]
@@ -389,12 +393,16 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private var lastMemWarningUptime: TimeInterval = 0
     private var lastLoggedApplyDigest: String = ""
     private var lastLoggedLockdownDigest: String = ""
+    private var lastRenderedTabPillsSignature: String = ""
+    private var lastApplyStartedUptime: TimeInterval = 0
+    private var lastAppliedSpecsSignature: String = ""
 
     private let protectQueue = DispatchQueue(label: "com.lili.jetweb.protect")
     private let trustEvalQueue = DispatchQueue(label: "com.lili.jetweb.trust")
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
     private var bgEpoch: UInt = 1
     private var fgProtectTimer: Timer?
+    private var pendingWaveDebounceWorkItem: DispatchWorkItem?
     private var tabSwitchSeq: UInt = 0
 
     private var sessionTrustedCerts: [String: String] = [:]
@@ -443,6 +451,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     deinit {
         fgProtectTimer?.invalidate()
+        pendingWaveDebounceWorkItem?.cancel()
         pendingURLPersistWorkItem?.cancel()
         toastHideWorkItem?.cancel()
         NotificationCenter.default.removeObserver(self)
@@ -584,7 +593,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         runtime.onUpdateAppearance = { [weak self] in
             self?.applyAppearanceStyles()
             self?.updateGlassChromeMaterials()
-            self?.rebuildTabPills()
+            self?.rebuildTabPills(force: true)
         }
         runtime.onUpdateTrustedCerts = { [weak self] in
             guard let self = self else { return }
@@ -596,9 +605,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
         runtime.onApplyProtectionNow = { [weak self] in
             guard let self = self else { return }
-            self.scheduleApplyProtectionAsync { [weak self] summary in
-                self?.runtime.helperBannerText = summary
-                self?.queryLiveStatusesAsync()
+            self.scheduleApplyProtectionAsync(logEvenIfUnchanged: false) { [weak self] summary in
+                guard let self = self else { return }
+                self.runtime.helperBannerText = summary
+                self.runtime.liveStatuses = self.lastProcStatuses
             }
         }
         runtime.onTrimMemoryNow = { [weak self] in
@@ -2161,14 +2171,18 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         present(alert, animated: true)
     }
 
-    private func rebuildTabPills() {
-        for sub in tabsStackView.arrangedSubviews {
-            tabsStackView.removeArrangedSubview(sub)
-            sub.removeFromSuperview()
-        }
-
+    private func rebuildTabPills(force: Bool = false) {
         let enabled = enabledSites()
         if enabled.isEmpty {
+            let emptySig = "__EMPTY__"
+            if !force && lastRenderedTabPillsSignature == emptySig && !tabsStackView.arrangedSubviews.isEmpty {
+                return
+            }
+            lastRenderedTabPillsSignature = emptySig
+            for sub in tabsStackView.arrangedSubviews {
+                tabsStackView.removeArrangedSubview(sub)
+                sub.removeFromSuperview()
+            }
             let addPill = SitePillControl(frame: .zero)
             addPill.configure(title: "+ 添加站点", active: true, aliveState: "OK", isolated: false)
             addPill.addTarget(self, action: #selector(openManageSheet), for: .touchUpInside)
@@ -2176,9 +2190,20 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             return
         }
 
+        struct PillSpec {
+            let site: SiteItem
+            let active: Bool
+            let badge: String
+            let normBand: Int
+            let unread: Bool
+        }
+
+        var sigParts: [String] = []
+        sigParts.reserveCapacity(enabled.count)
+        var specs: [PillSpec] = []
+        specs.reserveCapacity(enabled.count)
+
         for s in enabled {
-            let pill = SitePillControl(frame: .zero)
-            pill.siteId = s.id
             let wpid = JWBridgeWebViewContentPID(webViews[s.id])
             let effBand = config.effectiveSiteBand(for: s)
             let badge: String
@@ -2188,14 +2213,54 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 badge = ""
             }
             let active = (s.id == config.selectedSiteId)
+            let normBand = JWPriorityHelper.normalizeCustomBand(s.customBand)
+            let unread = unreadSiteIds.contains(s.id)
+            specs.append(PillSpec(site: s, active: active, badge: badge, normBand: normBand, unread: unread))
+            sigParts.append("\(s.id)|\(s.title)|\(active ? 1 : 0)|\(badge)|\(s.isIsolatedStore ? 1 : 0)|\(s.hibernated ? 1 : 0)|\(normBand)|\(unread ? 1 : 0)")
+        }
+
+        let newSig = sigParts.joined(separator: ";")
+        if !force && newSig == lastRenderedTabPillsSignature && tabsStackView.arrangedSubviews.count == specs.count {
+            return
+        }
+        lastRenderedTabPillsSignature = newSig
+
+        let existingPills = tabsStackView.arrangedSubviews.compactMap { $0 as? SitePillControl }
+        let sameOrder = existingPills.count == specs.count
+            && tabsStackView.arrangedSubviews.count == specs.count
+            && zip(existingPills, specs).allSatisfy { $0.siteId == $1.site.id }
+
+        if sameOrder {
+            for (pill, spec) in zip(existingPills, specs) {
+                pill.configure(
+                    title: spec.site.title,
+                    active: spec.active,
+                    aliveState: spec.badge,
+                    isolated: spec.site.isIsolatedStore,
+                    hibernated: spec.site.hibernated,
+                    customBand: spec.normBand,
+                    unread: spec.unread
+                )
+            }
+            return
+        }
+
+        for sub in tabsStackView.arrangedSubviews {
+            tabsStackView.removeArrangedSubview(sub)
+            sub.removeFromSuperview()
+        }
+
+        for spec in specs {
+            let pill = SitePillControl(frame: .zero)
+            pill.siteId = spec.site.id
             pill.configure(
-                title: s.title,
-                active: active,
-                aliveState: badge,
-                isolated: s.isIsolatedStore,
-                hibernated: s.hibernated,
-                customBand: JWPriorityHelper.normalizeCustomBand(s.customBand),
-                unread: unreadSiteIds.contains(s.id)
+                title: spec.site.title,
+                active: spec.active,
+                aliveState: spec.badge,
+                isolated: spec.site.isIsolatedStore,
+                hibernated: spec.site.hibernated,
+                customBand: spec.normBand,
+                unread: spec.unread
             )
             pill.addTarget(self, action: #selector(tabPillTapped(_:)), for: .touchUpInside)
             pill.onLongPress = { [weak self] pressedPill in
@@ -3099,6 +3164,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     }
 
     @objc private func openManageSheet() {
+        runtime.liveStatuses = lastProcStatuses
         refreshRuntimeWebPIDMap()
         let rootView = SettingsDrawerView(
             config: config,
@@ -3119,6 +3185,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     }
 
     private func openLogViewerSheet() {
+        runtime.liveStatuses = lastProcStatuses
         refreshRuntimeWebPIDMap()
         let rootView = StandaloneDiagnosticLogSheet(
             config: config,
@@ -3237,8 +3304,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let selfPid = getpid()
         let hostSt = lastProcStatuses[selfPid]
         let guardian = config.computedGuardianBands()
+        let smartTag = config.bgSmartNotifyOnly ? "/按需省电" : "/始终监听"
         let notifySummary = config.notificationsEnabled
-            ? "开启(护航\(config.bgNotifyGuardMinutes)m\(config.bgAutoSleepAfterNotify ? "/回完休眠" : ""))"
+            ? "开启(护航\(config.bgNotifyGuardMinutes)m\(smartTag)\(config.bgAutoSleepAfterNotify ? "/回完休眠" : ""))"
             : "关闭"
         let idleSummary = config.idleHibernateMinutes > 0 ? "\(config.idleHibernateMinutes)m" : "关闭"
 
@@ -3349,7 +3417,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             recordPID(JWBridgeWebViewNetworkingPID(wv), desiredBand: guardian.auxBand)
             recordPID(JWBridgeWebViewGPUPID(wv), desiredBand: guardian.auxBand)
         }
-        runtime.webPIDsBySiteId = webMap
+        if runtime.webPIDsBySiteId != webMap {
+            runtime.webPIDsBySiteId = webMap
+        }
 
         let queryPIDs = orderedPIDs.map { "\($0)" }
         let applySpecs = orderedPIDs.map { p in
@@ -3374,35 +3444,45 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func startForegroundProtectTimer() {
         stopForegroundProtectTimer()
-        let timer = Timer.scheduledTimer(withTimeInterval: 25.0, repeats: true) { [weak self] _ in
+        let timer = Timer.scheduledTimer(withTimeInterval: 45.0, repeats: true) { [weak self] _ in
             guard let self = self, UIApplication.shared.applicationState == .active else { return }
             self.evaluateIdleAutoHibernation(reason: "fg-patrol")
-            self.scheduleApplyProtectionAsync { [weak self] _ in
+            self.scheduleApplyProtectionAsync(logEvenIfUnchanged: false) { [weak self] _ in
                 self?.evaluateProactiveMemoryMaintenanceOnMainThread()
             }
         }
-        timer.tolerance = 5.0
+        timer.tolerance = 9.0
         fgProtectTimer = timer
     }
 
     private func stopForegroundProtectTimer() {
         fgProtectTimer?.invalidate()
         fgProtectTimer = nil
+        pendingWaveDebounceWorkItem?.cancel()
+        pendingWaveDebounceWorkItem = nil
     }
 
     private func schedulePostStateChangeProtectionWaves() {
+        pendingWaveDebounceWorkItem?.cancel()
         tabSwitchSeq &+= 1
         let seq = tabSwitchSeq
-        scheduleApplyProtectionAsync(completion: nil)
 
-        for sec in [1.5, 5.0, 21.5] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + sec) { [weak self] in
-                guard let self = self,
-                      self.tabSwitchSeq == seq,
-                      UIApplication.shared.applicationState == .active else { return }
-                self.scheduleApplyProtectionAsync(completion: nil)
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.tabSwitchSeq == seq else { return }
+            self.pendingWaveDebounceWorkItem = nil
+            self.scheduleApplyProtectionAsync(completion: nil)
+
+            for sec in [2.2, 9.5] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + sec) { [weak self] in
+                    guard let self = self,
+                          self.tabSwitchSeq == seq,
+                          UIApplication.shared.applicationState == .active else { return }
+                    self.scheduleApplyProtectionAsync(completion: nil)
+                }
             }
         }
+        pendingWaveDebounceWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.28, execute: work)
     }
 
     private func queryLiveStatusesAsync() {
@@ -3418,17 +3498,29 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 guard let self = self else { return }
                 if !parsed.isEmpty {
                     self.lastProcStatuses = parsed
+                    self.runtime.liveStatuses = parsed
                     self.rebuildTabPills()
                 }
             }
         }
     }
 
-    private func scheduleApplyProtectionAsync(completion: ((String) -> Void)?) {
+    private func scheduleApplyProtectionAsync(
+        logEvenIfUnchanged: Bool = false,
+        completion: ((String) -> Void)?
+    ) {
         let collected = collectTargetPIDStringsOnMainThread()
         let band = config.targetBand
         let maxMB = config.maxMemoryMB
         let hostBand = collected.hostBand
+        let specsSig = "\(band)|\(maxMB)|\(collected.applySpecs.joined(separator: ","))"
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+
+        if completion == nil && !logEvenIfUnchanged && specsSig == lastAppliedSpecsSignature && (nowUptime - lastApplyStartedUptime) < 0.75 {
+            return
+        }
+        lastApplyStartedUptime = nowUptime
+        lastAppliedSpecsSignature = specsSig
 
         protectQueue.async { [weak self] in
             HubViewController.writeSharedSnapshotOnBgQueue(collected.sharedSnapshot)
@@ -3456,7 +3548,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                         digest += ",\(st.pid):\(st.stateTag):\(st.band)"
                     }
                 }
-                if completion != nil || exitCode != 0 || digest != self.lastLoggedApplyDigest {
+                if logEvenIfUnchanged || exitCode != 0 || digest != self.lastLoggedApplyDigest {
                     self.lastLoggedApplyDigest = digest
                     JWLog("JETSAM", "apply rc=\(exitCode) hostBand=\(hostBand) default=\(band) max=\(maxMB)MB -> \(compactOut.isEmpty ? "(empty)" : compactOut)")
                 }
@@ -3700,6 +3792,19 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
     }
 
+    private func hasRecentConversationTaskForBgGuard() -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        for s in awakeSites() where s.notifyEnabled {
+            if let stAt = lastStreamingUptimeBySiteId[s.id], (now - stAt) < 180.0 {
+                return true
+            }
+            if let wv = webViews[s.id], wv.isLoading {
+                return true
+            }
+        }
+        return false
+    }
+
     private func armDetachedJetsamGuardForBackgroundTransition(reason: String) {
         endBackgroundGuardTask()
 
@@ -3755,9 +3860,24 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         scheduleApplyProtectionAsync(completion: nil)
 
-        let guardSpawnDelay: TimeInterval = shouldTrimBeforeBg ? 0.85 : 0.6
+        let guardSpawnDelay: TimeInterval = shouldTrimBeforeBg ? 0.85 : 0.65
         DispatchQueue.main.asyncAfter(deadline: .now() + guardSpawnDelay) { [weak self] in
             guard let self = self, self.bgEpoch == epoch else { return }
+
+            /* Optimization: If silent background audio listener is actively holding the app awake
+             * at FG(100), skip spawning a redundant 55s 7-wave --bg-guard loop now; lock child WebKit
+             * PIDs once at +1.5s and release UIBackgroundTask. The full 7-wave --bg-guard will run
+             * automatically on `notify-guard-ending` right before actual suspension! */
+            if reason == "enter-bg" && JWNotificationManager.shared.isBackgroundListening {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak self] in
+                    guard let self = self, self.bgEpoch == epoch else { return }
+                    self.scheduleApplyProtectionAsync(completion: nil)
+                    JWLog("BG", "BG audio listener active -> locked child bands & deferred --bg-guard to suspend (epoch=\(epoch))")
+                    self.endBackgroundGuardTask()
+                }
+                return
+            }
+
             let collected = self.collectTargetPIDStringsOnMainThread()
             let band = self.config.targetBand
             let maxMB = self.config.maxMemoryMB
@@ -3782,27 +3902,34 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         evaluateIdleAutoHibernation(reason: "enter-bg")
         syncAllWebViewHostStates(appActive: false)
 
+        let hasNotifyCandidate = config.hasAwakeNotifySite() && config.bgNotifyGuardMinutes > 0
+        let activeConvTask = hasRecentConversationTaskForBgGuard()
+        let shouldStartBgAudio = hasNotifyCandidate && (!config.bgSmartNotifyOnly || activeConvTask)
+
         if config.idleDetachSeconds > 0 {
             let now = ProcessInfo.processInfo.systemUptime
             for s in awakeSites() where s.id != config.selectedSiteId {
-                let isNotifyActive = config.notificationsEnabled && s.notifyEnabled && config.bgNotifyGuardMinutes > 0
-                let isStreaming = (now - (lastStreamingUptimeBySiteId[s.id] ?? 0)) < 60.0
-                if !isNotifyActive && !isStreaming {
+                let isStreaming = (now - (lastStreamingUptimeBySiteId[s.id] ?? 0)) < 180.0
+                let keepAttachedForBgListen = shouldStartBgAudio && s.notifyEnabled && (!config.bgSmartNotifyOnly || isStreaming)
+                if !keepAttachedForBgListen && !isStreaming {
                     detachWebViewFromWindow(siteId: s.id, reason: "enter-bg")
                 }
             }
         }
 
-        if config.hasAwakeNotifySite() && config.bgNotifyGuardMinutes > 0 {
+        if shouldStartBgAudio {
             JWNotificationManager.shared.startBackgroundListening(
                 minutes: config.bgNotifyGuardMinutes,
                 autoSleepAfterNotify: config.bgAutoSleepAfterNotify
             )
         } else {
             JWNotificationManager.shared.stopBackgroundListening(
-                reason: "no_awake_notify_site",
+                reason: hasNotifyCandidate ? "smart_idle_freeze" : "no_awake_notify_site",
                 triggerJetsamGuard: false
             )
+            if hasNotifyCandidate && config.bgSmartNotifyOnly {
+                JWLog("NOTIFY", "Smart-skip BG audio listener (no active reply/task in 3m) -> 0-power freeze with Jetsam guard")
+            }
         }
 
         armDetachedJetsamGuardForBackgroundTransition(reason: "enter-bg")
@@ -4166,7 +4293,21 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             }
             if kind == "streaming" {
                 touchSiteActivity(siteId: sid, streaming: true)
-                JWNotificationManager.shared.noteSiteStreamingActivity()
+                if UIApplication.shared.applicationState != .active,
+                   !JWNotificationManager.shared.isBackgroundListening,
+                   config.notificationsEnabled,
+                   senderSite.notifyEnabled,
+                   config.bgNotifyGuardMinutes > 0 {
+                    bgEpoch &+= 1
+                    writeBgEpochToken(bgEpoch)
+                    JWLog("NOTIFY", "Detected in-flight generation on site=\(senderSite.title) -> promoting BG listener (\(config.bgNotifyGuardMinutes)m)")
+                    JWNotificationManager.shared.startBackgroundListening(
+                        minutes: config.bgNotifyGuardMinutes,
+                        autoSleepAfterNotify: config.bgAutoSleepAfterNotify
+                    )
+                } else {
+                    JWNotificationManager.shared.noteSiteStreamingActivity()
+                }
                 return
             }
             guard kind == "reply_done" || kind == "unread_dot" || kind == "web_api" || kind == "title_badge" else {

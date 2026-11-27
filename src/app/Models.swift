@@ -424,6 +424,8 @@ final class AppConfig: ObservableObject {
     @Published var notificationsEnabled: Bool = true
     /// 0 = 仅前台跨标签通知（退后台不保活）；5 / 15 / 30 / 60 = 退后台等信护航分钟数
     @Published var bgNotifyGuardMinutes: Int = JWConstants.defaultBgNotifyMinutes
+    /// true = 智能按需护航（仅在刚提问/网页流式生成中切后台时才开启静音监听，平时切后台直接锁档 0 耗电冻结）
+    @Published var bgSmartNotifyOnly: Bool = true
     /// 退后台期间收到新消息弹完通知后，缓冲约 1 分钟自动停止后台连线省电
     @Published var bgAutoSleepAfterNotify: Bool = true
     /// 0 = 关闭自动休眠；10 / 20 / 30 / 60 = 后台标签静置超过该分钟数自动休眠释放内存
@@ -600,6 +602,9 @@ final class AppConfig: ObservableObject {
            [0, 5, 15, 30, 60].contains(bm) {
             cfg.bgNotifyGuardMinutes = bm
         }
+        if let smn = (root["bgSmartNotifyOnly"] as? NSNumber)?.boolValue ?? (root["bgSmartNotifyOnly"] as? Bool) {
+            cfg.bgSmartNotifyOnly = smn
+        }
         if let aslp = (root["bgAutoSleepAfterNotify"] as? NSNumber)?.boolValue ?? (root["bgAutoSleepAfterNotify"] as? Bool) {
             cfg.bgAutoSleepAfterNotify = aslp
         }
@@ -637,6 +642,7 @@ final class AppConfig: ObservableObject {
             "debugLoggingEnabled": debugLoggingEnabled,
             "notificationsEnabled": notificationsEnabled,
             "bgNotifyGuardMinutes": bgNotifyGuardMinutes,
+            "bgSmartNotifyOnly": bgSmartNotifyOnly,
             "bgAutoSleepAfterNotify": bgAutoSleepAfterNotify,
             "idleHibernateMinutes": idleHibernateMinutes,
             "autoMemoryTrimEnabled": autoMemoryTrimEnabled,

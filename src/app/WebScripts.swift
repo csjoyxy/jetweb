@@ -312,6 +312,9 @@ enum WebScripts {
         var bootIgnoreUntil=Date.now()+4800;
         var lastHref=location.href;
         var lastComposerText='';
+        var lastComposerInputAt=0;
+        var lastUserSentAt=0;
+        var lastWatchedMutationAt=0;
         var lastBaselineTail='';
         var lastNotifiedSnippet='';
         var lastNotifiedAt=0;
@@ -510,8 +513,10 @@ enum WebScripts {
               var rt=extractRowTitleForDot(explicit[i])||normText(explicit[i].textContent||'');
               if(rt.length>=2&&rt.length<=95)currentSet.add(rt);
             }
-            var candidates=document.body.querySelectorAll('a span,a div,li span,li div,[role="listitem"] span,[role="listitem"] div,div > span,div > div');
-            var limit=Math.min(candidates.length,450);
+            var navRoot=document.querySelector('nav,aside,[role="navigation"]');
+            var scopeRoot=navRoot||document.body;
+            var candidates=scopeRoot.querySelectorAll('a span,a div,li span,li div,[role="listitem"] span,[role="listitem"] div');
+            var limit=Math.min(candidates.length,220);
             for(var j=0;j<limit;j++){
               var el=candidates[j];
               if(isColoredUnreadDot(el)){
@@ -622,13 +627,23 @@ enum WebScripts {
           }
         }
 
+        function emitUserSentIfNeeded(){
+          var now=Date.now();
+          if(now-lastUserSentAt<2500)return;
+          lastUserSentAt=now;
+          postNative({k:'user_sent'});
+        }
+
         /* 6. Composer input & send tracking */
         document.addEventListener('input',function(ev){
           var el=ev&&ev.target;
           if(!el)return;
           if(el.tagName==='TEXTAREA'||el.tagName==='INPUT'||el.isContentEditable){
             var v=normText(el.value||el.textContent||'');
-            if(v.length>=2)lastComposerText=v.length>120?(v.slice(0,120)+'…'):v;
+            if(v.length>=2){
+              lastComposerInputAt=Date.now();
+              lastComposerText=v.length>120?(v.slice(0,120)+'…'):v;
+            }
           }
         },true);
 
@@ -636,7 +651,7 @@ enum WebScripts {
           if(!ev||ev.key!=='Enter'||ev.shiftKey||ev.isComposing)return;
           var el=ev.target;
           if(el&&(el.tagName==='TEXTAREA'||el.isContentEditable||el.tagName==='INPUT')){
-            postNative({k:'user_sent'});
+            emitUserSentIfNeeded();
           }
         },true);
 
@@ -645,9 +660,11 @@ enum WebScripts {
           while(cur&&cur.nodeType===1&&d<5){
             if(cur.tagName==='BUTTON'||cur.getAttribute('role')==='button'){
               var tp=(cur.getAttribute('type')||'').toLowerCase();
-              var lb=((cur.getAttribute('aria-label')||'')+' '+(cur.textContent||'')).toLowerCase();
-              if(tp==='submit'||/send|submit|发送|提交|ask/.test(lb)){
-                postNative({k:'user_sent'});
+              var lb=((cur.getAttribute('aria-label')||'')+' '+(cur.getAttribute('title')||'')+' '+(cur.textContent||'')).toLowerCase();
+              if(tp==='submit'||/send|submit|发送|提交|ask|up-arrow/.test(lb)){
+                emitUserSentIfNeeded();
+              }else if((Date.now()-lastComposerInputAt)<45000&&!/cancel|close|attach|upload|voice|mic|menu|sidebar|copy|stop|取消|关闭|上传|菜单|复制|停止/.test(lb)){
+                emitUserSentIfNeeded();
               }
               break;
             }
@@ -665,6 +682,10 @@ enum WebScripts {
           if(wasWatching&&!nowWatching){
             lastBaselineTail=captureLatestChatSnippet();
             scanUnreadDots(false);
+            var now=Date.now();
+            if(isBusyGenerating()||((now-lastWatchedMutationAt)<6000&&(now-lastComposerInputAt)<180000)){
+              scheduleReplySettle();
+            }
           }else if(!wasWatching&&nowWatching){
             pendingReply=false;
             streamStartedAt=0;
@@ -699,7 +720,29 @@ enum WebScripts {
               },4300);
               return;
             }
-            if(Date.now()<bootIgnoreUntil)return;
+            var now=Date.now();
+            if(now<bootIgnoreUntil)return;
+
+            /* Fast-path when user is actively watching this foreground tab:
+             * zero DOM parent walks, zero textContent copies, zero dot scans! */
+            if(isUserWatching()){
+              for(var w=0;w<mutations.length;w++){
+                var mw=mutations[w];
+                if(mw.target&&mw.target.nodeName==='TITLE'){
+                  checkTitleBadge();
+                  continue;
+                }
+                if(mw.type==='characterData'||(mw.type==='childList'&&mw.addedNodes&&mw.addedNodes.length>0)){
+                  lastWatchedMutationAt=now;
+                  if((now-lastStreamPingAt)>15000&&((now-lastComposerInputAt)<180000||isBusyGenerating())){
+                    lastStreamPingAt=now;
+                    postNative({k:'streaming'});
+                  }
+                  break;
+                }
+              }
+              return;
+            }
 
             var hasMeaningfulText=false;
             var hasElementAdded=false;
@@ -717,7 +760,7 @@ enum WebScripts {
                 }
               }else if(m.type==='childList'&&m.addedNodes&&m.addedNodes.length>0){
                 hasElementAdded=true;
-                if(m.target&&m.target.nodeType===1&&!isInsideIgnoredChrome(m.target)){
+                if(!hasMeaningfulText&&m.target&&m.target.nodeType===1&&!isInsideIgnoredChrome(m.target)){
                   for(var k=0;k<m.addedNodes.length;k++){
                     var nd=m.addedNodes[k];
                     var nt=normText(nd.textContent||'');
@@ -730,16 +773,14 @@ enum WebScripts {
               }
             }
 
-            if(hasMeaningfulText && !isUserWatching()){
+            if(hasMeaningfulText){
               scheduleReplySettle();
             }
-            if(hasElementAdded && !isUserWatching()){
-              if(!dotScanTimer){
-                dotScanTimer=setTimeout(function(){
-                  dotScanTimer=null;
-                  scanUnreadDots(true);
-                },1500);
-              }
+            if(hasElementAdded&&!dotScanTimer){
+              dotScanTimer=setTimeout(function(){
+                dotScanTimer=null;
+                if(!isUserWatching())scanUnreadDots(true);
+              },3200);
             }
           });
 
@@ -896,7 +937,7 @@ enum WebScripts {
           if(!sc||typeof ResizeObserver!=='function')return;
           if(!resizeObs){
             resizeObs=new ResizeObserver(function(){
-              if(!activeScroller||isApplyingScroll)return;
+              if(!activeScroller||isApplyingScroll||document.visibilityState==='hidden')return;
               stabilizeIfNeeded('resize');
             });
           }
@@ -1422,7 +1463,7 @@ enum WebScripts {
         function installMutationHook(){
           if(!document.documentElement)return;
           var mo=new MutationObserver(function(mutations){
-            if(!activeScroller||isApplyingScroll)return;
+            if(!activeScroller||isApplyingScroll||document.visibilityState==='hidden')return;
             if(location.href!==lastHref){
               stabilizeIfNeeded('href');
               return;

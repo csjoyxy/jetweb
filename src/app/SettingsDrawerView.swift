@@ -814,7 +814,7 @@ struct SettingsDrawerView: View {
     private var notificationSection: some View {
         Section(
             header: Text("智能新消息通知与省电护航"),
-            footer: Text("开启后自动识别网页对话回复收尾、未读蓝点与网页通知并推送到 iOS 系统通知栏。退后台限时护航结束后（或通知送达约 1 分钟后）自动切断后台连线恢复 0 耗电冻结，锁屏过夜不跑电。")
+            footer: Text("开启「智能按需护航」后，仅当你刚发出提问或 AI 正在生成回复中途切后台时才开启静音等信护航；普通浏览切走或锁屏会直接移交锁档冻结（0 耗电且网页照常驻留内存不重刷）。如有需要被动接收他人主动发信的群聊站点，可关闭按需护航改为每次退后台均监听。")
         ) {
             Toggle("开启新对话 / 回复系统通知", isOn: Binding(
                 get: { config.notificationsEnabled },
@@ -842,6 +842,15 @@ struct SettingsDrawerView: View {
                 }
 
                 if config.bgNotifyGuardMinutes > 0 {
+                    Toggle("智能按需护航（仅提问 / 回复中保活，极省电）", isOn: Binding(
+                        get: { config.bgSmartNotifyOnly },
+                        set: { newVal in
+                            config.bgSmartNotifyOnly = newVal
+                            config.save()
+                            runtime.onNotificationPolicyChanged?()
+                        }
+                    ))
+
                     Toggle("收到通知后 1 分钟自动休眠省电", isOn: Binding(
                         get: { config.bgAutoSleepAfterNotify },
                         set: { newVal in
