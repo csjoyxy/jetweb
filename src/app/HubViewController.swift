@@ -1701,13 +1701,16 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let unlockedCount = lockdownOn ? 0 : Int(JWBridgeUnlockExperimentalWebKitFeatures(cfg.preferences))
 
         if !isPure {
+            let proxy = WeakScriptMessageProxy(target: self)
             cfg.userContentController.addUserScript(WebScripts.compatPolyfillScript())
+            cfg.userContentController.addUserScript(WebScripts.makeCSSCompatUserScript())
             cfg.userContentController.addUserScript(WebScripts.inputContrastFixScript())
             cfg.userContentController.addUserScript(WebScripts.diagnosticJSErrorScript())
             cfg.userContentController.addUserScript(WebScripts.conversationMonitorScript())
             cfg.userContentController.addUserScript(WebScripts.memoryReliefHelperScript())
-            cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwDiag")
-            cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwNotify")
+            cfg.userContentController.add(proxy, name: "jwDiag")
+            cfg.userContentController.add(proxy, name: "jwNotify")
+            cfg.userContentController.add(proxy, name: WebScripts.cssFetchMessageHandlerName)
         }
 
         let initBounds = (webContainerView.bounds.width > 10 && webContainerView.bounds.height > 10)
@@ -1864,6 +1867,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         old.stopLoading()
         old.configuration.userContentController.removeScriptMessageHandler(forName: "jwDiag")
         old.configuration.userContentController.removeScriptMessageHandler(forName: "jwNotify")
+        old.configuration.userContentController.removeScriptMessageHandler(forName: WebScripts.cssFetchMessageHandlerName)
+        old.configuration.userContentController.removeAllUserScripts()
         progressObservations.removeValue(forKey: siteId)?.invalidate()
         urlObservations.removeValue(forKey: siteId)?.invalidate()
         old.navigationDelegate = nil
@@ -4632,7 +4637,66 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 subtitle: sub,
                 body: body
             )
+            return
         }
+
+        if message.name == WebScripts.cssFetchMessageHandlerName {
+            handleNativeCSSFetchMessage(message)
+            return
+        }
+    }
+
+    private func handleNativeCSSFetchMessage(_ message: WKScriptMessage) {
+        guard let dict = message.body as? [String: Any],
+              let reqId = dict["id"] as? String,
+              let urlStr = dict["url"] as? String,
+              let url = URL(string: urlStr),
+              let scheme = url.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              let webView = message.webView else {
+            return
+        }
+        let frameInfo = message.frameInfo
+        var req = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 8.0)
+        req.setValue("text/css,*/*;q=0.1", forHTTPHeaderField: "Accept")
+        if let ua = webView.customUserAgent, !ua.isEmpty {
+            req.setValue(ua, forHTTPHeaderField: "User-Agent")
+        }
+
+        URLSession.shared.dataTask(with: req) { [weak webView] data, response, error in
+            guard let webView = webView else { return }
+            var cssPayloadLit = "null"
+            if error == nil,
+               let http = response as? HTTPURLResponse,
+               (200...299).contains(http.statusCode),
+               let data = data,
+               data.count > 0 && data.count <= 2_097_152 {
+                let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1)
+                if let text = text,
+                   let encoded = try? JSONSerialization.data(withJSONObject: [text], options: []),
+                   let arrStr = String(data: encoded, encoding: .utf8),
+                   arrStr.count >= 2 {
+                    let sIdx = arrStr.index(after: arrStr.startIndex)
+                    let eIdx = arrStr.index(before: arrStr.endIndex)
+                    cssPayloadLit = String(arrStr[sIdx..<eIdx])
+                }
+            }
+            guard let idData = try? JSONSerialization.data(withJSONObject: [reqId], options: []),
+                  let idArrStr = String(data: idData, encoding: .utf8),
+                  idArrStr.count >= 2 else { return }
+            let idStart = idArrStr.index(after: idArrStr.startIndex)
+            let idEnd = idArrStr.index(before: idArrStr.endIndex)
+            let idLit = String(idArrStr[idStart..<idEnd])
+
+            DispatchQueue.main.async {
+                webView.evaluateJavaScript(
+                    "window.__jbResolveCSSFetch && window.__jbResolveCSSFetch(\(idLit), \(cssPayloadLit));",
+                    in: frameInfo,
+                    in: .page,
+                    completionHandler: nil
+                )
+            }
+        }.resume()
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {

@@ -696,6 +696,11 @@ NSInteger JWBridgeUnlockExperimentalWebKitFeatures(WKPreferences *prefs) {
             @"HTMLPopoverAttribute",
             @"PopoverAttribute",
             @"CSSNesting",
+            @"CSSScopedStyle",
+            @"CSSScopeAtRule",
+            @"CSSLightDark",
+            @"CSSStartingStyle",
+            @"CSSRelativeColorSyntax",
             @"LazyImageLoading",
             @"StorageAccessAPI",
             @"UserActivationAPI",
@@ -744,7 +749,12 @@ NSInteger JWBridgeUnlockExperimentalWebKitFeatures(WKPreferences *prefs) {
                 featKey = nil;
             }
             if (![featKey isKindOfClass:[NSString class]] || featKey.length == 0) continue;
-            if (![sTargetKeys containsObject:featKey] || [alreadyEnabled containsObject:featKey]) continue;
+            // UnifiedWebPreferences.yaml keys usually carry an "Enabled" suffix (e.g. CSSNestingEnabled)
+            NSString *baseKey = ([featKey hasSuffix:@"Enabled"] && featKey.length > 7)
+                ? [featKey substringToIndex:(featKey.length - 7)]
+                : featKey;
+            BOOL matchesTarget = [sTargetKeys containsObject:featKey] || [sTargetKeys containsObject:baseKey];
+            if (!matchesTarget || [alreadyEnabled containsObject:featKey]) continue;
 
             for (NSString *setSelName in setterSelectors) {
                 SEL setSel = NSSelectorFromString(setSelName);
