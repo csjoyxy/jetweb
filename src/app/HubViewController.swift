@@ -353,8 +353,17 @@ final class SitePillControl: UIControl {
 // MARK: - Main Multi-WebView Hub View Controller (UIKit)
 
 final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
-    private let config = AppConfig.load()
+    private let config: AppConfig
     private let runtime = HubRuntimeState()
+
+    init(initialConfig: AppConfig = AppConfig.load()) {
+        self.config = initialConfig
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
     private var webViews: [String: WKWebView] = [:]
     private var webViewStoreIds: [String: String] = [:]
@@ -513,9 +522,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
 
         setupLayout()
-        syncWebViewsWithConfig(preferredSelectId: nil)
         applyAppearanceStyles()
         applyDockCollapsedState(animated: false)
+        view.layoutIfNeeded()
+        syncWebViewsWithConfig(preferredSelectId: nil)
         startForegroundProtectTimer()
 
         if config.notificationsEnabled {
@@ -1684,9 +1694,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         cfg.websiteDataStore = websiteDataStore(for: site)
         cfg.allowsInlineMediaPlayback = true
         cfg.mediaTypesRequiringUserActionForPlayback = [.audio]
+        cfg.preferences.javaScriptCanOpenWindowsAutomatically = true
         cfg.defaultWebpagePreferences.allowsContentJavaScript = true
+        cfg.defaultWebpagePreferences.preferredContentMode = .mobile
         JWBridgeApplyWebpageLockdownPreference(cfg.defaultWebpagePreferences, lockdownOn)
-        let unlockedCount = lockdownOn ? 0 : JWBridgeUnlockExperimentalWebKitFeatures(cfg.preferences)
+        let unlockedCount = lockdownOn ? 0 : Int(JWBridgeUnlockExperimentalWebKitFeatures(cfg.preferences))
 
         if !isPure {
             cfg.userContentController.addUserScript(WebScripts.compatPolyfillScript())
@@ -1698,12 +1710,18 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwNotify")
         }
 
-        let wv = WKWebView(frame: webContainerView.bounds, configuration: cfg)
+        let initBounds = (webContainerView.bounds.width > 10 && webContainerView.bounds.height > 10)
+            ? webContainerView.bounds
+            : UIScreen.main.bounds
+        let wv = WKWebView(frame: initBounds, configuration: cfg)
         wv.translatesAutoresizingMaskIntoConstraints = false
         wv.navigationDelegate = self
         wv.uiDelegate = self
         wv.allowsBackForwardNavigationGestures = true
-        wv.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1"
+        JWBridgeConfigureWebViewModernExtras(wv)
+        wv.customUserAgent = isPure
+            ? nil
+            : "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1"
 
         let capturedId = site.id
         touchSiteActivity(siteId: capturedId)
@@ -1746,7 +1764,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         let shortStore = JWDataStoreHelper.isIsolated(normStoreId) ? String(normStoreId.prefix(8)) : "default"
         let effBand = config.effectiveSiteBand(for: site)
-        JWLog("WEBKIT", "Create WebView site=\(site.title) store=\(shortStore) band=\(effBand) lockdown=\(lockdownOn ? "ON" : "EXEMPT") pure=\(isPure ? "ON" : "OFF") feat=\(unlockedCount) appearance=\(site.appearanceMode)")
+        JWLog("WEBKIT", "Create WebView site=\(site.title) store=\(shortStore) band=\(effBand) lockdown=\(lockdownOn ? "ON" : "EXEMPT") pure=\(isPure ? "ON" : "OFF") ua=\(isPure ? "native" : "safari18") feat=\(unlockedCount) appearance=\(site.appearanceMode)")
 
         let savedMem = JWURLHelper.sanitizePersistedURL(lastKnownURLBySiteId[site.id])
         let savedCfg = JWURLHelper.sanitizePersistedURL(site.lastKnownURL)
@@ -2417,7 +2435,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         showTopGlassToast(
             symbol: isPure ? "leaf.fill" : "sparkles",
             tint: isPure ? .systemGreen : .systemBlue,
-            text: isPure ? "「\(title)」已开启纯净原生模式（零辅助脚本）" : "「\(title)」已恢复标准增强模式"
+            text: isPure ? "「\(title)」已开启原生 Safari 模式（零脚本+原生UA）" : "「\(title)」已恢复 Safari 18 增强引擎"
         )
     }
 
@@ -2599,7 +2617,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             JWGlassRowItem(
                 symbol: "leaf.fill",
                 tint: targetSite.pureMode ? .systemGreen : .secondaryLabel,
-                title: "纯净原生模式（零辅助脚本）",
+                title: "原生 Safari 模式（零脚本+原生UA）",
                 trailingText: targetSite.pureMode ? "已开启" : "标准增强"
             ) { [weak self] in
                 self?.toggleSitePureMode(siteId: targetSite.id)
@@ -3067,7 +3085,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             JWGlassRowItem(
                 symbol: "leaf.fill",
                 tint: curSite.pureMode ? .systemGreen : .secondaryLabel,
-                title: "纯净原生模式（零辅助脚本）",
+                title: "原生 Safari 模式（零脚本+原生UA）",
                 trailingText: curSite.pureMode ? "已开启" : "标准增强"
             ) { [weak self] in
                 self?.toggleSitePureMode(siteId: siteId)
@@ -4720,8 +4738,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             return
         }
         if method == NSURLAuthenticationMethodHTTPBasic ||
-            method == NSURLAuthenticationMethodHTTPDigest ||
-            method == NSURLAuthenticationMethodDefault {
+            method == NSURLAuthenticationMethodHTTPDigest {
             handleBasicAuthChallenge(challenge, webView: webView, guardObj: guardObj)
             return
         }
@@ -4908,7 +4925,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
               !scheme.isEmpty else {
             return nil
         }
-        if !["http", "https", "about", "blob", "data", "file"].contains(scheme) {
+        if !["http", "https", "about", "blob", "data", "file", "javascript"].contains(scheme) {
             if UIApplication.shared.canOpenURL(url) {
                 UIApplication.shared.open(url, options: [:], completionHandler: nil)
             }
@@ -4929,16 +4946,17 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     func webView(
         _ webView: WKWebView,
         decidePolicyFor navigationAction: WKNavigationAction,
-        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        preferences: WKWebpagePreferences,
+        decisionHandler: @escaping (WKNavigationActionPolicy, WKWebpagePreferences) -> Void
     ) {
         if let url = navigationAction.request.url,
            let scheme = url.scheme?.lowercased(),
            !scheme.isEmpty,
-           !["http", "https", "about", "blob", "data", "file"].contains(scheme) {
+           !["http", "https", "about", "blob", "data", "file", "javascript"].contains(scheme) {
             if UIApplication.shared.canOpenURL(url) {
                 UIApplication.shared.open(url, options: [:], completionHandler: nil)
             }
-            decisionHandler(.cancel)
+            decisionHandler(.cancel, preferences)
             return
         }
 
@@ -4947,7 +4965,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
            webView === webViews[config.selectedSiteId],
            let url = navigationAction.request.url,
            shouldPromptExternalLink(url: url, for: webView) {
-            decisionHandler(.cancel)
+            decisionHandler(.cancel, preferences)
             DispatchQueue.main.async { [weak self, weak webView] in
                 guard let self = self, let webView = webView else { return }
                 self.presentExternalLinkActionSheet(url: url, for: webView)
@@ -4955,7 +4973,24 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             return
         }
 
-        decisionHandler(.allow)
+        preferences.allowsContentJavaScript = true
+        preferences.preferredContentMode = .mobile
+        let enforceLockdown: Bool
+        if let sid = siteId(for: webView), let targetSite = site(forId: sid) {
+            enforceLockdown = config.effectiveSiteLockdownEnabled(
+                for: targetSite,
+                systemLockdownEnabled: runtime.systemLockdownEnabled,
+                bypassIgnored: runtime.lockdownBypassDetected
+            )
+        } else {
+            enforceLockdown = config.effectiveGlobalLockdownEnabled(
+                systemLockdownEnabled: runtime.systemLockdownEnabled,
+                bypassIgnored: runtime.lockdownBypassDetected
+            )
+        }
+        JWBridgeApplyWebpageLockdownPreference(preferences, enforceLockdown)
+
+        decisionHandler(.allow, preferences)
     }
 
     func webView(

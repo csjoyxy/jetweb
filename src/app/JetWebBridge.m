@@ -676,58 +676,99 @@ void JWBridgeApplyWebpageLockdownPreference(WKWebpagePreferences *prefs, BOOL lo
     }
 }
 
-NSUInteger JWBridgeUnlockExperimentalWebKitFeatures(WKPreferences *prefs) {
+NSInteger JWBridgeUnlockExperimentalWebKitFeatures(WKPreferences *prefs) {
     if (!prefs) return 0;
-    static NSSet<NSString *> *sSafeFeatureKeys = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        sSafeFeatureKeys = [NSSet setWithArray:@[
+
+    static NSSet<NSString *> *sTargetKeys = nil;
+    static dispatch_once_t onceKeys;
+    dispatch_once(&onceKeys, ^{
+        sTargetKeys = [NSSet setWithArray:@[
             @"RequestIdleCallback",
             @"OffscreenCanvas",
             @"OffscreenCanvasInWorkers",
-            @"CSSSubgridEnabled",
-            @"CSSNestingEnabled",
-            @"ConstructableStylesheets",
+            @"CSSSubgrid",
+            @"CSSGridSubgrid",
             @"FetchPriority",
+            @"WebCodecs",
             @"ImportMaps",
+            @"ConstructableStylesheets",
+            @"BroadcastChannelOriginPartitioning",
             @"HTMLPopoverAttribute",
-            @"DialogElement",
+            @"PopoverAttribute",
+            @"CSSNesting",
             @"LazyImageLoading",
-            @"BroadcastChannel",
+            @"StorageAccessAPI",
             @"UserActivationAPI",
-            @"WebAnimationsCompositeOperations"
+            @"DialogElement"
         ]];
     });
 
-    NSUInteger enabledCount = 0;
-    Class prefCls = [WKPreferences class];
-    NSArray<NSArray<NSString *> *> *pairs = @[
-        @[@"_experimentalFeatures", @"_setEnabled:forExperimentalFeature:"],
-        @[@"_features", @"_setEnabled:forFeature:"],
-        @[@"_internalFeatures", @"_setEnabled:forInternalFeature:"]
-    ];
-    SEL keySel = NSSelectorFromString(@"key");
+    NSInteger unlockedCount = 0;
 
-    for (NSArray<NSString *> *pair in pairs) {
-        SEL listSel = NSSelectorFromString(pair[0]);
-        SEL setSel = NSSelectorFromString(pair[1]);
-        SEL altSetSel = NSSelectorFromString(@"_setEnabled:forFeature:");
-        if (![prefCls respondsToSelector:listSel]) continue;
-        SEL activeSetSel = [prefs respondsToSelector:setSel] ? setSel : ([prefs respondsToSelector:altSetSel] ? altSetSel : NULL);
-        if (!activeSetSel) continue;
-
+    SEL fsSel = NSSelectorFromString(@"_setFullScreenEnabled:");
+    if ([prefs respondsToSelector:fsSel]) {
         @try {
-            NSArray *features = ((NSArray *(*)(id, SEL))objc_msgSend)(prefCls, listSel);
-            if (![features isKindOfClass:[NSArray class]]) continue;
-            for (id feat in features) {
-                if (![feat respondsToSelector:keySel]) continue;
-                NSString *k = ((NSString *(*)(id, SEL))objc_msgSend)(feat, keySel);
-                if ([k isKindOfClass:[NSString class]] && [sSafeFeatureKeys containsObject:k]) {
-                    ((void (*)(id, SEL, BOOL, id))objc_msgSend)(prefs, activeSetSel, YES, feat);
-                    enabledCount++;
-                }
-            }
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(prefs, fsSel, YES);
         } @catch (__unused NSException *ex) {}
     }
-    return enabledCount;
+
+    Class prefCls = [WKPreferences class];
+    SEL keySel = NSSelectorFromString(@"key");
+    NSArray<NSString *> *listSelectors = @[@"_experimentalFeatures", @"_features", @"_internalFeatures"];
+    NSArray<NSString *> *setterSelectors = @[
+        @"_setEnabled:forExperimentalFeature:",
+        @"_setEnabled:forFeature:",
+        @"_setEnabled:forInternalDebugFeature:"
+    ];
+
+    NSMutableSet<NSString *> *alreadyEnabled = [NSMutableSet set];
+
+    for (NSString *listSelName in listSelectors) {
+        SEL listSel = NSSelectorFromString(listSelName);
+        if (![prefCls respondsToSelector:listSel]) continue;
+
+        NSArray *features = nil;
+        @try {
+            features = ((NSArray *(*)(id, SEL))objc_msgSend)(prefCls, listSel);
+        } @catch (__unused NSException *ex) {
+            features = nil;
+        }
+        if (![features isKindOfClass:[NSArray class]]) continue;
+
+        for (id feat in features) {
+            if (![feat respondsToSelector:keySel]) continue;
+            NSString *featKey = nil;
+            @try {
+                featKey = ((NSString *(*)(id, SEL))objc_msgSend)(feat, keySel);
+            } @catch (__unused NSException *ex) {
+                featKey = nil;
+            }
+            if (![featKey isKindOfClass:[NSString class]] || featKey.length == 0) continue;
+            if (![sTargetKeys containsObject:featKey] || [alreadyEnabled containsObject:featKey]) continue;
+
+            for (NSString *setSelName in setterSelectors) {
+                SEL setSel = NSSelectorFromString(setSelName);
+                if ([prefs respondsToSelector:setSel]) {
+                    @try {
+                        ((void (*)(id, SEL, BOOL, id))objc_msgSend)(prefs, setSel, YES, feat);
+                        [alreadyEnabled addObject:featKey];
+                        unlockedCount++;
+                        break;
+                    } @catch (__unused NSException *ex) {}
+                }
+            }
+        }
+    }
+
+    return unlockedCount;
+}
+
+void JWBridgeConfigureWebViewModernExtras(WKWebView *webView) {
+    if (!webView) return;
+    SEL inspSel = NSSelectorFromString(@"setInspectable:");
+    if ([webView respondsToSelector:inspSel]) {
+        @try {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(webView, inspSel, YES);
+        } @catch (__unused NSException *ex) {}
+    }
 }
