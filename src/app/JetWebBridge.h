@@ -7,7 +7,7 @@
 #import <WebKit/WebKit.h>
 #import <Security/Security.h>
 
-#define JW_VERSION "0.2.1"
+#define JW_VERSION "0.2.2"
 #ifndef JW_COMMIT
 #define JW_COMMIT "dev"
 #endif

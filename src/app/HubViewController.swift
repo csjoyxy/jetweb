@@ -388,6 +388,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     }
     private var lastActiveUptimeBySiteId: [String: TimeInterval] = [:]
     private var lastStreamingUptimeBySiteId: [String: TimeInterval] = [:]
+    private var lastCommitUptimeBySiteId: [String: TimeInterval] = [:]
+    private var lastCrashUptimeBySiteId: [String: TimeInterval] = [:]
+    private var recentCrashCountBySiteId: [String: Int] = [:]
+    private var circuitBrokenReasonBySiteId: [String: String] = [:]
     private var lastAutoTrimUptime: TimeInterval = 0
     private var lastAutoDeepTrimUptime: TimeInterval = 0
     private var lastMemWarningUptime: TimeInterval = 0
@@ -1110,6 +1114,20 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         wakeBtn.addTarget(self, action: #selector(wakeSelectedSiteTapped), for: .touchUpInside)
         hibernatedGlassCard.contentView.addSubview(wakeBtn)
 
+        let repairWakeBtn = UIButton(type: .system)
+        repairWakeBtn.translatesAutoresizingMaskIntoConstraints = false
+        var repairCfg = UIButton.Configuration.tinted()
+        repairCfg.title = "清缓存修复并回首页（保留登录）"
+        repairCfg.image = UIImage(systemName: "wrench.and.screwdriver.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold))
+        repairCfg.imagePadding = 6
+        repairCfg.baseBackgroundColor = .systemTeal
+        repairCfg.baseForegroundColor = .systemTeal
+        repairCfg.cornerStyle = .capsule
+        repairCfg.contentInsets = NSDirectionalEdgeInsets(top: 9, leading: 18, bottom: 9, trailing: 18)
+        repairWakeBtn.configuration = repairCfg
+        repairWakeBtn.addTarget(self, action: #selector(repairSelectedSiteTapped), for: .touchUpInside)
+        hibernatedGlassCard.contentView.addSubview(repairWakeBtn)
+
         let hibManageBtn = UIButton(type: .system)
         hibManageBtn.translatesAutoresizingMaskIntoConstraints = false
         var manageCfg = UIButton.Configuration.tinted()
@@ -1172,7 +1190,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             wakeBtn.topAnchor.constraint(equalTo: hibernatedSubLabel.bottomAnchor, constant: 20),
             wakeBtn.centerXAnchor.constraint(equalTo: hibernatedGlassCard.contentView.centerXAnchor),
 
-            hibManageBtn.topAnchor.constraint(equalTo: wakeBtn.bottomAnchor, constant: 10),
+            repairWakeBtn.topAnchor.constraint(equalTo: wakeBtn.bottomAnchor, constant: 10),
+            repairWakeBtn.centerXAnchor.constraint(equalTo: hibernatedGlassCard.contentView.centerXAnchor),
+
+            hibManageBtn.topAnchor.constraint(equalTo: repairWakeBtn.bottomAnchor, constant: 10),
             hibManageBtn.centerXAnchor.constraint(equalTo: hibernatedGlassCard.contentView.centerXAnchor),
             hibManageBtn.bottomAnchor.constraint(equalTo: hibernatedGlassCard.contentView.bottomAnchor, constant: -24)
         ])
@@ -1548,6 +1569,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private func snapshotLiveURLBeforeHibernate(siteId: String) {
         guard let wv = webViews[siteId],
               let liveStr = wv.url?.absoluteString else { return }
+        if wv.isLoading && wv.estimatedProgress < 0.35 {
+            return
+        }
         let clean = JWURLHelper.sanitizePersistedURL(liveStr)
         guard !clean.isEmpty else { return }
         lastKnownURLBySiteId[siteId] = clean
@@ -1965,6 +1989,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private func reloadSiteFromHomeOrCurrent(siteId: String, forceHome: Bool) {
         guard !siteId.isEmpty else { return }
         if forceHome {
+            circuitBrokenReasonBySiteId.removeValue(forKey: siteId)
+            recentCrashCountBySiteId.removeValue(forKey: siteId)
             clearLastKnownURL(forSiteId: siteId, saveImmediately: true)
         }
         if let cur = site(forId: siteId), cur.hibernated {
@@ -1976,8 +2002,17 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         hideErrorOverlay(forSiteId: siteId)
         touchSiteActivity(siteId: siteId)
 
+        let livePID = JWBridgeWebViewContentPID(wv)
+        let liveMB = (livePID > 0) ? (lastProcStatuses[livePID]?.footprintMB ?? 0) : 0
+
+        if forceHome && (wv.isLoading || livePID <= 0 || liveMB >= 420) {
+            JWLog("WEBKIT", "Hard-recreating WebView for forceHome siteId=\(siteId) prevPID=\(livePID) mb=\(liveMB)")
+            teardownWebView(forSiteId: siteId)
+            syncWebViewsWithConfig(preferredSelectId: siteId)
+            return
+        }
+
         if !forceHome {
-            let livePID = JWBridgeWebViewContentPID(wv)
             let savedMem = JWURLHelper.sanitizePersistedURL(lastKnownURLBySiteId[siteId])
             let savedCfg = JWURLHelper.sanitizePersistedURL(site(forId: siteId)?.lastKnownURL)
             let remembered = !savedMem.isEmpty ? savedMem : savedCfg
@@ -2053,8 +2088,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             progressView.isHidden = true
             let spaceLabel = JWDataStoreHelper.label(for: curSite.dataStoreId)
             let tierText = JWPriorityHelper.tierDescription(customBand: curSite.customBand, globalBand: config.targetBand)
-            hibernatedTitleLabel.text = "\(curSite.title) 已休眠"
-            hibernatedSubLabel.text = "已销毁该标签渲染进程并释放全部运行内存。\n登录空间（\(spaceLabel)）与保活预设（\(tierText)）完整保留。"
+            if let cbMsg = circuitBrokenReasonBySiteId[siteId], !cbMsg.isEmpty {
+                hibernatedTitleLabel.text = "⚡️ \(curSite.title) 已自动熔断保护"
+                hibernatedSubLabel.text = cbMsg
+            } else {
+                hibernatedTitleLabel.text = "\(curSite.title) 已休眠"
+                hibernatedSubLabel.text = "已销毁该标签渲染进程并释放全部运行内存。\n登录空间（\(spaceLabel)）与保活预设（\(tierText)）完整保留。"
+            }
             hibernatedStateView.isHidden = false
             webContainerView.bringSubviewToFront(hibernatedStateView)
         }
@@ -2070,12 +2110,19 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
     }
 
-    private func setSiteHibernated(siteId: String, hibernated: Bool) {
+    private func setSiteHibernated(
+        siteId: String,
+        hibernated: Bool,
+        skipURLSnapshot: Bool = false,
+        circuitBreakMessage: String? = nil
+    ) {
         guard let idx = config.sites.firstIndex(where: { $0.id == siteId }) else { return }
         let title = config.sites[idx].title
         unreadSiteIds.remove(siteId)
 
         if !hibernated {
+            circuitBrokenReasonBySiteId.removeValue(forKey: siteId)
+            recentCrashCountBySiteId.removeValue(forKey: siteId)
             config.sites[idx].enabled = true
             config.sites[idx].hibernated = false
             config.selectedSiteId = siteId
@@ -2086,7 +2133,15 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             return
         }
 
-        snapshotLiveURLBeforeHibernate(siteId: siteId)
+        if let cb = circuitBreakMessage, !cb.isEmpty {
+            circuitBrokenReasonBySiteId[siteId] = cb
+        } else {
+            circuitBrokenReasonBySiteId.removeValue(forKey: siteId)
+        }
+
+        if !skipURLSnapshot {
+            snapshotLiveURLBeforeHibernate(siteId: siteId)
+        }
         pendingURLPersistWorkItem?.cancel()
         pendingURLPersistWorkItem = nil
 
@@ -2095,7 +2150,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         config.sites[idx].hibernated = true
 
         var nextSelected = config.selectedSiteId
-        if config.selectedSiteId == siteId {
+        if config.selectedSiteId == siteId && circuitBreakMessage == nil {
             if let nextAwake = config.sites.first(where: { $0.enabled && !$0.hibernated }) {
                 nextSelected = nextAwake.id
             } else {
@@ -2104,7 +2159,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
         config.selectedSiteId = nextSelected
         config.save()
-        JWLog("HIBERNATE", "Hibernated site=\(title) prevPID=\(prevPID) freed~\(prevMB)MB")
+        JWLog("HIBERNATE", "Hibernated site=\(title) prevPID=\(prevPID) freed~\(prevMB)MB circuitBreak=\(circuitBreakMessage != nil)")
         syncWebViewsWithConfig(preferredSelectId: nextSelected)
     }
 
@@ -2148,6 +2203,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     @objc private func wakeSelectedSiteTapped() {
         guard !config.selectedSiteId.isEmpty else { return }
         setSiteHibernated(siteId: config.selectedSiteId, hibernated: false)
+    }
+
+    @objc private func repairSelectedSiteTapped() {
+        guard !config.selectedSiteId.isEmpty else { return }
+        repairSitePreservingLogin(siteId: config.selectedSiteId)
     }
 
     private func confirmDeleteSite(_ targetSite: SiteItem) {
@@ -2449,6 +2509,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 self?.triggerUserMemoryTrim()
             })
         }
+        hibGroup.append(JWGlassRowItem(
+            symbol: "wrench.and.screwdriver.fill",
+            tint: .systemOrange,
+            title: "修复白屏/卡死（清缓存保登录）",
+            trailingText: "回初始首页"
+        ) { [weak self] in
+            self?.repairSitePreservingLogin(siteId: targetSite.id)
+        })
         let otherAwakeCount = awakeSites().filter { $0.id != targetSite.id }.count
         if otherAwakeCount > 0 {
             hibGroup.append(JWGlassRowItem(
@@ -2898,6 +2966,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 self?.reloadSiteFromHomeOrCurrent(siteId: siteId, forceHome: true)
             },
             JWGlassRowItem(
+                symbol: "wrench.and.screwdriver.fill",
+                tint: .systemOrange,
+                title: "修复白屏/卡死（清缓存保登录）",
+                trailingText: "不掉登录"
+            ) { [weak self] in
+                self?.repairSitePreservingLogin(siteId: siteId)
+            },
+            JWGlassRowItem(
                 symbol: "doc.on.doc",
                 tint: .systemTeal,
                 title: "复制当前页面网址"
@@ -3206,6 +3282,72 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     }
 
     // MARK: - Website Data Clearing & Diagnostic Header
+
+    /// Kills any hung/runaway WebContent process immediately, resets `lastKnownURL` to the site's
+    /// configured home URL, and purges non-cookie caches (IndexedDB, LocalStorage, SessionStorage,
+    /// ServiceWorker, Fetch/Disk/Memory cache) while strictly preserving login Cookies.
+    private func repairSitePreservingLogin(siteId: String) {
+        guard let idx = config.sites.firstIndex(where: { $0.id == siteId }) else { return }
+        let targetSite = config.sites[idx]
+        let title = targetSite.title
+
+        circuitBrokenReasonBySiteId.removeValue(forKey: siteId)
+        recentCrashCountBySiteId.removeValue(forKey: siteId)
+        clearLastKnownURL(forSiteId: siteId, saveImmediately: false)
+
+        let prevPID = JWBridgeWebViewContentPID(webViews[siteId])
+        teardownWebView(forSiteId: siteId)
+
+        config.sites[idx].enabled = true
+        config.sites[idx].hibernated = false
+        config.selectedSiteId = siteId
+        config.save()
+
+        var cacheTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+        cacheTypes.remove(WKWebsiteDataTypeCookies)
+        let since = Date(timeIntervalSince1970: 0)
+        let dsId = JWDataStoreHelper.normalize(targetSite.dataStoreId)
+
+        let finishRepair: () -> Void = { [weak self] in
+            guard let self = self else { return }
+            self.syncWebViewsWithConfig(preferredSelectId: siteId)
+            self.applyDockCollapsedState(animated: false)
+            self.showTopGlassToast(
+                symbol: "checkmark.shield.fill",
+                tint: .systemGreen,
+                text: "已清缓存修复「\(title)」（登录态已保留）"
+            )
+        }
+
+        if JWDataStoreHelper.isIsolated(dsId) {
+            let store = customDataStores[dsId] ?? websiteDataStore(for: targetSite)
+            JWLog("DATA", "Repairing isolated store (preserving cookies) for site=\(title) prevPID=\(prevPID)")
+            store.removeData(ofTypes: cacheTypes, modifiedSince: since) {
+                DispatchQueue.main.async(execute: finishRepair)
+            }
+            return
+        }
+
+        let host = JWURLHelper.hostKey(targetSite.urlString)
+        let rootDomain = HubViewController.rootDomain(of: URL(string: targetSite.urlString))
+        let matchKey = rootDomain.isEmpty ? host : rootDomain
+        JWLog("DATA", "Repairing default-store site=\(title) domain=\(matchKey) prevPID=\(prevPID) (preserving cookies)")
+
+        let defStore = WKWebsiteDataStore.default()
+        defStore.fetchDataRecords(ofTypes: cacheTypes) { records in
+            let matched = records.filter { rec in
+                let dn = rec.displayName.lowercased()
+                return !matchKey.isEmpty && (dn == matchKey || dn.contains(matchKey) || host.contains(dn))
+            }
+            if !matched.isEmpty {
+                defStore.removeData(ofTypes: cacheTypes, for: matched) {
+                    DispatchQueue.main.async(execute: finishRepair)
+                }
+            } else {
+                DispatchQueue.main.async(execute: finishRepair)
+            }
+        }
+    }
 
     private func clearDataForSite(siteId: String) {
         guard let targetSite = site(forId: siteId) else { return }
@@ -3676,16 +3818,23 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         guard config.autoMemoryTrimEnabled, !isTrimmingMemory else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let softTabMB = max(210, Int(Double(config.maxMemoryMB) * 0.72))
+        let runawayTabCap = max(960, config.maxMemoryMB + 360)
 
-        if (snap.maxBgTabMB > config.maxMemoryMB || snap.totalMB >= 1120) && (now - lastAutoDeepTrimUptime) >= 90.0 {
+        if (snap.maxBgTabMB > config.maxMemoryMB || snap.totalMB >= 1120 || snap.maxAwakeTabMB >= runawayTabCap)
+            && (now - lastAutoDeepTrimUptime) >= 40.0 {
             lastAutoDeepTrimUptime = now
             lastAutoTrimUptime = now
             performMemoryTrim(
                 deep: true,
                 reason: "patrol-high(\(snap.totalMB)MB)",
-                showFeedbackToast: false,
-                completion: nil
-            )
+                showFeedbackToast: false
+            ) { [weak self] summary in
+                guard let self = self else { return }
+                _ = self.tryTripRunawayActiveTabCircuitBreaker(
+                    savedByTrim: max(0, summary?.savedMB ?? 0),
+                    reason: "patrol-high"
+                )
+            }
         } else if (snap.maxAwakeTabMB >= softTabMB || snap.totalMB >= 820) && (now - lastAutoTrimUptime) >= 55.0 {
             lastAutoTrimUptime = now
             performMemoryTrim(
@@ -3695,6 +3844,44 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 completion: nil
             )
         }
+    }
+
+    /// Protects 4GB devices from single-tab infinite JS/DOM allocation loops (e.g. >960MB live heap
+    /// with <32MB reclaimable by deep GC) that would otherwise peg 100% CPU, overheat the phone,
+    /// and brick WebContent responsiveness.
+    @discardableResult
+    private func tryTripRunawayActiveTabCircuitBreaker(savedByTrim: Int, reason: String) -> Bool {
+        guard config.autoHibernateOnCriticalMemory else { return false }
+        let selId = config.selectedSiteId
+        guard !selId.isEmpty,
+              let curSite = site(forId: selId),
+              !curSite.hibernated,
+              let wv = webViews[selId] else { return false }
+
+        let pid = JWBridgeWebViewContentPID(wv)
+        let tabMB = (pid > 0) ? (lastProcStatuses[pid]?.footprintMB ?? 0) : 0
+        let runawayTabCap = max(960, config.maxMemoryMB + 360)
+        guard tabMB >= runawayTabCap && savedByTrim < 32 else { return false }
+
+        let wasStuckLoading = wv.isLoading
+        if wasStuckLoading {
+            clearLastKnownURL(forSiteId: selId, saveImmediately: true)
+        }
+        let cbDetail = "检测到页面脚本异常占用 \(tabMB) MB 内存（无损回收仅释放 \(savedByTrim) MB），已自动熔断销毁渲染进程防止手机发烫。\n若唤醒后仍卡白屏，请点击下方「清缓存修复并回首页（保留登录）」。"
+        JWLog("MEM-WARN", "Runaway circuit breaker tripped! site=\(curSite.title) pid=\(pid) tabMB=\(tabMB) saved=\(savedByTrim)MB loading=\(wasStuckLoading) reason=\(reason)")
+
+        setSiteHibernated(
+            siteId: selId,
+            hibernated: true,
+            skipURLSnapshot: true,
+            circuitBreakMessage: cbDetail
+        )
+        let banner = "⚡️「\(curSite.title)」内存失控(\(tabMB)MB)已自动熔断防发烫"
+        runtime.helperBannerText = banner
+        if UIApplication.shared.applicationState == .active {
+            showTopGlassToast(symbol: "exclamationmark.shield.fill", tint: .systemOrange, text: banner)
+        }
+        return true
     }
 
     private func evaluateEmergencyAutoHibernateAfterWarning(
@@ -3716,6 +3903,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             && (postSnap.totalMB > criticalTotalCap || hasOverLimitBgTab || (isRepeatedWarning && postSnap.totalMB > 560))
 
         guard needEvict else {
+            if tryTripRunawayActiveTabCircuitBreaker(savedByTrim: savedByTrim, reason: "mem-warning") {
+                return
+            }
             JWLog("MEM-TRIM", "Memory warning absorbed by lossless trim (saved=\(savedByTrim)MB after=\(postSnap.totalMB)MB detached=\(detachedCount))")
             if UIApplication.shared.applicationState == .active && savedByTrim > 0 {
                 showTopGlassToast(
@@ -3792,13 +3982,24 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
     }
 
+    private func hasAwakeOverheatedOrRunawayTab() -> Bool {
+        let bgAudioMemCap = max(780, config.maxMemoryMB + 180)
+        for s in awakeSites() {
+            let pid = JWBridgeWebViewContentPID(webViews[s.id])
+            if pid > 0 && (lastProcStatuses[pid]?.footprintMB ?? 0) >= bgAudioMemCap {
+                return true
+            }
+        }
+        return false
+    }
+
     private func hasRecentConversationTaskForBgGuard() -> Bool {
+        if hasAwakeOverheatedOrRunawayTab() {
+            return false
+        }
         let now = ProcessInfo.processInfo.systemUptime
         for s in awakeSites() where s.notifyEnabled {
             if let stAt = lastStreamingUptimeBySiteId[s.id], (now - stAt) < 180.0 {
-                return true
-            }
-            if let wv = webViews[s.id], wv.isLoading {
                 return true
             }
         }
@@ -3902,9 +4103,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         evaluateIdleAutoHibernation(reason: "enter-bg")
         syncAllWebViewHostStates(appActive: false)
 
+        let overheated = hasAwakeOverheatedOrRunawayTab()
         let hasNotifyCandidate = config.hasAwakeNotifySite() && config.bgNotifyGuardMinutes > 0
         let activeConvTask = hasRecentConversationTaskForBgGuard()
-        let shouldStartBgAudio = hasNotifyCandidate && (!config.bgSmartNotifyOnly || activeConvTask)
+        let shouldStartBgAudio = hasNotifyCandidate && !overheated && (!config.bgSmartNotifyOnly || activeConvTask)
 
         if config.idleDetachSeconds > 0 {
             let now = ProcessInfo.processInfo.systemUptime
@@ -3924,10 +4126,12 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             )
         } else {
             JWNotificationManager.shared.stopBackgroundListening(
-                reason: hasNotifyCandidate ? "smart_idle_freeze" : "no_awake_notify_site",
+                reason: overheated ? "runaway_mem_guard" : (hasNotifyCandidate ? "smart_idle_freeze" : "no_awake_notify_site"),
                 triggerJetsamGuard: false
             )
-            if hasNotifyCandidate && config.bgSmartNotifyOnly {
+            if overheated {
+                JWLog("NOTIFY", "Runaway memory guard -> skipping BG audio listener to prevent overheating")
+            } else if hasNotifyCandidate && config.bgSmartNotifyOnly {
                 JWLog("NOTIFY", "Smart-skip BG audio listener (no active reply/task in 3m) -> 0-power freeze with Jetsam guard")
             }
         }
@@ -4352,6 +4556,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         if let sid = siteId(for: webView) {
+            lastCommitUptimeBySiteId[sid] = ProcessInfo.processInfo.systemUptime
             terminatedSiteIds.remove(sid)
             hideErrorOverlay(forSiteId: sid)
             let sTitle = site(forId: sid)?.title ?? sid
@@ -4454,11 +4659,35 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let sTitle = site(forId: hitId)?.title ?? hitId
         let st = UIApplication.shared.applicationState
         let isSelected = (hitId == config.selectedSiteId)
-        JWLog("TERM", "WebContent terminated! site=\(sTitle) selected=\(isSelected) appState=\(st.rawValue)")
+        let now = ProcessInfo.processInfo.systemUptime
+
+        let sinceCommit = now - (lastCommitUptimeBySiteId[hitId] ?? 0)
+        let crashedSoonAfterCommit = (lastCommitUptimeBySiteId[hitId] != nil && sinceCommit < 45.0)
+
+        let prevCrashAt = lastCrashUptimeBySiteId[hitId] ?? 0
+        let crashCount = ((now - prevCrashAt) < 90.0 ? (recentCrashCountBySiteId[hitId] ?? 0) : 0) + 1
+        lastCrashUptimeBySiteId[hitId] = now
+        recentCrashCountBySiteId[hitId] = crashCount
+
+        if crashedSoonAfterCommit {
+            clearLastKnownURL(forSiteId: hitId, saveImmediately: true)
+        }
+        JWLog("TERM", "WebContent terminated! site=\(sTitle) selected=\(isSelected) appState=\(st.rawValue) sinceCommit=\(Int(sinceCommit))s crashCount=\(crashCount)")
         refreshRuntimeWebPIDMap()
 
+        if crashCount >= 2 {
+            let cbMsg = "页面渲染进程在短时间内连续崩溃 \(crashCount) 次，已暂停自动重载防止死循环发烫。\n建议点击下方「清缓存修复并回首页（保留登录）」恢复访问。"
+            setSiteHibernated(
+                siteId: hitId,
+                hibernated: true,
+                skipURLSnapshot: true,
+                circuitBreakMessage: cbMsg
+            )
+            return
+        }
+
         if isSelected && st == .active {
-            reloadSiteFromHomeOrCurrent(siteId: hitId, forceHome: false)
+            reloadSiteFromHomeOrCurrent(siteId: hitId, forceHome: crashedSoonAfterCommit)
         } else {
             terminatedSiteIds.insert(hitId)
             rebuildTabPills()
