@@ -15,6 +15,8 @@ final class WeakScriptMessageProxy: NSObject, WKScriptMessageHandler {
 }
 
 enum WebScripts {
+    static let cssFetchMessageHandlerName = "jbCSSFetch"
+
     /// Modern ES2023–ES2026 & Web scheduling compatibility layer (100% verbatim parity with JetBrowser's WebCompatEngine).
     /// Runs in `.page` world with zero DOM observers and zero prototype conflicts.
     static func compatPolyfillScript() -> WKUserScript {
@@ -787,6 +789,849 @@ enum WebScripts {
             in: .page
         )
     }
+
+    static func makeCSSCompatUserScript() -> WKUserScript {
+        return WKUserScript(
+            source: cssCompatJavaScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false,
+            in: .page
+        )
+    }
+
+    // MARK: - Modern CSS Soft-Upgrade Engine (Tailwind v4 / CSS Nesting / light-dark() / @scope / Shadow DOM)
+
+    static let cssCompatJavaScript: String = #"""
+(function() {
+  'use strict';
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+  if (window.__jbCSSCompatInstalled) return;
+  try {
+    Object.defineProperty(window, '__jbCSSCompatInstalled', { value: true, configurable: false, enumerable: false, writable: false });
+  } catch (_) {
+    window.__jbCSSCompatInstalled = true;
+  }
+
+  // 1. Live engine capability detection (0 overhead on future iOS versions that support everything natively)
+  var hasCSSSupports = typeof CSS !== 'undefined' && typeof CSS.supports === 'function';
+  var hasLightDark = hasCSSSupports && CSS.supports('color', 'light-dark(#fff, #000)');
+  var hasColorMix = hasCSSSupports && CSS.supports('color', 'color-mix(in srgb, #fff 100%, #000)');
+  var hasScope = typeof window.CSSScopeRule !== 'undefined';
+  var hasStartingStyle = typeof window.CSSStartingStyleRule !== 'undefined';
+  var hasRelColorCurrent = hasCSSSupports && CSS.supports('color', 'rgb(from currentColor r g b / 0.5)');
+  var hasNesting = false;
+  try {
+    var probeDoc = document.implementation.createHTMLDocument('');
+    var probeStyle = probeDoc.createElement('style');
+    probeStyle.textContent = '.a{b{color:red}@media all{color:blue}z-index:3}';
+    probeDoc.head.appendChild(probeStyle);
+    var r0 = probeStyle.sheet && probeStyle.sheet.cssRules && probeStyle.sheet.cssRules[0];
+    if (r0 && r0.cssRules && r0.cssRules.length === 2 && r0.style && r0.style.zIndex === '3') {
+      hasNesting = true;
+    }
+  } catch (_) {}
+
+  if (hasNesting && hasLightDark && hasScope && hasStartingStyle && hasRelColorCurrent) {
+    return;
+  }
+
+  var preferDarkMedia = null;
+  try {
+    preferDarkMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+  } catch (_) {}
+
+  var LEAF_AT_RE = /^@(?:-(?:webkit|moz|o|ms)-)?(?:keyframes|font-face|property|page|counter-style|font-palette-values|color-profile)\b/i;
+  var COND_AT_RE = /^@(?:media|supports|container|layer|document)\b/i;
+
+  function skipString(str, i) {
+    var quote = str.charCodeAt(i);
+    var len = str.length;
+    i++;
+    while (i < len) {
+      var c = str.charCodeAt(i);
+      if (c === 92) { i += 2; continue; }
+      if (c === quote) return i + 1;
+      i++;
+    }
+    return len;
+  }
+
+  function skipComment(str, i) {
+    var end = str.indexOf('*/', i + 2);
+    return end === -1 ? str.length : end + 2;
+  }
+
+  function findMatchingParen(str, openIdx) {
+    var len = str.length;
+    var depth = 1, i = openIdx + 1;
+    while (i < len && depth > 0) {
+      var c = str.charCodeAt(i);
+      if (c === 92) { i += 2; continue; }
+      if (c === 34 || c === 39) { i = skipString(str, i); continue; }
+      if (c === 47 && str.charCodeAt(i + 1) === 42) { i = skipComment(str, i); continue; }
+      if (c === 40) depth++;
+      else if (c === 41) depth--;
+      i++;
+    }
+    return depth === 0 ? i - 1 : -1;
+  }
+
+  function splitTopLevelCommas(str) {
+    var parts = [];
+    var len = str.length;
+    var pDepth = 0, bDepth = 0, start = 0, i = 0;
+    while (i < len) {
+      var c = str.charCodeAt(i);
+      if (c === 92) { i += 2; continue; }
+      if (c === 34 || c === 39) { i = skipString(str, i); continue; }
+      if (c === 47 && str.charCodeAt(i + 1) === 42) { i = skipComment(str, i); continue; }
+      if (c === 40) pDepth++;
+      else if (c === 41) { if (pDepth > 0) pDepth--; }
+      else if (c === 91) bDepth++;
+      else if (c === 93) { if (bDepth > 0) bDepth--; }
+      else if (c === 44 && pDepth === 0 && bDepth === 0) {
+        var s = str.slice(start, i).trim();
+        if (s) parts.push(s);
+        start = i + 1;
+      }
+      i++;
+    }
+    var tail = str.slice(start).trim();
+    if (tail) parts.push(tail);
+    return parts;
+  }
+
+  var didEmitLightDark = false;
+
+  function mayNeedValueTransform(str) {
+    if (!hasLightDark && (str.indexOf('light-dark(') !== -1 || str.indexOf('LIGHT-DARK(') !== -1)) return true;
+    if (!hasRelColorCurrent && hasColorMix && str.indexOf('from ') !== -1) return true;
+    return false;
+  }
+
+  function transformValues(val) {
+    if (!val || !mayNeedValueTransform(val)) return val;
+    var out = val;
+
+    if (!hasLightDark && out.toLowerCase().indexOf('light-dark(') !== -1) {
+      var res = '';
+      var i = 0, lastCopy = 0;
+      var len = out.length;
+      while (i < len) {
+        var c = out.charCodeAt(i);
+        if (c === 92) { i += 2; continue; }
+        if (c === 34 || c === 39) { i = skipString(out, i); continue; }
+        if (c === 47 && out.charCodeAt(i + 1) === 42) { i = skipComment(out, i); continue; }
+        if ((c === 108 || c === 76) && out.slice(i, i + 11).toLowerCase() === 'light-dark(') {
+          var prev = i > 0 ? out.charCodeAt(i - 1) : 0;
+          var isIdentPrev = (prev >= 48 && prev <= 57) || (prev >= 65 && prev <= 90) || (prev >= 97 && prev <= 122) || prev === 45 || prev === 95;
+          if (!isIdentPrev) {
+            var openIdx = i + 10;
+            var closeIdx = findMatchingParen(out, openIdx);
+            if (closeIdx !== -1) {
+              var args = splitTopLevelCommas(out.slice(openIdx + 1, closeIdx));
+              if (args.length === 2) {
+                var a = transformValues(args[0]);
+                var b = transformValues(args[1]);
+                didEmitLightDark = true;
+                res += out.slice(lastCopy, i);
+                if (hasColorMix) {
+                  res += 'color-mix(in srgb, ' + a + ' var(--jb-ld-pct, 100%), ' + b + ')';
+                } else {
+                  var isDarkNow = !!(preferDarkMedia && preferDarkMedia.matches);
+                  res += isDarkNow ? b : a;
+                }
+                i = closeIdx + 1;
+                lastCopy = i;
+                continue;
+              }
+            }
+          }
+        }
+        i++;
+      }
+      if (lastCopy > 0) out = res + out.slice(lastCopy);
+    }
+
+    if (!hasRelColorCurrent && hasColorMix && out.indexOf('from ') !== -1) {
+      out = out.replace(/\b(?:rgba?|srgb|oklch|oklab|hsla?)\(\s*from\s+([^)\s]+)\s+(?:r\s+g\s+b|l\s+c\s+h|l\s+a\s+b|h\s+s\s+l)\s*\/\s*([^)]+)\)/gi, function(_, origin, alpha) {
+        var a = alpha.trim();
+        if (a.endsWith('%')) return 'color-mix(in srgb, ' + origin + ' ' + a + ', transparent)';
+        var num = parseFloat(a);
+        if (!Number.isNaN(num)) {
+          var pct = Math.max(0, Math.min(100, +(num * 100).toFixed(3)));
+          return 'color-mix(in srgb, ' + origin + ' ' + pct + '%, transparent)';
+        }
+        return 'color-mix(in srgb, ' + origin + ' calc(' + a + ' * 100%), transparent)';
+      });
+    }
+
+    return out;
+  }
+
+  function hasUnescapedAmpersand(sel) {
+    var len = sel.length;
+    var i = 0;
+    while (i < len) {
+      var c = sel.charCodeAt(i);
+      if (c === 92) { i += 2; continue; }
+      if (c === 34 || c === 39) { i = skipString(sel, i); continue; }
+      if (c === 38) return true;
+      i++;
+    }
+    return false;
+  }
+
+  function hasPseudoElement(sel) {
+    var len = sel.length;
+    var pDepth = 0, bDepth = 0, i = 0;
+    while (i < len) {
+      var c = sel.charCodeAt(i);
+      if (c === 92) { i += 2; continue; }
+      if (c === 34 || c === 39) { i = skipString(sel, i); continue; }
+      if (c === 40) pDepth++;
+      else if (c === 41 && pDepth > 0) pDepth--;
+      else if (c === 91) bDepth++;
+      else if (c === 93 && bDepth > 0) bDepth--;
+      else if (c === 58 && sel.charCodeAt(i + 1) === 58 && pDepth === 0 && bDepth === 0) return true;
+      i++;
+    }
+    return false;
+  }
+
+  function hasUnescapedTopLevelCombinator(sel) {
+    var len = sel.length;
+    var pDepth = 0, bDepth = 0, i = 0;
+    while (i < len) {
+      var c = sel.charCodeAt(i);
+      if (c === 92) { i += 2; continue; }
+      if (c === 34 || c === 39) { i = skipString(sel, i); continue; }
+      if (c === 40) pDepth++;
+      else if (c === 41 && pDepth > 0) pDepth--;
+      else if (c === 91) bDepth++;
+      else if (c === 93 && bDepth > 0) bDepth--;
+      else if (pDepth === 0 && bDepth === 0 && (c === 32 || c === 62 || c === 43 || c === 126)) return true;
+      i++;
+    }
+    return false;
+  }
+
+  function resolveSinglePair(par, ch, parComplex) {
+    if (hasUnescapedAmpersand(ch)) {
+      var res = '';
+      var len = ch.length;
+      var i = 0;
+      while (i < len) {
+        var c = ch.charCodeAt(i);
+        if (c === 92) { res += ch.slice(i, i + 2); i += 2; continue; }
+        if (c === 34 || c === 39) { var nx = skipString(ch, i); res += ch.slice(i, nx); i = nx; continue; }
+        if (c === 38) {
+          var prev = i > 0 ? ch.charCodeAt(i - 1) : 0;
+          var prevIsIdent = (prev >= 48 && prev <= 57) || (prev >= 65 && prev <= 90) || (prev >= 97 && prev <= 122) || prev === 45 || prev === 95 || prev === 41 || prev === 93;
+          var needIs = (prevIsIdent && /^[a-zA-Z*]/.test(par)) || (i > 0 && parComplex && ch.slice(0, i).trim().length > 0 && ch[0] !== ':');
+          res += needIs ? (':is(' + par + ')') : par;
+          i++;
+          continue;
+        }
+        res += ch[i++];
+      }
+      return res;
+    }
+    return par + ' ' + ch;
+  }
+
+  function resolveSelectors(parentSel, childSel) {
+    if (!parentSel) return childSel.trim();
+    var parents = splitTopLevelCommas(parentSel);
+    var children = splitTopLevelCommas(childSel);
+    var anyPseudo = parents.some(hasPseudoElement) || children.some(hasPseudoElement);
+
+    if (parents.length > 1 && !anyPseudo) {
+      var wrappedParent = ':is(' + parents.join(', ') + ')';
+      var mapped = [];
+      for (var k = 0; k < children.length; k++) {
+        mapped.push(resolveSinglePair(wrappedParent, children[k], false));
+      }
+      return mapped.join(', ');
+    }
+
+    var out = [];
+    for (var p = 0; p < parents.length; p++) {
+      var par = parents[p];
+      var parComplex = !anyPseudo && hasUnescapedTopLevelCombinator(par);
+      for (var c = 0; c < children.length; c++) {
+        out.push(resolveSinglePair(par, children[c], parComplex));
+      }
+    }
+    return out.join(', ');
+  }
+
+  function quickNeedsTranspile(css) {
+    if (!css || css.length < 4) return false;
+    if (!hasLightDark && (css.indexOf('light-dark(') !== -1 || css.indexOf('LIGHT-DARK(') !== -1)) return true;
+    if (!hasScope && css.indexOf('@scope') !== -1) return true;
+    if (!hasStartingStyle && css.indexOf('@starting-style') !== -1) return true;
+    if (!hasRelColorCurrent && css.indexOf('from ') !== -1 && /from\s+currentColor/i.test(css)) return true;
+    if (!hasNesting) {
+      var len = css.length;
+      var pDepth = 0, bDepth = 0, i = 0, tokenStart = 0;
+      var stack = [];
+      while (i < len) {
+        var c = css.charCodeAt(i);
+        if (c === 92) { i += 2; continue; }
+        if (c === 34 || c === 39) { i = skipString(css, i); continue; }
+        if (c === 47 && css.charCodeAt(i + 1) === 42) { i = skipComment(css, i); continue; }
+        if (c === 40) { pDepth++; i++; continue; }
+        if (c === 41) { if (pDepth > 0) pDepth--; i++; continue; }
+        if (c === 91) { bDepth++; i++; continue; }
+        if (c === 93) { if (bDepth > 0) bDepth--; i++; continue; }
+        if (pDepth === 0 && bDepth === 0) {
+          if (c === 59) { tokenStart = i + 1; i++; continue; }
+          if (c === 123) {
+            var top = stack.length > 0 ? stack[stack.length - 1] : -1;
+            if (top === 2) return true;
+            if (top === 1) { stack.push(1); tokenStart = i + 1; i++; continue; }
+            var s = tokenStart;
+            while (s < i) {
+              var sc = css.charCodeAt(s);
+              if (sc <= 32) { s++; continue; }
+              if (sc === 47 && css.charCodeAt(s + 1) === 42) { s = skipComment(css, s); continue; }
+              break;
+            }
+            if (s < i && css.charCodeAt(s) === 64) {
+              var prel = css.slice(s, i).trim();
+              stack.push(LEAF_AT_RE.test(prel) ? 1 : 0);
+            } else {
+              stack.push(2);
+            }
+            tokenStart = i + 1;
+            i++;
+            continue;
+          }
+          if (c === 125) {
+            if (stack.length > 0) stack.pop();
+            tokenStart = i + 1;
+            i++;
+            continue;
+          }
+        }
+        i++;
+      }
+    }
+    return false;
+  }
+
+  function parseItems(css) {
+    var items = [];
+    var len = css.length;
+    var pDepth = 0, bDepth = 0, tokenStart = 0, i = 0;
+
+    while (i < len) {
+      var c = css.charCodeAt(i);
+      if (c === 92) { i += 2; continue; }
+      if (c === 34 || c === 39) { i = skipString(css, i); continue; }
+      if (c === 47 && css.charCodeAt(i + 1) === 42) { i = skipComment(css, i); continue; }
+      if (c === 40) { pDepth++; i++; continue; }
+      if (c === 41) { if (pDepth > 0) pDepth--; i++; continue; }
+      if (c === 91) { bDepth++; i++; continue; }
+      if (c === 93) { if (bDepth > 0) bDepth--; i++; continue; }
+
+      if (pDepth === 0 && bDepth === 0) {
+        if (c === 59) {
+          var stmt = css.slice(tokenStart, i).trim();
+          if (stmt) items.push({ type: 0, text: stmt });
+          tokenStart = i + 1;
+          i++;
+          continue;
+        }
+        if (c === 123) {
+          var prelude = css.slice(tokenStart, i).trim();
+          var braceDepth = 1, j = i + 1, ip = 0, ib = 0, hasInnerBrace = false;
+          while (j < len && braceDepth > 0) {
+            var cc = css.charCodeAt(j);
+            if (cc === 92) { j += 2; continue; }
+            if (cc === 34 || cc === 39) { j = skipString(css, j); continue; }
+            if (cc === 47 && css.charCodeAt(j + 1) === 42) { j = skipComment(css, j); continue; }
+            if (cc === 40) ip++;
+            else if (cc === 41 && ip > 0) ip--;
+            else if (cc === 91) ib++;
+            else if (cc === 93 && ib > 0) ib--;
+            else if (ip === 0 && ib === 0) {
+              if (cc === 123) { braceDepth++; hasInnerBrace = true; }
+              else if (cc === 125) braceDepth--;
+            }
+            j++;
+          }
+          var bodyEnd = braceDepth === 0 ? j - 1 : len;
+          items.push({ type: 1, prelude: prelude, body: css.slice(i + 1, bodyEnd), hasInnerBrace: hasInnerBrace });
+          tokenStart = j;
+          i = j;
+          continue;
+        }
+      }
+      i++;
+    }
+    var rem = css.slice(tokenStart).trim();
+    if (rem) {
+      var cleaned = rem.replace(/\/\*[\s\S]*?\*\//g, '').trim();
+      if (cleaned) items.push({ type: 0, text: rem });
+    }
+    return items;
+  }
+
+  function wrapAt(atWrappers, content) {
+    var res = content;
+    for (var i = atWrappers.length - 1; i >= 0; i--) {
+      res = atWrappers[i] + '{' + res + '}';
+    }
+    return res;
+  }
+
+  function emitRuleList(css, parentSel, atWrappers, out) {
+    var items = parseItems(css);
+    var directDecls = [];
+
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it.type === 0) {
+        if (!parentSel && it.text.charCodeAt(0) === 64) {
+          out.push(wrapAt(atWrappers, it.text + ';'));
+        } else {
+          directDecls.push(transformValues(it.text));
+        }
+      }
+    }
+
+    if (directDecls.length > 0 && parentSel) {
+      out.push(wrapAt(atWrappers, parentSel + '{' + directDecls.join(';') + ';}'));
+      directDecls.length = 0;
+    }
+
+    for (var b = 0; b < items.length; b++) {
+      var blk = items[b];
+      if (blk.type !== 1) continue;
+      var prel = blk.prelude;
+      if (prel.indexOf('/*') !== -1) prel = prel.replace(/\/\*[\s\S]*?\*\//g, '').trim();
+      if (!prel) continue;
+
+      if (!blk.hasInnerBrace && prel.charCodeAt(0) !== 64) {
+        var sel = parentSel ? resolveSelectors(parentSel, prel) : prel;
+        out.push(wrapAt(atWrappers, sel + '{' + transformValues(blk.body) + '}'));
+        continue;
+      }
+
+      if (prel.charCodeAt(0) === 64) {
+        if (LEAF_AT_RE.test(prel)) {
+          out.push(wrapAt(atWrappers, prel + '{' + transformValues(blk.body) + '}'));
+          continue;
+        }
+        if (/^@starting-style\b/i.test(prel)) {
+          if (hasStartingStyle) {
+            var innerStart = [];
+            emitRuleList(blk.body, parentSel, [], innerStart);
+            if (innerStart.length) out.push(wrapAt(atWrappers.concat([prel]), innerStart.join('\n')));
+          }
+          continue;
+        }
+        if (/^@scope\b/i.test(prel) && !hasScope) {
+          var openP = prel.indexOf('(');
+          var scopeRoot = '';
+          if (openP !== -1) {
+            var closeP = findMatchingParen(prel, openP);
+            if (closeP !== -1) scopeRoot = prel.slice(openP + 1, closeP).trim();
+          }
+          var scopeBody = blk.body.replace(/:scope\b/g, '&');
+          var nextSel = scopeRoot ? resolveSelectors(parentSel, ':where(' + scopeRoot + ')') : (parentSel || ':root');
+          emitRuleList(scopeBody, nextSel, atWrappers, out);
+          continue;
+        }
+        if (COND_AT_RE.test(prel)) {
+          if (!parentSel) {
+            if (!blk.hasInnerBrace) {
+              out.push(wrapAt(atWrappers, prel + '{' + transformValues(blk.body) + '}'));
+            } else {
+              var innerCond = [];
+              emitRuleList(blk.body, null, [], innerCond);
+              out.push(wrapAt(atWrappers, prel + '{' + innerCond.join('\n') + '}'));
+            }
+          } else {
+            emitRuleList(blk.body, parentSel, atWrappers.concat([prel]), out);
+          }
+          continue;
+        }
+        out.push(wrapAt(atWrappers, prel + '{' + transformValues(blk.body) + '}'));
+        continue;
+      }
+
+      var resolvedSel = resolveSelectors(parentSel, prel);
+      emitRuleList(blk.body, resolvedSel, atWrappers, out);
+    }
+  }
+
+  function transpileCSS(css) {
+    if (typeof css !== 'string' || !quickNeedsTranspile(css)) return null;
+    var out = [];
+    emitRuleList(css, null, [], out);
+    if (didEmitLightDark) ensureLightDarkVars();
+    return out.join('\n');
+  }
+
+  function rebaseRelativeURLs(css, baseURL) {
+    if (!baseURL || (css.indexOf('url(') === -1 && css.indexOf('URL(') === -1)) return css;
+    return css.replace(/\burl\(\s*(['"]?)([^'")]+)\1\s*\)/gi, function(m, q, rawUrl) {
+      var u = rawUrl.trim();
+      if (!u || u.charAt(0) === '#' || /^(?:data:|blob:|https?:|\/\/)/i.test(u)) return m;
+      try {
+        var abs = new URL(u, baseURL).href;
+        return 'url(' + (q || '"') + abs + (q || '"') + ')';
+      } catch (_) {
+        return m;
+      }
+    });
+  }
+
+  // 2. Reactive --jb-ld-pct variable synchronization for light-dark()
+  var varsInjected = false;
+  var LD_VARS_CSS =
+    ':root,:host,.light,.light-theme,.vscode-light,[data-theme="light"],[data-color-scheme="light"],[data-color-mode="light"]{--jb-ld-pct:100%;}' +
+    '@media (prefers-color-scheme:dark){:root:not(.light):not(.light-theme):not(.vscode-light):not([data-theme="light"]):not([data-color-scheme="light"]):not([data-color-mode="light"]),:host{--jb-ld-pct:0%;}}' +
+    'html:has(>body.dark-theme),html:has(>body.dark),html:has(>body.vscode-dark),.dark,.dark-theme,.vscode-dark,[data-theme="dark"],[data-color-scheme="dark"],[data-color-mode="dark"]{--jb-ld-pct:0%;}' +
+    'html:has(>body.light-theme),html:has(>body.light),html:has(>body.vscode-light){--jb-ld-pct:100%;}';
+
+  function findPageNonce() {
+    try {
+      var el = document.querySelector('style[nonce],link[nonce],script[nonce]');
+      if (el) return el.nonce || el.getAttribute('nonce') || '';
+    } catch (_) {}
+    return '';
+  }
+
+  function syncExplicitColorScheme() {
+    if (!didEmitLightDark || !hasColorMix) return;
+    try {
+      var docEl = document.documentElement;
+      if (!docEl) return;
+      var body = document.body;
+      var bodyCS = body ? (getComputedStyle(body).colorScheme || '').trim().toLowerCase() : '';
+      var rootCS = (getComputedStyle(docEl).colorScheme || '').trim().toLowerCase();
+      var eff = (bodyCS && bodyCS !== 'normal') ? bodyCS : rootCS;
+      if (eff === 'dark' || eff === 'only dark') {
+        docEl.style.setProperty('--jb-ld-pct', '0%');
+      } else if (eff === 'light' || eff === 'only light') {
+        docEl.style.setProperty('--jb-ld-pct', '100%');
+      } else {
+        docEl.style.removeProperty('--jb-ld-pct');
+      }
+    } catch (_) {}
+  }
+
+  function ensureLightDarkVars() {
+    if (varsInjected || !hasColorMix) return;
+    var target = document.head || document.documentElement;
+    if (!target) return;
+    varsInjected = true;
+    try {
+      var st = document.createElement('style');
+      st.setAttribute('data-jb-compat-vars', '1');
+      var n = findPageNonce();
+      if (n) st.nonce = n;
+      st.textContent = LD_VARS_CSS;
+      target.insertBefore(st, target.firstChild);
+    } catch (_) {}
+    syncExplicitColorScheme();
+  }
+
+  // 3. Process <style> and <link rel="stylesheet"> elements
+  var rewrittenTextByStyle = new WeakMap();
+  var processedLinks = new WeakSet();
+
+  function processStyleElement(styleEl) {
+    if (!styleEl || styleEl.hasAttribute('data-jb-compat-vars') || styleEl.hasAttribute('data-jb-compat-link')) return;
+    var raw = styleEl.textContent;
+    if (!raw || rewrittenTextByStyle.get(styleEl) === raw) return;
+    var transpiled = transpileCSS(raw);
+    if (transpiled !== null && transpiled !== raw) {
+      rewrittenTextByStyle.set(styleEl, transpiled);
+      styleEl.textContent = transpiled;
+    } else {
+      rewrittenTextByStyle.set(styleEl, raw);
+    }
+  }
+
+  // Native fallback bridge for cross-origin <link rel="stylesheet"> without CORS headers
+  var pendingCSSFetches = Object.create(null);
+  var nextFetchId = 1;
+  window.__jbResolveCSSFetch = function(id, cssText) {
+    var cb = pendingCSSFetches[id];
+    if (cb) {
+      delete pendingCSSFetches[id];
+      cb(typeof cssText === 'string' ? cssText : null);
+    }
+  };
+
+  function fetchExternalStylesheet(href, done) {
+    var isSameOrigin = false;
+    try {
+      isSameOrigin = (new URL(href, location.href).origin === location.origin);
+    } catch (_) {}
+
+    var fetchOpts = isSameOrigin
+      ? { credentials: 'same-origin', cache: 'force-cache' }
+      : { mode: 'cors', credentials: 'omit', cache: 'force-cache' };
+
+    if (typeof window.fetch === 'function') {
+      window.fetch(href, fetchOpts).then(function(resp) {
+        if (!resp || !resp.ok) throw new Error('HTTP ' + (resp ? resp.status : 0));
+        return resp.text();
+      }).then(function(txt) {
+        done(txt);
+      }).catch(function() {
+        try {
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.jbCSSFetch) {
+            var reqId = 'css_' + (nextFetchId++);
+            pendingCSSFetches[reqId] = done;
+            setTimeout(function() {
+              if (pendingCSSFetches[reqId]) {
+                delete pendingCSSFetches[reqId];
+                done(null);
+              }
+            }, 8000);
+            window.webkit.messageHandlers.jbCSSFetch.postMessage({ id: reqId, url: href });
+            return;
+          }
+        } catch (_) {}
+        done(null);
+      });
+    } else {
+      done(null);
+    }
+  }
+
+  function processLinkElement(linkEl) {
+    if (!linkEl || processedLinks.has(linkEl)) return;
+    var rel = (linkEl.getAttribute('rel') || '').toLowerCase();
+    if (rel.indexOf('stylesheet') === -1 || rel.indexOf('preload') !== -1) return;
+    var href = linkEl.href;
+    if (!href || !/^https?:\/\//i.test(href)) return;
+    // Skip pure Google/Adobe webfont CSS endpoints that never use CSS Nesting or light-dark()
+    if (/^https:\/\/fonts\.googleapis\.com\//i.test(href) || /^https:\/\/use\.typekit\.net\//i.test(href)) return;
+
+    processedLinks.add(linkEl);
+    fetchExternalStylesheet(href, function(rawCSS) {
+      if (!rawCSS || !linkEl.isConnected) return;
+      try {
+        var transpiled = transpileCSS(rawCSS);
+        if (transpiled !== null) {
+          var rebased = rebaseRelativeURLs(transpiled, href);
+          var replacement = document.createElement('style');
+          replacement.setAttribute('data-jb-compat-link', href);
+          var nonce = linkEl.nonce || linkEl.getAttribute('nonce') || findPageNonce();
+          if (nonce) replacement.nonce = nonce;
+          var media = linkEl.getAttribute('media');
+          if (media) replacement.setAttribute('media', media);
+          rewrittenTextByStyle.set(replacement, rebased);
+          replacement.textContent = rebased;
+          if (linkEl.parentNode) {
+            linkEl.parentNode.insertBefore(replacement, linkEl.nextSibling);
+            linkEl.disabled = true;
+          }
+        }
+      } catch (_) {}
+    });
+  }
+
+  function scanSubtree(node) {
+    if (!node) return;
+    var nt = node.nodeType;
+    if (nt === 1) {
+      var tag = node.tagName;
+      if (tag === 'STYLE') {
+        processStyleElement(node);
+        return;
+      }
+      if (tag === 'LINK') {
+        processLinkElement(node);
+        return;
+      }
+      if (node.childElementCount > 0 && node.getElementsByTagName) {
+        var styles = node.getElementsByTagName('style');
+        for (var i = 0; i < styles.length; i++) processStyleElement(styles[i]);
+        var links = node.getElementsByTagName('link');
+        for (var j = 0; j < links.length; j++) processLinkElement(links[j]);
+      }
+    } else if (nt === 11 && node.querySelectorAll) {
+      var fragNodes = node.querySelectorAll('style, link[rel*="stylesheet" i]');
+      for (var k = 0; k < fragNodes.length; k++) {
+        if (fragNodes[k].tagName === 'STYLE') processStyleElement(fragNodes[k]);
+        else processLinkElement(fragNodes[k]);
+      }
+    }
+  }
+
+  // 4. Synchronous pre-insertion DOM hooks (eliminates FOUC on dynamically appended <style> like Angular / Tailwind v4)
+  try {
+    var origAppendChild = Node.prototype.appendChild;
+    Node.prototype.appendChild = function(child) {
+      try { scanSubtree(child); } catch (_) {}
+      return origAppendChild.call(this, child);
+    };
+    var origInsertBefore = Node.prototype.insertBefore;
+    Node.prototype.insertBefore = function(newNode, refNode) {
+      try { scanSubtree(newNode); } catch (_) {}
+      return origInsertBefore.call(this, newNode, refNode);
+    };
+    var origReplaceChild = Node.prototype.replaceChild;
+    Node.prototype.replaceChild = function(newChild, oldChild) {
+      try { scanSubtree(newChild); } catch (_) {}
+      return origReplaceChild.call(this, newChild, oldChild);
+    };
+    var hookVariadicInsert = function(proto, method) {
+      if (!proto || typeof proto[method] !== 'function') return;
+      var orig = proto[method];
+      proto[method] = function() {
+        try {
+          for (var i = 0; i < arguments.length; i++) {
+            var arg = arguments[i];
+            if (arg && typeof arg === 'object') scanSubtree(arg);
+          }
+        } catch (_) {}
+        return orig.apply(this, arguments);
+      };
+    };
+    hookVariadicInsert(Element.prototype, 'append');
+    hookVariadicInsert(Element.prototype, 'prepend');
+    if (typeof DocumentFragment !== 'undefined') {
+      hookVariadicInsert(DocumentFragment.prototype, 'append');
+      hookVariadicInsert(DocumentFragment.prototype, 'prepend');
+    }
+  } catch (_) {}
+
+  // 5. Constructable Stylesheets (Lit / Web Components) & CSSOM insertRule (Emotion / Styled-Components)
+  if (typeof CSSStyleSheet !== 'undefined' && CSSStyleSheet.prototype) {
+    var sp = CSSStyleSheet.prototype;
+    if (typeof sp.replaceSync === 'function') {
+      var origReplaceSync = sp.replaceSync;
+      sp.replaceSync = function(text) {
+        var next = text;
+        try {
+          if (typeof text === 'string') {
+            var tr = transpileCSS(text);
+            if (tr !== null) next = tr;
+          }
+        } catch (_) {}
+        return origReplaceSync.call(this, next);
+      };
+    }
+    if (typeof sp.replace === 'function') {
+      var origReplace = sp.replace;
+      sp.replace = function(text) {
+        var next = text;
+        try {
+          if (typeof text === 'string') {
+            var tr = transpileCSS(text);
+            if (tr !== null) next = tr;
+          }
+        } catch (_) {}
+        return origReplace.call(this, next);
+      };
+    }
+    if (typeof sp.insertRule === 'function') {
+      var origInsertRule = sp.insertRule;
+      sp.insertRule = function(rule, index) {
+        if (typeof rule === 'string' && quickNeedsTranspile(rule)) {
+          try {
+            var out = [];
+            emitRuleList(rule, null, [], out);
+            if (didEmitLightDark) ensureLightDarkVars();
+            if (out.length === 1) {
+              return index !== undefined ? origInsertRule.call(this, out[0], index) : origInsertRule.call(this, out[0]);
+            } else if (out.length > 1) {
+              var grouped = '@media all{' + out.join('\n') + '}';
+              return index !== undefined ? origInsertRule.call(this, grouped, index) : origInsertRule.call(this, grouped);
+            }
+          } catch (_) {}
+        }
+        return index !== undefined ? origInsertRule.call(this, rule, index) : origInsertRule.call(this, rule);
+      };
+    }
+  }
+
+  // 6. MutationObserver for SSR <style> streaming, in-place <style> text mutations, ShadowRoots & theme toggles
+  function observeRoot(root) {
+    if (!root || typeof MutationObserver === 'undefined') return;
+    var mo = new MutationObserver(function(mutations) {
+      var checkTheme = false;
+      for (var i = 0; i < mutations.length; i++) {
+        var m = mutations[i];
+        if (m.type === 'childList') {
+          var t = m.target;
+          if (t && t.nodeType === 1 && t.tagName === 'STYLE') {
+            processStyleElement(t);
+            continue;
+          }
+          var added = m.addedNodes;
+          for (var j = 0; j < added.length; j++) {
+            scanSubtree(added[j]);
+          }
+        } else if (m.type === 'characterData') {
+          var p = m.target && m.target.parentNode;
+          if (p && p.nodeType === 1 && p.tagName === 'STYLE') {
+            processStyleElement(p);
+          }
+        } else if (m.type === 'attributes') {
+          var at = m.target;
+          if (at === document.documentElement || at === document.body) {
+            checkTheme = true;
+          } else if (at && at.nodeType === 1 && at.tagName === 'LINK') {
+            processLinkElement(at);
+          }
+        }
+      }
+      if (checkTheme) syncExplicitColorScheme();
+    });
+    try {
+      mo.observe(root, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme', 'data-color-scheme', 'data-color-mode', 'href', 'rel']
+      });
+    } catch (_) {}
+  }
+
+  if (typeof Element !== 'undefined' && Element.prototype && typeof Element.prototype.attachShadow === 'function') {
+    var origAttachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function(init) {
+      var sr = origAttachShadow.call(this, init);
+      try { observeRoot(sr); } catch (_) {}
+      return sr;
+    };
+  }
+
+  if (document.documentElement) {
+    if (didEmitLightDark) ensureLightDarkVars();
+    scanSubtree(document.documentElement);
+    observeRoot(document.documentElement);
+  } else {
+    var bootMo = new MutationObserver(function() {
+      if (document.documentElement) {
+        bootMo.disconnect();
+        if (didEmitLightDark) ensureLightDarkVars();
+        scanSubtree(document.documentElement);
+        observeRoot(document.documentElement);
+      }
+    });
+    bootMo.observe(document, { childList: true });
+  }
+
+  document.addEventListener('DOMContentLoaded', function() {
+    if (didEmitLightDark) ensureLightDarkVars();
+    if (document.documentElement) scanSubtree(document.documentElement);
+    syncExplicitColorScheme();
+  }, { once: true });
+})();
+"""#
 
     /// Event-driven input contrast guard running strictly in `.page` (main frame only) so WebKit
     /// never allocates a duplicate `.defaultClient` DOMWrapperWorld across large SPA DOM trees.
