@@ -245,6 +245,8 @@ struct SiteItem: Identifiable, Equatable {
     var lockdownMode: String
     /// 持久化的上次停留对话/子页面地址（重启或休眠唤醒后精准恢复）
     var lastKnownURL: String
+    /// true = 纯净原生模式（零辅助脚本注入，100% 等同自带 Safari 裸 WKWebView）
+    var pureMode: Bool
 
     init(
         id: String = UUID().uuidString,
@@ -258,7 +260,8 @@ struct SiteItem: Identifiable, Equatable {
         notifyEnabled: Bool = true,
         autoHibernateExempt: Bool = false,
         lockdownMode: String = JWConstants.siteLockdownInherit,
-        lastKnownURL: String = ""
+        lastKnownURL: String = "",
+        pureMode: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -272,6 +275,7 @@ struct SiteItem: Identifiable, Equatable {
         self.autoHibernateExempt = autoHibernateExempt
         self.lockdownMode = JWLockdownHelper.normalizeSite(lockdownMode)
         self.lastKnownURL = JWURLHelper.sanitizePersistedURL(lastKnownURL)
+        self.pureMode = pureMode
     }
 
     var isIsolatedStore: Bool {
@@ -291,6 +295,7 @@ struct SiteItem: Identifiable, Equatable {
         let autoHibernateExempt = (dict["autoHibernateExempt"] as? NSNumber)?.boolValue ?? (dict["autoHibernateExempt"] as? Bool) ?? false
         let lockdownMode = JWLockdownHelper.normalizeSite(dict["lockdownMode"] as? String)
         let lastKnownURL = JWURLHelper.sanitizePersistedURL(dict["lastKnownURL"] as? String)
+        let pureMode = (dict["pureMode"] as? NSNumber)?.boolValue ?? (dict["pureMode"] as? Bool) ?? false
         return SiteItem(
             id: sid,
             title: rawTitle.isEmpty ? url : rawTitle,
@@ -303,7 +308,8 @@ struct SiteItem: Identifiable, Equatable {
             notifyEnabled: notifyEnabled,
             autoHibernateExempt: autoHibernateExempt,
             lockdownMode: lockdownMode,
-            lastKnownURL: lastKnownURL
+            lastKnownURL: lastKnownURL,
+            pureMode: pureMode
         )
     }
 
@@ -319,7 +325,8 @@ struct SiteItem: Identifiable, Equatable {
             "hibernated": hibernated,
             "notifyEnabled": notifyEnabled,
             "autoHibernateExempt": autoHibernateExempt,
-            "lockdownMode": JWLockdownHelper.normalizeSite(lockdownMode)
+            "lockdownMode": JWLockdownHelper.normalizeSite(lockdownMode),
+            "pureMode": pureMode
         ]
         let cleanLast = JWURLHelper.sanitizePersistedURL(lastKnownURL)
         if !cleanLast.isEmpty {

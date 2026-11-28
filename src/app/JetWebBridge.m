@@ -675,3 +675,59 @@ void JWBridgeApplyWebpageLockdownPreference(WKWebpagePreferences *prefs, BOOL lo
         } @catch (__unused NSException *ex) {}
     }
 }
+
+NSUInteger JWBridgeUnlockExperimentalWebKitFeatures(WKPreferences *prefs) {
+    if (!prefs) return 0;
+    static NSSet<NSString *> *sSafeFeatureKeys = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sSafeFeatureKeys = [NSSet setWithArray:@[
+            @"RequestIdleCallback",
+            @"OffscreenCanvas",
+            @"OffscreenCanvasInWorkers",
+            @"CSSSubgridEnabled",
+            @"CSSNestingEnabled",
+            @"ConstructableStylesheets",
+            @"FetchPriority",
+            @"ImportMaps",
+            @"HTMLPopoverAttribute",
+            @"DialogElement",
+            @"LazyImageLoading",
+            @"BroadcastChannel",
+            @"UserActivationAPI",
+            @"WebAnimationsCompositeOperations"
+        ]];
+    });
+
+    NSUInteger enabledCount = 0;
+    Class prefCls = [WKPreferences class];
+    NSArray<NSArray<NSString *> *> *pairs = @[
+        @[@"_experimentalFeatures", @"_setEnabled:forExperimentalFeature:"],
+        @[@"_features", @"_setEnabled:forFeature:"],
+        @[@"_internalFeatures", @"_setEnabled:forInternalFeature:"]
+    ];
+    SEL keySel = NSSelectorFromString(@"key");
+
+    for (NSArray<NSString *> *pair in pairs) {
+        SEL listSel = NSSelectorFromString(pair[0]);
+        SEL setSel = NSSelectorFromString(pair[1]);
+        SEL altSetSel = NSSelectorFromString(@"_setEnabled:forFeature:");
+        if (![prefCls respondsToSelector:listSel]) continue;
+        SEL activeSetSel = [prefs respondsToSelector:setSel] ? setSel : ([prefs respondsToSelector:altSetSel] ? altSetSel : NULL);
+        if (!activeSetSel) continue;
+
+        @try {
+            NSArray *features = ((NSArray *(*)(id, SEL))objc_msgSend)(prefCls, listSel);
+            if (![features isKindOfClass:[NSArray class]]) continue;
+            for (id feat in features) {
+                if (![feat respondsToSelector:keySel]) continue;
+                NSString *k = ((NSString *(*)(id, SEL))objc_msgSend)(feat, keySel);
+                if ([k isKindOfClass:[NSString class]] && [sSafeFeatureKeys containsObject:k]) {
+                    ((void (*)(id, SEL, BOOL, id))objc_msgSend)(prefs, activeSetSel, YES, feat);
+                    enabledCount++;
+                }
+            }
+        } @catch (__unused NSException *ex) {}
+    }
+    return enabledCount;
+}

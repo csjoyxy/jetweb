@@ -1193,8 +1193,17 @@ struct SiteDetailView: View {
 
                 Section(
                     header: Text("通知、内存释放、锁定防护与外观"),
-                    footer: Text("信任的常驻站点豁免后完整启用 JIT / Wasm 与图标字体；若访问不信任外站，可单独为此标签开启「🔒 强制锁定」隔离防护。")
+                    footer: Text("默认已采用零前台观察器的极速兼容引擎；如遇特殊网页，也可开启「🍃 纯净原生模式」彻底关闭全部辅助脚本，100% 等同自带 Safari。")
                 ) {
+                    Toggle("🍃 纯净原生模式（零辅助脚本注入）", isOn: Binding(
+                        get: { config.sites[idx].pureMode },
+                        set: { newVal in
+                            config.sites[idx].pureMode = newVal
+                            config.save()
+                            runtime.onSyncStructure?(config.selectedSiteId)
+                        }
+                    ))
+
                     Toggle("🔔 接收此站点新消息通知", isOn: Binding(
                         get: { config.sites[idx].notifyEnabled },
                         set: { newVal in
@@ -1327,7 +1336,8 @@ struct SiteDetailView: View {
             hibernated: false,
             notifyEnabled: site.notifyEnabled,
             autoHibernateExempt: site.autoHibernateExempt,
-            lockdownMode: site.lockdownMode
+            lockdownMode: site.lockdownMode,
+            pureMode: site.pureMode
         )
         config.sites.append(clone)
         config.selectedSiteId = clone.id

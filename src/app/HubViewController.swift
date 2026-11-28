@@ -359,6 +359,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private var webViews: [String: WKWebView] = [:]
     private var webViewStoreIds: [String: String] = [:]
     private var webViewLockdownStates: [String: Bool] = [:]
+    private var webViewPureStates: [String: Bool] = [:]
     private var customDataStores: [String: WKWebsiteDataStore] = [:]
     private var knownIsolatedStoreIds: Set<String> = []
     private var errorOverlays: [String: ErrorOverlayView] = [:]
@@ -1464,11 +1465,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let changed = (webView.overrideUserInterfaceStyle != targetStyle)
         webView.overrideUserInterfaceStyle = targetStyle
         errorOverlays[site.id]?.overrideUserInterfaceStyle = targetStyle
-        if changed {
+        if changed && !(webViewPureStates[site.id] ?? site.pureMode) {
             webView.evaluateJavaScript(
                 "if(window.__jwRecheckInputs)window.__jwRecheckInputs();",
                 in: nil,
-                in: .defaultClient,
+                in: .page,
                 completionHandler: nil
             )
         }
@@ -1678,27 +1679,31 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             systemLockdownEnabled: runtime.systemLockdownEnabled,
             bypassIgnored: runtime.lockdownBypassDetected
         )
+        let isPure = site.pureMode
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = websiteDataStore(for: site)
         cfg.allowsInlineMediaPlayback = true
-        cfg.mediaTypesRequiringUserActionForPlayback = []
+        cfg.mediaTypesRequiringUserActionForPlayback = [.audio]
         cfg.defaultWebpagePreferences.allowsContentJavaScript = true
         JWBridgeApplyWebpageLockdownPreference(cfg.defaultWebpagePreferences, lockdownOn)
-        cfg.userContentController.addUserScript(WebScripts.compatPolyfillScript())
-        cfg.userContentController.addUserScript(WebScripts.inputContrastFixScript())
-        cfg.userContentController.addUserScript(WebScripts.scrollAnchorStabilizerScript())
-        cfg.userContentController.addUserScript(WebScripts.diagnosticJSErrorScript())
-        cfg.userContentController.addUserScript(WebScripts.conversationMonitorScript())
-        cfg.userContentController.addUserScript(WebScripts.memoryReliefHelperScript())
-        cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwDiag")
-        cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwNotify")
+        let unlockedCount = lockdownOn ? 0 : JWBridgeUnlockExperimentalWebKitFeatures(cfg.preferences)
+
+        if !isPure {
+            cfg.userContentController.addUserScript(WebScripts.compatPolyfillScript())
+            cfg.userContentController.addUserScript(WebScripts.inputContrastFixScript())
+            cfg.userContentController.addUserScript(WebScripts.diagnosticJSErrorScript())
+            cfg.userContentController.addUserScript(WebScripts.conversationMonitorScript())
+            cfg.userContentController.addUserScript(WebScripts.memoryReliefHelperScript())
+            cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwDiag")
+            cfg.userContentController.add(WeakScriptMessageProxy(target: self), name: "jwNotify")
+        }
 
         let wv = WKWebView(frame: webContainerView.bounds, configuration: cfg)
         wv.translatesAutoresizingMaskIntoConstraints = false
         wv.navigationDelegate = self
         wv.uiDelegate = self
         wv.allowsBackForwardNavigationGestures = true
-        wv.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1"
+        wv.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1"
 
         let capturedId = site.id
         touchSiteActivity(siteId: capturedId)
@@ -1725,22 +1730,23 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         overlay.onGoHome = { [weak self] in
             self?.reloadSiteFromHomeOrCurrent(siteId: capturedId, forceHome: true)
         }
-        wv.addSubview(overlay)
+        webContainerView.addSubview(overlay)
         NSLayoutConstraint.activate([
-            overlay.topAnchor.constraint(equalTo: wv.topAnchor),
-            overlay.leadingAnchor.constraint(equalTo: wv.leadingAnchor),
-            overlay.trailingAnchor.constraint(equalTo: wv.trailingAnchor),
-            overlay.bottomAnchor.constraint(equalTo: wv.bottomAnchor)
+            overlay.topAnchor.constraint(equalTo: webContainerView.topAnchor),
+            overlay.leadingAnchor.constraint(equalTo: webContainerView.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: webContainerView.trailingAnchor),
+            overlay.bottomAnchor.constraint(equalTo: webContainerView.bottomAnchor)
         ])
         errorOverlays[capturedId] = overlay
         webViewStoreIds[capturedId] = normStoreId
         webViewLockdownStates[capturedId] = lockdownOn
+        webViewPureStates[capturedId] = isPure
 
         applyAppearanceStyle(to: wv, for: site)
 
         let shortStore = JWDataStoreHelper.isIsolated(normStoreId) ? String(normStoreId.prefix(8)) : "default"
         let effBand = config.effectiveSiteBand(for: site)
-        JWLog("WEBKIT", "Create WebView site=\(site.title) store=\(shortStore) band=\(effBand) lockdown=\(lockdownOn ? "ON" : "EXEMPT") appearance=\(site.appearanceMode)")
+        JWLog("WEBKIT", "Create WebView site=\(site.title) store=\(shortStore) band=\(effBand) lockdown=\(lockdownOn ? "ON" : "EXEMPT") pure=\(isPure ? "ON" : "OFF") feat=\(unlockedCount) appearance=\(site.appearanceMode)")
 
         let savedMem = JWURLHelper.sanitizePersistedURL(lastKnownURLBySiteId[site.id])
         let savedCfg = JWURLHelper.sanitizePersistedURL(site.lastKnownURL)
@@ -1848,7 +1854,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         webViews.removeValue(forKey: siteId)
         webViewStoreIds.removeValue(forKey: siteId)
         webViewLockdownStates.removeValue(forKey: siteId)
-        errorOverlays.removeValue(forKey: siteId)
+        webViewPureStates.removeValue(forKey: siteId)
+        errorOverlays.removeValue(forKey: siteId)?.removeFromSuperview()
         terminatedSiteIds.remove(siteId)
         detachedSiteIds.remove(siteId)
         lastSiteActiveAt.removeValue(forKey: siteId)
@@ -1861,6 +1868,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private func syncAllWebViewHostStates(appActive: Bool) {
         let activeLiteral = appActive ? "true" : "false"
         for (sid, wv) in webViews {
+            if webViewPureStates[sid] == true { continue }
             let selLiteral = (sid == config.selectedSiteId) ? "true" : "false"
             let js = "if(window.__jwUpdateHostState)window.__jwUpdateHostState({appActive:\(activeLiteral),tabSelected:\(selLiteral)});"
             wv.evaluateJavaScript(js, in: nil, in: .page, completionHandler: nil)
@@ -1916,6 +1924,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             } else if let currentLockdown = webViewLockdownStates[s.id], currentLockdown != desiredLockdown {
                 snapshotLiveURLBeforeHibernate(siteId: s.id)
                 teardownWebView(forSiteId: s.id)
+            } else if let currentPure = webViewPureStates[s.id], currentPure != s.pureMode {
+                snapshotLiveURLBeforeHibernate(siteId: s.id)
+                teardownWebView(forSiteId: s.id)
             }
             if webViews[s.id] == nil {
                 webViews[s.id] = createWebView(for: s)
@@ -1936,7 +1947,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         if enabled.isEmpty {
             config.selectedSiteId = ""
+            for ov in errorOverlays.values {
+                ov.isHidden = true
+            }
             emptyStateView.isHidden = false
+            webContainerView.bringSubviewToFront(emptyStateView)
             hibernatedStateView.isHidden = true
             progressView.isHidden = true
             updateFloatingIslandVisuals()
@@ -1961,7 +1976,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func hideErrorOverlay(forSiteId siteId: String) {
         guard !siteId.isEmpty else { return }
-        errorOverlays[siteId]?.isHidden = true
+        if let ov = errorOverlays[siteId] {
+            ov.hasActiveError = false
+            ov.isHidden = true
+        }
         lastRejectedAuthBySiteId.removeValue(forKey: siteId)
     }
 
@@ -1982,8 +2000,12 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             customTitle: customTitle,
             customDetail: customDetail
         )
-        overlay.isHidden = false
-        webView.bringSubviewToFront(overlay)
+        overlay.hasActiveError = true
+        let shouldShowNow = (sid == config.selectedSiteId) && !(s?.hibernated ?? false)
+        overlay.isHidden = !shouldShowNow
+        if shouldShowNow {
+            webContainerView.bringSubviewToFront(overlay)
+        }
     }
 
     private func reloadSiteFromHomeOrCurrent(siteId: String, forceHome: Bool) {
@@ -2047,7 +2069,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private func recoverWebViewIfTerminated(siteId: String) {
         guard !siteId.isEmpty, let wv = webViews[siteId] else { return }
-        let hasVisibleError = !(errorOverlays[siteId]?.isHidden ?? true)
+        let hasVisibleError = errorOverlays[siteId]?.hasActiveError ?? false
         let markedTerminated = terminatedSiteIds.contains(siteId)
         let missingProcess = (JWBridgeWebViewContentPID(wv) <= 0 && !wv.isLoading && !hasVisibleError)
         guard markedTerminated || missingProcess else { return }
@@ -2076,6 +2098,13 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 wv.isUserInteractionEnabled = isSel
             }
             webContainerView.bringSubviewToFront(targetWV)
+            for (sid, ov) in errorOverlays {
+                let showOv = (sid == siteId) && ov.hasActiveError
+                ov.isHidden = !showOv
+                if showOv {
+                    webContainerView.bringSubviewToFront(ov)
+                }
+            }
             let p = Float(targetWV.estimatedProgress)
             progressView.isHidden = (!targetWV.isLoading || p >= 1.0 || p <= 0.01)
             progressView.setProgress(p, animated: false)
@@ -2084,6 +2113,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             for (_, wv) in webViews {
                 wv.isHidden = true
                 wv.isUserInteractionEnabled = false
+            }
+            for ov in errorOverlays.values {
+                ov.isHidden = true
             }
             progressView.isHidden = true
             let spaceLabel = JWDataStoreHelper.label(for: curSite.dataStoreId)
@@ -2374,6 +2406,21 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         rebuildTabPills()
     }
 
+    private func toggleSitePureMode(siteId: String) {
+        guard let idx = config.sites.firstIndex(where: { $0.id == siteId }) else { return }
+        config.sites[idx].pureMode.toggle()
+        let isPure = config.sites[idx].pureMode
+        let title = config.sites[idx].title
+        config.save()
+        JWLog("WEBKIT", "Toggled site=\(title) pureMode=\(isPure)")
+        syncWebViewsWithConfig(preferredSelectId: config.selectedSiteId)
+        showTopGlassToast(
+            symbol: isPure ? "leaf.fill" : "sparkles",
+            tint: isPure ? .systemGreen : .systemBlue,
+            text: isPure ? "「\(title)」已开启纯净原生模式（零辅助脚本）" : "「\(title)」已恢复标准增强模式"
+        )
+    }
+
     private func autoHibernateTrailingText(for site: SiteItem) -> String {
         if site.autoHibernateExempt {
             return "已开启"
@@ -2426,6 +2473,10 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             chips.append(JWGlassChipItem(symbol: "lock.shield.fill", text: "独立空间", tint: .systemTeal))
         } else {
             chips.append(JWGlassChipItem(symbol: "person.2.fill", text: "共享空间", tint: .secondaryLabel))
+        }
+
+        if targetSite.pureMode {
+            chips.append(JWGlassChipItem(symbol: "leaf.fill", text: "纯净原生", tint: .systemGreen))
         }
 
         let showLDMChip = runtime.systemLockdownEnabled
@@ -2545,6 +2596,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             bypassIgnored: runtime.lockdownBypassDetected
         )
         let configGroup: [JWGlassRowItem] = [
+            JWGlassRowItem(
+                symbol: "leaf.fill",
+                tint: targetSite.pureMode ? .systemGreen : .secondaryLabel,
+                title: "纯净原生模式（零辅助脚本）",
+                trailingText: targetSite.pureMode ? "已开启" : "标准增强"
+            ) { [weak self] in
+                self?.toggleSitePureMode(siteId: targetSite.id)
+            },
             JWGlassRowItem(
                 symbol: targetSite.autoHibernateExempt ? "pin.fill" : "clock.arrow.circlepath",
                 tint: targetSite.autoHibernateExempt ? .systemOrange : .systemIndigo,
@@ -2901,7 +2960,8 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 hibernated: false,
                 notifyEnabled: site.notifyEnabled,
                 autoHibernateExempt: site.autoHibernateExempt,
-                lockdownMode: site.lockdownMode
+                lockdownMode: site.lockdownMode,
+                pureMode: site.pureMode
             )
             self.config.sites.append(clone)
             self.config.selectedSiteId = clone.id
@@ -3004,6 +3064,14 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             bypassIgnored: runtime.lockdownBypassDetected
         )
         let sitePolicyGroup: [JWGlassRowItem] = [
+            JWGlassRowItem(
+                symbol: "leaf.fill",
+                tint: curSite.pureMode ? .systemGreen : .secondaryLabel,
+                title: "纯净原生模式（零辅助脚本）",
+                trailingText: curSite.pureMode ? "已开启" : "标准增强"
+            ) { [weak self] in
+                self?.toggleSitePureMode(siteId: siteId)
+            },
             JWGlassRowItem(
                 symbol: curSite.autoHibernateExempt ? "pin.fill" : "clock.arrow.circlepath",
                 tint: curSite.autoHibernateExempt ? .systemOrange : .systemIndigo,
@@ -3480,10 +3548,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 bypassIgnored: runtime.lockdownBypassDetected
             )
             let ldmTag = siteLocked ? "🔒锁定" : "⚡️豁免"
+            let pureTag = s.pureMode ? " 🍃纯净" : ""
             let notifyBadge = s.notifyEnabled ? "🔔" : "🔕"
             let exemptBadge = s.autoHibernateExempt ? " 📌免眠" : ""
             let recMark = terminatedSiteIds.contains(s.id) ? " [曾被回收]" : ""
-            lines.append("站点[\(stateLabel)]: \(s.title) \(notifyBadge)\(exemptBadge) | \(ldmTag) | \(bandLabel) | \(JWDataStoreHelper.shortBadge(for: s.dataStoreId)) | WebPID=\(wpid) NetPID=\(npid) GPUPID=\(gpid) | 实测=\(st?.band ?? -1)档 内存=\(st?.footprintMB ?? 0)MB\(recMark)")
+            lines.append("站点[\(stateLabel)]: \(s.title) \(notifyBadge)\(exemptBadge)\(pureTag) | \(ldmTag) | \(bandLabel) | \(JWDataStoreHelper.shortBadge(for: s.dataStoreId)) | WebPID=\(wpid) NetPID=\(npid) GPUPID=\(gpid) | 实测=\(st?.band ?? -1)档 内存=\(st?.footprintMB ?? 0)MB\(recMark)")
         }
         lines.append("======================")
         return lines.joined(separator: "\n")
@@ -3733,9 +3802,11 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         let suspendBgMedia = deep && (reason == "mem-warning")
         for (sid, wv) in webViews {
             let isHiddenTab = (sid != config.selectedSiteId)
-            let hidLiteral = isHiddenTab ? "true" : "false"
-            let js = "if(window.__jwTrimPageMemory)window.__jwTrimPageMemory({aggressive:\(aggLiteral),hiddenTab:\(hidLiteral)});"
-            wv.evaluateJavaScript(js, in: nil, in: .page, completionHandler: nil)
+            if webViewPureStates[sid] != true {
+                let hidLiteral = isHiddenTab ? "true" : "false"
+                let js = "if(window.__jwTrimPageMemory)window.__jwTrimPageMemory({aggressive:\(aggLiteral),hiddenTab:\(hidLiteral)});"
+                wv.evaluateJavaScript(js, in: nil, in: .page, completionHandler: nil)
+            }
             JWBridgeTrimWebViewMemory(wv, deep, suspendBgMedia && isHiddenTab)
         }
         JWBridgeReleaseHostMemory()
@@ -3818,9 +3889,9 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         guard config.autoMemoryTrimEnabled, !isTrimmingMemory else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let softTabMB = max(210, Int(Double(config.maxMemoryMB) * 0.72))
-        let runawayTabCap = max(960, config.maxMemoryMB + 360)
+        let runawayTabCap = max(780, config.maxMemoryMB + 200)
 
-        if (snap.maxBgTabMB > config.maxMemoryMB || snap.totalMB >= 1120 || snap.maxAwakeTabMB >= runawayTabCap)
+        if (snap.maxBgTabMB > config.maxMemoryMB || snap.totalMB >= 1060 || snap.maxAwakeTabMB >= runawayTabCap)
             && (now - lastAutoDeepTrimUptime) >= 40.0 {
             lastAutoDeepTrimUptime = now
             lastAutoTrimUptime = now
@@ -3846,7 +3917,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
     }
 
-    /// Protects 4GB devices from single-tab infinite JS/DOM allocation loops (e.g. >960MB live heap
+    /// Protects 4GB devices from single-tab infinite JS/DOM allocation loops (e.g. >=780~800MB live heap
     /// with <32MB reclaimable by deep GC) that would otherwise peg 100% CPU, overheat the phone,
     /// and brick WebContent responsiveness.
     @discardableResult
@@ -3860,7 +3931,7 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         let pid = JWBridgeWebViewContentPID(wv)
         let tabMB = (pid > 0) ? (lastProcStatuses[pid]?.footprintMB ?? 0) : 0
-        let runawayTabCap = max(960, config.maxMemoryMB + 360)
+        let runawayTabCap = max(780, config.maxMemoryMB + 200)
         guard tabMB >= runawayTabCap && savedByTrim < 32 else { return false }
 
         let wasStuckLoading = wv.isLoading
@@ -4568,19 +4639,22 @@ final class HubViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         webView.scrollView.refreshControl?.endRefreshing()
-        if let sid = siteId(for: webView) {
+        let sid = siteId(for: webView)
+        if let sid = sid {
             terminatedSiteIds.remove(sid)
             hideErrorOverlay(forSiteId: sid)
         }
         if webView === webViews[config.selectedSiteId] {
             progressView.isHidden = true
         }
-        webView.evaluateJavaScript(
-            "if(window.__jwRecheckInputs)window.__jwRecheckInputs();",
-            in: nil,
-            in: .defaultClient,
-            completionHandler: nil
-        )
+        if let sid = sid, webViewPureStates[sid] != true {
+            webView.evaluateJavaScript(
+                "if(window.__jwRecheckInputs)window.__jwRecheckInputs();",
+                in: nil,
+                in: .page,
+                completionHandler: nil
+            )
+        }
         syncAllWebViewHostStates(appActive: UIApplication.shared.applicationState == .active)
         refreshRuntimeWebPIDMap()
         schedulePostStateChangeProtectionWaves()

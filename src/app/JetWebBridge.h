@@ -7,7 +7,7 @@
 #import <WebKit/WebKit.h>
 #import <Security/Security.h>
 
-#define JW_VERSION "0.2.2"
+#define JW_VERSION "0.2.3"
 #ifndef JW_COMMIT
 #define JW_COMMIT "dev"
 #endif
@@ -50,6 +50,7 @@ FOUNDATION_EXPORT BOOL JWBridgeSyncProcessLockdownState(int overrideMode);
 FOUNDATION_EXPORT void JWBridgeRegisterLockdownConfigChangedHandler(void (^handler)(void));
 FOUNDATION_EXPORT void JWBridgeApplyWebpageLockdownPreference(WKWebpagePreferences * _Nullable prefs,
                                                               BOOL lockdownEnabled);
+FOUNDATION_EXPORT NSUInteger JWBridgeUnlockExperimentalWebKitFeatures(WKPreferences * _Nullable prefs);
 
 FOUNDATION_EXPORT NSDictionary<NSString *, NSString *> *JWBridgeExtractLeafCertInfo(SecTrustRef trust);
 FOUNDATION_EXPORT NSURLCredential *JWBridgeCredentialForAcceptedTrust(SecTrustRef trust);

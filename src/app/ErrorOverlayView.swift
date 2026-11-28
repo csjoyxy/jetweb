@@ -1,6 +1,7 @@
 import UIKit
 
 final class ErrorOverlayView: UIView {
+    var hasActiveError: Bool = false
     var failedURLString: String = ""
     var onRetry: (() -> Void)?
     var onGoHome: (() -> Void)?

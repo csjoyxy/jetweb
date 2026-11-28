@@ -15,6 +15,8 @@ final class WeakScriptMessageProxy: NSObject, WKScriptMessageHandler {
 }
 
 enum WebScripts {
+    /// Modern ES2023–ES2026 & Web scheduling compatibility layer (aligned with JetBrowser's WebCompatEngine).
+    /// Runs in `.page` world with zero DOM observers and zero prototype conflicts.
     static func compatPolyfillScript() -> WKUserScript {
         let js = #"""
         (function(){
@@ -90,6 +92,33 @@ enum WebScripts {
             };
             window.cancelIdleCallback=function cancelIdleCallback(id){clearTimeout(id);};
           }
+          if(!window.scheduler){
+            window.scheduler={};
+          }
+          if(typeof window.scheduler.yield!=='function'){
+            window.scheduler.yield=function schedulerYield(){
+              return new Promise(function(resolve){setTimeout(resolve,0);});
+            };
+          }
+          if(typeof window.scheduler.postTask!=='function'){
+            window.scheduler.postTask=function postTask(cb,opts){
+              var o=opts||{};
+              var sig=o.signal;
+              var delay=Math.max(0,Number(o.delay)||0);
+              return new Promise(function(resolve,reject){
+                if(sig&&sig.aborted){reject(sig.reason);return;}
+                var tid=setTimeout(function(){
+                  if(sig)sig.removeEventListener('abort',onAbort);
+                  try{resolve(cb());}catch(e){reject(e);}
+                },delay);
+                function onAbort(){
+                  clearTimeout(tid);
+                  reject(sig.reason);
+                }
+                if(sig)sig.addEventListener('abort',onAbort,{once:true});
+              });
+            };
+          }
           if(typeof ReadableStream==='function'&&ReadableStream.prototype&&typeof Symbol==='function'&&Symbol.asyncIterator&&!ReadableStream.prototype[Symbol.asyncIterator]){
             var rsValues=function values(opts){
               var reader=this.getReader();
@@ -133,6 +162,51 @@ enum WebScripts {
             defSet('isSupersetOf',function(o){if(!o||typeof o.keys!=='function')return false;var it=o.keys(),s;while(!(s=it.next()).done){if(!this.has(s.value))return false;}return true;});
             defSet('isDisjointFrom',function(o){if(!o||typeof o.has!=='function')return true;var it=this.values(),s;while(!(s=it.next()).done){if(o.has(s.value))return false;}return true;});
           }
+          if(Array.prototype){
+            var defArr=function(n,fn){if(typeof Array.prototype[n]!=='function')Object.defineProperty(Array.prototype,n,{configurable:true,writable:true,value:fn});};
+            defArr('at',function(i){var len=this.length>>>0,k=Math.trunc(i)||0;if(k<0)k+=len;return(k<0||k>=len)?undefined:this[k];});
+            defArr('findLast',function(cb,thisArg){for(var i=(this.length>>>0)-1;i>=0;i--){if(cb.call(thisArg,this[i],i,this))return this[i];}return undefined;});
+            defArr('findLastIndex',function(cb,thisArg){for(var i=(this.length>>>0)-1;i>=0;i--){if(cb.call(thisArg,this[i],i,this))return i;}return -1;});
+            defArr('toReversed',function(){return Array.from(this).reverse();});
+            defArr('toSorted',function(cmp){var a=Array.from(this);return cmp!==undefined?a.sort(cmp):a.sort();});
+            defArr('toSpliced',function(start,delCount){var a=Array.from(this),args=[start,arguments.length<2?a.length:delCount];for(var i=2;i<arguments.length;i++)args.push(arguments[i]);a.splice.apply(a,args);return a;});
+            defArr('with',function(idx,val){var a=Array.from(this),len=a.length,k=Math.trunc(idx)||0;if(k<0)k+=len;if(k<0||k>=len)throw new RangeError('Invalid index');a[k]=val;return a;});
+          }
+          if(typeof Symbol==='function'&&Symbol.iterator){
+            var iterProto=Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+            if(iterProto&&typeof iterProto.toArray!=='function'){
+              var wrapIter=function(genFn){return function(){return genFn.apply(this,arguments);};};
+              var defIt=function(n,fn){if(typeof iterProto[n]!=='function')Object.defineProperty(iterProto,n,{configurable:true,writable:true,value:fn});};
+              defIt('toArray',function(){var out=[],s;while(!(s=this.next()).done)out.push(s.value);return out;});
+              defIt('forEach',function(fn){var i=0,s;while(!(s=this.next()).done)fn(s.value,i++);});
+              defIt('some',function(fn){var i=0,s;while(!(s=this.next()).done){if(fn(s.value,i++)){if(typeof this.return==='function')try{this.return();}catch(_){}return true;}}return false;});
+              defIt('every',function(fn){var i=0,s;while(!(s=this.next()).done){if(!fn(s.value,i++)){if(typeof this.return==='function')try{this.return();}catch(_){}return false;}}return true;});
+              defIt('find',function(fn){var i=0,s;while(!(s=this.next()).done){if(fn(s.value,i++)){if(typeof this.return==='function')try{this.return();}catch(_){}return s.value;}}return undefined;});
+              defIt('reduce',function(fn,init){var hasInit=arguments.length>=2,acc=init,i=0,s;while(!(s=this.next()).done){if(!hasInit){acc=s.value;hasInit=true;i++;continue;}acc=fn(acc,s.value,i++);}if(!hasInit)throw new TypeError('Reduce of empty iterator with no initial value');return acc;});
+              defIt('map',wrapIter(function*(fn){var i=0,s;try{while(!(s=this.next()).done)yield fn(s.value,i++);}finally{if(!s||!s.done)if(typeof this.return==='function')try{this.return();}catch(_){}}}));
+              defIt('filter',wrapIter(function*(fn){var i=0,s;try{while(!(s=this.next()).done){if(fn(s.value,i++))yield s.value;}}finally{if(!s||!s.done)if(typeof this.return==='function')try{this.return();}catch(_){}}}));
+              defIt('take',wrapIter(function*(lim){var n=Math.max(0,Math.trunc(lim)||0),i=0,s;try{while(i++<n&&!(s=this.next()).done)yield s.value;}finally{if((!s||!s.done)&&typeof this.return==='function')try{this.return();}catch(_){}}}));
+              defIt('drop',wrapIter(function*(lim){var n=Math.max(0,Math.trunc(lim)||0),i=0,s;try{while(i++<n&&!(s=this.next()).done){}while(!(s=this.next()).done)yield s.value;}finally{if((!s||!s.done)&&typeof this.return==='function')try{this.return();}catch(_){}}}));
+              defIt('flatMap',wrapIter(function*(fn){var i=0,s;try{while(!(s=this.next()).done){var sub=fn(s.value,i++);if(sub!=null&&typeof sub[Symbol.iterator]==='function'){for(var x of sub)yield x;}else if(sub&&typeof sub.next==='function'){var t;while(!(t=sub.next()).done)yield t.value;}}}finally{if((!s||!s.done)&&typeof this.return==='function')try{this.return();}catch(_){}}}));
+              if(typeof window.Iterator==='undefined'){
+                var JWIterator=function(){};
+                JWIterator.prototype=iterProto;
+                JWIterator.from=function(v){
+                  if(v!=null&&typeof v[Symbol.iterator]==='function')return v[Symbol.iterator]();
+                  if(v&&typeof v.next==='function'){
+                    if(iterProto.isPrototypeOf(v))return v;
+                    var w=Object.create(iterProto);
+                    w.next=function(){return v.next();};
+                    w.return=function(x){return typeof v.return==='function'?v.return(x):{done:true,value:x};};
+                    w[Symbol.iterator]=function(){return this;};
+                    return w;
+                  }
+                  throw new TypeError('Object is not iterable');
+                };
+                window.Iterator=JWIterator;
+              }
+            }
+          }
           if(typeof RegExp==='function'&&typeof RegExp.escape!=='function'){
             Object.defineProperty(RegExp,'escape',{configurable:true,writable:true,value:function escape(s){
               return String(s).replace(/[\\^$.*+?()[\]{}|/\-]/g,'\\$&');
@@ -154,6 +228,8 @@ enum WebScripts {
         )
     }
 
+    /// Event-driven input contrast guard running strictly in `.page` (main frame only) so WebKit
+    /// never allocates a duplicate `.defaultClient` DOMWrapperWorld across large SPA DOM trees.
     static func inputContrastFixScript() -> WKUserScript {
         let js = #"""
         (function(){
@@ -162,6 +238,7 @@ enum WebScripts {
         window.__jwContrastFixInstalled=true;
         var SKIP_TYPES={hidden:1,checkbox:1,radio:1,button:1,submit:1,reset:1,image:1,file:1,range:1,color:1};
         var patched=new WeakMap();
+        var patchedRefs=[];
         function isTextInput(el){
           if(!el||el.nodeType!==1)return false;
           var tag=el.tagName;
@@ -217,7 +294,7 @@ enum WebScripts {
         }
         function effectiveBackground(el){
           var layers=[],node=el,depth=0;
-          while(node&&node.nodeType===1&&depth<40){
+          while(node&&node.nodeType===1&&depth<32){
             var bg=parseColor(getComputedStyle(node).backgroundColor);
             if(bg&&bg.a>0.01){
               layers.push(bg);
@@ -260,6 +337,9 @@ enum WebScripts {
             caret:el.style.getPropertyValue('caret-color'),
             caretPrio:el.style.getPropertyPriority('caret-color')
           });
+          if(patchedRefs.length<16&&patchedRefs.indexOf(el)===-1){
+            patchedRefs.push(el);
+          }
         }
         function checkAndFix(el){
           try{
@@ -304,35 +384,36 @@ enum WebScripts {
           if(!isTextInput(t))return;
           checkAndFix(t);
           requestAnimationFrame(function(){checkAndFix(t);});
-          setTimeout(function(){checkAndFix(t);},80);
         },true);
         document.addEventListener('input',function(ev){checkAndFix(eventTarget(ev));},true);
         document.addEventListener('change',function(ev){checkAndFix(eventTarget(ev));},true);
         document.addEventListener('blur',function(ev){
           var t=eventTarget(ev);
-          if(isTextInput(t)&&(patched.has(t)||(t.value&&t.value.length>0))){checkAndFix(t);}
+          if(isTextInput(t)&&patched.has(t)){checkAndFix(t);}
         },true);
         window.__jwRecheckInputs=function(){
           try{
-            if(document.activeElement)checkAndFix(document.activeElement);
-            var list=document.querySelectorAll('input,textarea');
-            for(var i=0;i<list.length;i++){
-              var el=list[i];
-              if(el===document.activeElement||patched.has(el)||(el.value&&el.value.length>0))checkAndFix(el);
+            if(document.activeElement&&isTextInput(document.activeElement)){
+              checkAndFix(document.activeElement);
+            }
+            for(var i=patchedRefs.length-1;i>=0;i--){
+              var el=patchedRefs[i];
+              if(!el||!el.isConnected){patchedRefs.splice(i,1);continue;}
+              checkAndFix(el);
             }
           }catch(_){}
         };
         try{
           var mq=window.matchMedia('(prefers-color-scheme: dark)');
-          if(mq&&mq.addEventListener)mq.addEventListener('change',function(){setTimeout(window.__jwRecheckInputs,50);});
+          if(mq&&mq.addEventListener)mq.addEventListener('change',function(){setTimeout(window.__jwRecheckInputs,60);});
         }catch(_){}
         })();
         """#
         return WKUserScript(
             source: js,
             injectionTime: .atDocumentEnd,
-            forMainFrameOnly: false,
-            in: .defaultClient
+            forMainFrameOnly: true,
+            in: .page
         )
     }
 
@@ -366,15 +447,18 @@ enum WebScripts {
         return WKUserScript(
             source: js,
             injectionTime: .atDocumentStart,
-            forMainFrameOnly: false,
+            forMainFrameOnly: true,
             in: .page
         )
     }
 
-    /// Universal 3-in-1 conversation & unread message detector:
-    /// 1) Polyfills `window.Notification` + `ServiceWorkerRegistration.prototype.showNotification`
-    /// 2) Monitors `document.title` unread counters `(1)` / `[新消息]`
-    /// 3) Detects newly appearing unread dots in conversation lists & settled streaming replies (`Muse` / `agy` / `Hermes`)
+    /// Zero-foreground-overhead background conversation monitor:
+    /// - Attaches ZERO `MutationObserver`s and runs ZERO DOM layout queries during page load,
+    ///   SPA hydration, scrolling, or foreground viewing (`isUserWatching() == true`).
+    /// - Does NOT override `window.Notification` or `Element.prototype.attachShadow`, preserving
+    ///   100% stock Safari / JetBrowser global API parity for Google / Lit / React SPAs.
+    /// - Connects a bounded `MutationObserver` ONLY while the tab is in the background or unselected,
+    ///   and disconnects it immediately upon returning to foreground.
     static func conversationMonitorScript() -> WKUserScript {
         let js = #"""
         (function(){
@@ -383,12 +467,9 @@ enum WebScripts {
         window.__jwNotifyInstalled=true;
 
         var hostState={appActive:true,tabSelected:true};
-        var bootIgnoreUntil=Date.now()+4800;
-        var lastHref=location.href;
         var lastComposerText='';
         var lastComposerInputAt=0;
         var lastUserSentAt=0;
-        var lastWatchedMutationAt=0;
         var lastBaselineTail='';
         var lastNotifiedSnippet='';
         var lastNotifiedAt=0;
@@ -399,6 +480,9 @@ enum WebScripts {
         var dotScanTimer=null;
         var knownUnreadTitles=new Set();
         var lastTitleCount=0;
+        var sharedMutObs=null;
+        var obsConnected=false;
+        var bgEnteredAt=0;
 
         function postNative(payload){
           try{
@@ -412,8 +496,19 @@ enum WebScripts {
           return !!(hostState.appActive && hostState.tabSelected && document.visibilityState!=='hidden');
         }
 
-        function normText(s){
-          return String(s||'').replace(/\s+/g,' ').trim();
+        function normShortText(s){
+          if(!s)return '';
+          var clipped=s.length>420?s.slice(0,420):s;
+          return clipped.replace(/\s+/g,' ').trim();
+        }
+
+        function safeLeafText(el,maxChildren){
+          if(!el||el.nodeType!==1)return '';
+          var lim=maxChildren||5;
+          if(typeof el.childElementCount==='number'&&el.childElementCount>lim)return '';
+          var raw=el.textContent;
+          if(!raw||raw.length>1800)return '';
+          return normShortText(raw);
         }
 
         function isTrivialStatusOrTime(t){
@@ -423,55 +518,16 @@ enum WebScripts {
           return false;
         }
 
-        /* 1. Polyfill standard Web Notification API -> Native iOS Banner */
-        try{
-          if(typeof window.Notification==='undefined'){
-            var JWNotification=function(title,options){
-              var opts=options||{};
-              this.title=String(title||'');
-              this.body=String(opts.body||'');
-              this.tag=String(opts.tag||'');
-              this.onclick=null;
-              this.onclose=null;
-              postNative({
-                k:'web_api',
-                sub:this.title,
-                body:this.body||'收到一条新网页通知'
-              });
-            };
-            JWNotification.permission='granted';
-            JWNotification.requestPermission=function(cb){
-              if(typeof cb==='function'){try{cb('granted');}catch(_){}}
-              return Promise.resolve('granted');
-            };
-            JWNotification.prototype.close=function(){
-              if(typeof this.onclose==='function'){try{this.onclose();}catch(_){}}
-            };
-            JWNotification.prototype.addEventListener=function(){};
-            JWNotification.prototype.removeEventListener=function(){};
-            window.Notification=JWNotification;
-          }
-          if(window.ServiceWorkerRegistration&&window.ServiceWorkerRegistration.prototype&&!window.ServiceWorkerRegistration.prototype.__jwPatched){
-            window.ServiceWorkerRegistration.prototype.__jwPatched=true;
-            window.ServiceWorkerRegistration.prototype.showNotification=function(title,options){
-              var opts=options||{};
-              postNative({k:'web_api',sub:String(title||''),body:String(opts.body||'收到一条新网页通知')});
-              return Promise.resolve();
-            };
-          }
-        }catch(_){}
-
-        /* 2. Extract latest meaningful reply snippet from conversation DOM */
         function isInsideIgnoredChrome(el){
           var cur=el,d=0;
-          while(cur&&cur.nodeType===1&&d<16){
+          while(cur&&cur.nodeType===1&&d<14){
             var tag=cur.tagName;
             if(tag==='NAV'||tag==='ASIDE'||tag==='HEADER'||tag==='FOOTER'||tag==='SCRIPT'||tag==='STYLE'||tag==='SVG'||tag==='TEXTAREA'||tag==='INPUT'||tag==='BUTTON'){
               return true;
             }
             if(cur.isContentEditable)return true;
             var role=(cur.getAttribute('role')||'').toLowerCase();
-            if(role==='navigation'||role==='textbox'||role==='combobox'||role==='Dialog')return true;
+            if(role==='navigation'||role==='textbox'||role==='combobox'||role==='dialog')return true;
             cur=cur.parentElement;
             d++;
           }
@@ -481,50 +537,16 @@ enum WebScripts {
         function captureLatestChatSnippet(){
           try{
             if(!document.body)return '';
-            var selectors=[
-              '[data-message-author-role="assistant"]',
-              '[data-role="assistant"]',
-              '[class*="assistant" i]',
-              '[class*="agent-message" i]',
-              '[class*="model-response" i]',
-              '[class*="markdown" i]',
-              '[class*="prose" i]',
-              '[class*="message-content" i]',
-              '[class*="chat-message" i]',
-              'main article',
-              'main p',
-              '[role="main"] p',
-              '[role="log"] div'
-            ];
+            var root=document.querySelector('main,[role="main"],[role="log"]')||document.body;
+            var blocks=root.querySelectorAll('p,li,pre,blockquote,[data-message-author-role="assistant"] p,[class*="markdown" i] p,[class*="prose" i] p');
             var best='';
-            for(var s=0;s<selectors.length;s++){
-              var nodes=document.querySelectorAll(selectors[s]);
-              if(!nodes||!nodes.length)continue;
-              for(var i=nodes.length-1;i>=Math.max(0,nodes.length-6);i--){
-                var el=nodes[i];
-                if(isInsideIgnoredChrome(el))continue;
-                var r=el.getBoundingClientRect();
-                if(r.width<=0||r.height<=0)continue;
-                var txt=normText(el.innerText||el.textContent||'');
-                if(txt.length>=4&&!isTrivialStatusOrTime(txt)&&txt!==lastComposerText){
-                  best=txt;
-                  break;
-                }
-              }
-              if(best)break;
-            }
-            if(!best){
-              var root=document.querySelector('main,[role="main"],[role="log"]')||document.body;
-              var blocks=root.querySelectorAll('p,li,div');
-              for(var j=blocks.length-1;j>=Math.max(0,blocks.length-40);j--){
-                var b=blocks[j];
-                if(b.children&&b.children.length>4)continue;
-                if(isInsideIgnoredChrome(b))continue;
-                var t=normText(b.innerText||b.textContent||'');
-                if(t.length>=6&&t.length<=600&&!isTrivialStatusOrTime(t)&&t!==lastComposerText){
-                  best=t;
-                  break;
-                }
+            for(var i=blocks.length-1;i>=Math.max(0,blocks.length-28);i--){
+              var el=blocks[i];
+              if(isInsideIgnoredChrome(el))continue;
+              var txt=safeLeafText(el,6);
+              if(txt.length>=4&&!isTrivialStatusOrTime(txt)&&txt!==lastComposerText){
+                best=txt;
+                break;
               }
             }
             if(best.length>120){
@@ -536,17 +558,13 @@ enum WebScripts {
           }
         }
 
-        /* 3. Unread blue/red dot scanner for conversation lists (e.g. Antigravity / Muse sidebar) */
         function extractRowTitleForDot(dotEl){
           var cur=dotEl.parentElement,d=0;
-          while(cur&&cur.nodeType===1&&cur!==document.body&&d<6){
-            var rect=cur.getBoundingClientRect();
-            if(rect.height>=22&&rect.height<=92&&rect.width>=120){
-              var raw=normText(cur.innerText||cur.textContent||'');
+          while(cur&&cur.nodeType===1&&cur!==document.body&&d<5){
+            var raw=safeLeafText(cur,5);
+            if(raw.length>=2&&raw.length<=95){
               raw=raw.replace(/\b\d+\s*(s|m|h|d|min|hr)\b$/i,'').trim();
-              if(raw.length>=2&&raw.length<=95&&!isTrivialStatusOrTime(raw)){
-                return raw;
-              }
+              if(raw.length>=2&&!isTrivialStatusOrTime(raw))return raw;
             }
             cur=cur.parentElement;
             d++;
@@ -554,61 +572,25 @@ enum WebScripts {
           return '';
         }
 
-        function isColoredUnreadDot(el){
-          if(!el||el.nodeType!==1)return false;
-          var tag=el.tagName;
-          if(tag!=='SPAN'&&tag!=='DIV'&&tag!=='I')return false;
-          if(el.children&&el.children.length>0)return false;
-          var txt=normText(el.textContent||'');
-          if(txt.length>0)return false;
-          var r=el.getBoundingClientRect();
-          if(r.width<4.5||r.width>14.5||r.height<4.5||r.height>14.5)return false;
-          if(Math.abs(r.width-r.height)>2.5)return false;
-          var cs=getComputedStyle(el);
-          if(cs.display==='none'||cs.visibility==='hidden'||parseFloat(cs.opacity)<0.35)return false;
-          var br=parseFloat(cs.borderTopLeftRadius)||0;
-          if(br<r.width*0.35)return false;
-          var bg=cs.backgroundColor||'';
-          var m=bg.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*[,/]\s*([\d.]+))?/);
-          if(!m)return false;
-          var rv=parseInt(m[1],10),gv=parseInt(m[2],10),bv=parseInt(m[3],10);
-          var av=m[4]!==undefined?parseFloat(m[4]):1;
-          if(av<0.45)return false;
-          var spread=Math.max(rv,gv,bv)-Math.min(rv,gv,bv);
-          return spread>=40;
-        }
-
         function scanUnreadDots(allowEmit){
           try{
             if(!document.body)return;
             var currentSet=new Set();
             var explicit=document.querySelectorAll('[aria-label*="unread" i],[data-unread="true"],[title*="未读"]');
-            for(var i=0;i<explicit.length;i++){
-              var rt=extractRowTitleForDot(explicit[i])||normText(explicit[i].textContent||'');
+            var lim=Math.min(explicit.length,40);
+            for(var i=0;i<lim;i++){
+              var rt=extractRowTitleForDot(explicit[i])||safeLeafText(explicit[i],4);
               if(rt.length>=2&&rt.length<=95)currentSet.add(rt);
             }
-            var navRoot=document.querySelector('nav,aside,[role="navigation"]');
-            var scopeRoot=navRoot||document.body;
-            var candidates=scopeRoot.querySelectorAll('a span,a div,li span,li div,[role="listitem"] span,[role="listitem"] div');
-            var limit=Math.min(candidates.length,220);
-            for(var j=0;j<limit;j++){
-              var el=candidates[j];
-              if(isColoredUnreadDot(el)){
-                var rowTitle=extractRowTitleForDot(el);
-                if(rowTitle)currentSet.add(rowTitle);
-              }
-            }
-            if(allowEmit&&!isUserWatching()&&Date.now()>bootIgnoreUntil){
+            if(allowEmit&&!isUserWatching()&&(Date.now()-bgEnteredAt)>1500){
               currentSet.forEach(function(title){
-                if(!knownUnreadTitles.has(title)){
-                  if(Date.now()-lastNotifiedAt>=6000){
-                    lastNotifiedAt=Date.now();
-                    postNative({
-                      k:'unread_dot',
-                      sub:'新对话动态',
-                      body:'「'+title+'」有新回复待查看'
-                    });
-                  }
+                if(!knownUnreadTitles.has(title)&&(Date.now()-lastNotifiedAt)>=6000){
+                  lastNotifiedAt=Date.now();
+                  postNative({
+                    k:'unread_dot',
+                    sub:'新对话动态',
+                    body:'「'+title+'」有新回复待查看'
+                  });
                 }
               });
             }
@@ -616,53 +598,13 @@ enum WebScripts {
           }catch(_){}
         }
 
-        /* 4. Shadow DOM root tracking (bounded, zero polling) + Streaming busy check */
-        var shadowRoots=[];
-        var sharedMutObs=null;
-        var OBS_OPTS={childList:true,subtree:true,characterData:true};
-        try{
-          if(typeof Element==='function'&&Element.prototype&&typeof Element.prototype.attachShadow==='function'&&!Element.prototype.attachShadow.__jwWrapped){
-            var origAttachShadow=Element.prototype.attachShadow;
-            var wrappedAttach=function(init){
-              var sr=origAttachShadow.apply(this,arguments);
-              try{
-                if(sr&&init&&init.mode==='open'&&shadowRoots.length<28){
-                  shadowRoots.push(sr);
-                  if(sharedMutObs)sharedMutObs.observe(sr,OBS_OPTS);
-                }
-              }catch(_){}
-              return sr;
-            };
-            wrappedAttach.__jwWrapped=true;
-            Element.prototype.attachShadow=wrappedAttach;
-          }
-        }catch(_){}
-
-        function hasStopButtonInRoot(root){
-          var btns=root.querySelectorAll('button,[role="button"]');
-          var lim=Math.min(btns.length,60);
-          for(var i=0;i<lim;i++){
-            var b=btns[i];
-            if(b.disabled)continue;
-            var label=((b.getAttribute('aria-label')||'')+' '+(b.getAttribute('title')||'')+' '+(b.getAttribute('data-testid')||'')).toLowerCase();
-            var txt=normText(b.textContent||'').toLowerCase();
-            if(label.indexOf('stop')!==-1||label.indexOf('停止')!==-1||label.indexOf('cancel generation')!==-1||
-               txt==='stop'||txt==='stop_circle'||txt==='stop_Generating'||txt==='停止'||txt==='停止生成'){
-              var r=b.getBoundingClientRect();
-              if(r.width>4&&r.height>4)return true;
-            }
-          }
-          return false;
-        }
-
         function isBusyGenerating(){
           if(streamStartedAt>0&&(Date.now()-streamStartedAt)>600000)return false;
           try{
-            if(hasStopButtonInRoot(document))return true;
-            for(var s=shadowRoots.length-1;s>=0;s--){
-              var sr=shadowRoots[s];
-              if(!sr||!sr.host||!sr.host.isConnected){shadowRoots.splice(s,1);continue;}
-              if(hasStopButtonInRoot(sr))return true;
+            if(!document.body)return false;
+            var btns=document.querySelectorAll('button[aria-label*="stop" i],button[aria-label*="停止"],button[title*="stop" i],button[title*="停止"],[role="button"][aria-label*="stop" i]');
+            for(var i=0;i<btns.length&&i<12;i++){
+              if(!btns[i].disabled)return true;
             }
           }catch(_){}
           return false;
@@ -670,15 +612,13 @@ enum WebScripts {
 
         function checkReplySettled(){
           settleTimer=null;
-          if(!pendingReply)return;
-          if(isUserWatching()){
+          if(!pendingReply||isUserWatching()){
             pendingReply=false;
             streamStartedAt=0;
-            lastBaselineTail=captureLatestChatSnippet();
             return;
           }
           if(isBusyGenerating()){
-            settleTimer=setTimeout(checkReplySettled,2000);
+            settleTimer=setTimeout(checkReplySettled,2200);
             return;
           }
           pendingReply=false;
@@ -699,23 +639,21 @@ enum WebScripts {
         }
 
         function scheduleReplySettle(){
-          if(Date.now()<bootIgnoreUntil)return;
+          if(isUserWatching())return;
           if(!pendingReply){
             pendingReply=true;
             streamStartedAt=Date.now();
           }
-          if(!isUserWatching()&&(Date.now()-lastStreamPingAt)>12000){
+          if((Date.now()-lastStreamPingAt)>12000){
             lastStreamPingAt=Date.now();
             postNative({k:'streaming'});
           }
           if(settleTimer)clearTimeout(settleTimer);
-          settleTimer=setTimeout(checkReplySettled,3000);
+          settleTimer=setTimeout(checkReplySettled,3200);
         }
 
-        /* 5. Title unread counter observer */
         function checkTitleBadge(){
-          if(Date.now()<bootIgnoreUntil)return;
-          var t=normText(document.title||'');
+          var t=normShortText(document.title||'');
           var m=t.match(/^(?:\((\d+)\)|\[(\d+|新消息)\])\s*(.*)$/);
           if(!m){
             lastTitleCount=0;
@@ -736,6 +674,77 @@ enum WebScripts {
           }
         }
 
+        function ensureBackgroundObserver(){
+          if(isUserWatching()){
+            if(obsConnected&&sharedMutObs){
+              sharedMutObs.disconnect();
+              obsConnected=false;
+            }
+            if(settleTimer){clearTimeout(settleTimer);settleTimer=null;}
+            if(dotScanTimer){clearTimeout(dotScanTimer);dotScanTimer=null;}
+            pendingReply=false;
+            streamStartedAt=0;
+            return;
+          }
+          if(obsConnected||!document.body)return;
+          if(!sharedMutObs){
+            sharedMutObs=new MutationObserver(function(mutations){
+              if(isUserWatching()){
+                ensureBackgroundObserver();
+                return;
+              }
+              var hasMeaningfulText=false;
+              var hasElementAdded=false;
+              var lim=Math.min(mutations.length,60);
+              for(var i=0;i<lim;i++){
+                var m=mutations[i];
+                if(m.target&&m.target.nodeName==='TITLE'){
+                  checkTitleBadge();
+                  continue;
+                }
+                if(m.type==='characterData'){
+                  var p=m.target?m.target.parentElement:null;
+                  if(p&&!isInsideIgnoredChrome(p)){
+                    var t=normShortText(m.target.nodeValue||'');
+                    if(t.length>=3&&!isTrivialStatusOrTime(t)){
+                      hasMeaningfulText=true;
+                      break;
+                    }
+                  }
+                }else if(m.type==='childList'&&m.addedNodes&&m.addedNodes.length>0){
+                  hasElementAdded=true;
+                  if(!hasMeaningfulText&&m.target&&m.target.nodeType===1&&!isInsideIgnoredChrome(m.target)){
+                    var nLim=Math.min(m.addedNodes.length,8);
+                    for(var k=0;k<nLim;k++){
+                      var nd=m.addedNodes[k];
+                      var nt=(nd.nodeType===3)?normShortText(nd.nodeValue||''):safeLeafText(nd,5);
+                      if(nt.length>=4&&!isTrivialStatusOrTime(nt)){
+                        hasMeaningfulText=true;
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+              if(hasMeaningfulText){
+                scheduleReplySettle();
+              }
+              if(hasElementAdded&&!dotScanTimer){
+                dotScanTimer=setTimeout(function(){
+                  dotScanTimer=null;
+                  if(!isUserWatching())scanUnreadDots(true);
+                },3500);
+              }
+            });
+          }
+          try{
+            sharedMutObs.observe(document.body,{childList:true,subtree:true,characterData:true});
+            var titleEl=document.querySelector('head > title');
+            if(titleEl)sharedMutObs.observe(titleEl,{childList:true,subtree:true,characterData:true});
+            obsConnected=true;
+          }catch(_){}
+        }
+
         function emitUserSentIfNeeded(){
           var now=Date.now();
           if(now-lastUserSentAt<2500)return;
@@ -743,7 +752,6 @@ enum WebScripts {
           postNative({k:'user_sent'});
         }
 
-        /* 6. Composer input & send tracking (Shadow DOM composedPath aware) */
         function getEventPath(ev){
           if(ev&&typeof ev.composedPath==='function'){
             var p=ev.composedPath();
@@ -768,7 +776,8 @@ enum WebScripts {
           for(var i=0;i<lim;i++){
             var el=path[i];
             if(isEditableTarget(el)){
-              var v=normText(el.value||el.textContent||'');
+              var raw=(typeof el.value==='string')?el.value:(el.textContent||'');
+              var v=normShortText(raw);
               lastComposerInputAt=Date.now();
               if(v.length>=2){
                 lastComposerText=v.length>120?(v.slice(0,120)+'…'):v;
@@ -776,7 +785,7 @@ enum WebScripts {
               break;
             }
           }
-        },true);
+        },{capture:true,passive:true});
 
         document.addEventListener('keydown',function(ev){
           if(!ev||ev.key!=='Enter'||ev.shiftKey||ev.isComposing)return;
@@ -788,17 +797,17 @@ enum WebScripts {
               break;
             }
           }
-        },true);
+        },{capture:true,passive:true});
 
         function checkButtonSendFromEvent(ev){
           var path=getEventPath(ev);
-          var lim=Math.min(path.length,10);
+          var lim=Math.min(path.length,8);
           for(var i=0;i<lim;i++){
             var cur=path[i];
             if(!cur||cur.nodeType!==1)continue;
             if(cur.tagName==='BUTTON'||cur.getAttribute('role')==='button'){
               var tp=(cur.getAttribute('type')||'').toLowerCase();
-              var lb=((cur.getAttribute('aria-label')||'')+' '+(cur.getAttribute('title')||'')+' '+(cur.getAttribute('data-testid')||'')+' '+(cur.textContent||'')).toLowerCase();
+              var lb=((cur.getAttribute('aria-label')||'')+' '+(cur.getAttribute('title')||'')+' '+(cur.getAttribute('data-testid')||'')+' '+safeLeafText(cur,3)).toLowerCase();
               if(tp==='submit'||/send|submit|发送|提交|ask|up-arrow|arrow_upward|north/.test(lb)){
                 emitUserSentIfNeeded();
               }else if((Date.now()-lastComposerInputAt)<60000&&!/cancel|close|attach|upload|voice|mic|menu|sidebar|copy|stop|more|add|plus|取消|关闭|上传|菜单|复制|停止|更多/.test(lb)){
@@ -808,132 +817,41 @@ enum WebScripts {
             }
           }
         }
-        document.addEventListener('click',checkButtonSendFromEvent,true);
-        document.addEventListener('pointerup',checkButtonSendFromEvent,true);
+        document.addEventListener('click',checkButtonSendFromEvent,{capture:true,passive:true});
+        document.addEventListener('pointerup',checkButtonSendFromEvent,{capture:true,passive:true});
 
-        /* 7. Host foreground/tab state hook */
         window.__jwUpdateHostState=function(st){
           var wasWatching=isUserWatching();
           if(st&&typeof st.appActive==='boolean')hostState.appActive=st.appActive;
           if(st&&typeof st.tabSelected==='boolean')hostState.tabSelected=st.tabSelected;
           var nowWatching=isUserWatching();
           if(wasWatching&&!nowWatching){
+            bgEnteredAt=Date.now();
             lastBaselineTail=captureLatestChatSnippet();
             scanUnreadDots(false);
-            var now=Date.now();
-            if(isBusyGenerating()||((now-lastWatchedMutationAt)<6000&&(now-lastComposerInputAt)<300000)){
+            ensureBackgroundObserver();
+            if(isBusyGenerating()||(Date.now()-lastUserSentAt)<180000){
               scheduleReplySettle();
             }
-          }else if(!wasWatching&&nowWatching){
-            pendingReply=false;
-            streamStartedAt=0;
-            if(settleTimer){clearTimeout(settleTimer);settleTimer=null;}
+          }else if(!nowWatching&&!obsConnected&&document.body){
+            bgEnteredAt=Date.now();
+            lastBaselineTail=captureLatestChatSnippet();
             scanUnreadDots(false);
+            ensureBackgroundObserver();
+          }else if(nowWatching&&obsConnected){
+            ensureBackgroundObserver();
           }
         };
 
         document.addEventListener('visibilitychange',function(){
           if(document.visibilityState==='hidden'){
+            bgEnteredAt=Date.now();
             if(!pendingReply)lastBaselineTail=captureLatestChatSnippet();
+            ensureBackgroundObserver();
+          }else{
+            ensureBackgroundObserver();
           }
         });
-
-        /* 8. Start DOM MutationObserver after documentElement exists */
-        function installObserver(){
-          if(!document.documentElement)return;
-          setTimeout(function(){
-            lastBaselineTail=captureLatestChatSnippet();
-            scanUnreadDots(false);
-          },4600);
-
-          var obs=new MutationObserver(function(mutations){
-            if(location.href!==lastHref){
-              lastHref=location.href;
-              bootIgnoreUntil=Date.now()+4200;
-              pendingReply=false;
-              if(settleTimer){clearTimeout(settleTimer);settleTimer=null;}
-              setTimeout(function(){
-                lastBaselineTail=captureLatestChatSnippet();
-                scanUnreadDots(false);
-              },4300);
-              return;
-            }
-            var now=Date.now();
-            if(now<bootIgnoreUntil)return;
-
-            /* Fast-path when user is actively watching this foreground tab:
-             * zero DOM parent walks, zero textContent copies, zero dot scans! */
-            if(isUserWatching()){
-              for(var w=0;w<mutations.length;w++){
-                var mw=mutations[w];
-                if(mw.target&&mw.target.nodeName==='TITLE'){
-                  checkTitleBadge();
-                  continue;
-                }
-                if(mw.type==='characterData'||(mw.type==='childList'&&mw.addedNodes&&mw.addedNodes.length>0)){
-                  lastWatchedMutationAt=now;
-                  if((now-lastStreamPingAt)>15000&&((now-lastComposerInputAt)<300000||isBusyGenerating())){
-                    lastStreamPingAt=now;
-                    postNative({k:'streaming'});
-                  }
-                  break;
-                }
-              }
-              return;
-            }
-
-            var hasMeaningfulText=false;
-            var hasElementAdded=false;
-            for(var i=0;i<mutations.length;i++){
-              var m=mutations[i];
-              if(m.target&&m.target.nodeName==='TITLE'){
-                checkTitleBadge();
-                continue;
-              }
-              if(m.type==='characterData'){
-                var p=m.target?m.target.parentElement:null;
-                if(p&&!isInsideIgnoredChrome(p)){
-                  var t=normText(m.target.nodeValue||'');
-                  if(t.length>=3&&!isTrivialStatusOrTime(t))hasMeaningfulText=true;
-                }
-              }else if(m.type==='childList'&&m.addedNodes&&m.addedNodes.length>0){
-                hasElementAdded=true;
-                if(!hasMeaningfulText&&m.target&&m.target.nodeType===1&&!isInsideIgnoredChrome(m.target)){
-                  for(var k=0;k<m.addedNodes.length;k++){
-                    var nd=m.addedNodes[k];
-                    var nt=normText(nd.textContent||'');
-                    if(nt.length>=4&&!isTrivialStatusOrTime(nt)){
-                      hasMeaningfulText=true;
-                      break;
-                    }
-                  }
-                }
-              }
-            }
-
-            if(hasMeaningfulText){
-              scheduleReplySettle();
-            }
-            if(hasElementAdded&&!dotScanTimer){
-              dotScanTimer=setTimeout(function(){
-                dotScanTimer=null;
-                if(!isUserWatching())scanUnreadDots(true);
-              },3200);
-            }
-          });
-
-          sharedMutObs=obs;
-          obs.observe(document.documentElement,OBS_OPTS);
-          for(var r=0;r<shadowRoots.length;r++){
-            try{obs.observe(shadowRoots[r],OBS_OPTS);}catch(_){}
-          }
-        }
-
-        if(document.documentElement){
-          installObserver();
-        }else{
-          window.addEventListener('DOMContentLoaded',installObserver,{once:true});
-        }
         })();
         """#
         return WKUserScript(
@@ -944,708 +862,7 @@ enum WebScripts {
         )
     }
 
-    /// iOS 15–26 WebKit lacks CSS Scroll Anchoring (`overflow-anchor: auto`), causing jarring viewport
-    /// jumps when chat WebApps prepend older history (`Loading older messages...`), unmount spinners,
-    /// or resize dynamic blocks above the current reading line (and when iOS rubber-band/momentum
-    /// clobbers one-shot `scrollTop` adjustments). This isolated-world stabilizer anchors the visible
-    /// reading paragraph across DOM prepends and async height updates without interfering with native
-    /// 60fps scrolling, bottom streaming auto-follow, or explicit navigation clicks.
-    static func scrollAnchorStabilizerScript() -> WKUserScript {
-        let js = #"""
-        (function(){
-        'use strict';
-        if(window.__jwScrollAnchorInstalled)return;
-        window.__jwScrollAnchorInstalled=true;
-
-        try{
-          if(window.CSS&&typeof CSS.supports==='function'&&CSS.supports('overflow-anchor','auto')){
-            return;
-          }
-        }catch(_){}
-
-        var INLINE_TAGS={
-          SPAN:1,A:1,CODE:1,STRONG:1,B:1,EM:1,I:1,SMALL:1,SUB:1,SUP:1,
-          MARK:1,ABBR:1,TIME:1,SVG:1,PATH:1,G:1,CIRCLE:1,RECT:1,IMG:1,
-          BUTTON:1,INPUT:1,TEXTAREA:1,LABEL:1
-        };
-
-        var activeScroller=null;
-        var anchorEl=null;
-        var anchorContentY=0;
-        var anchorTextKey='';
-        var lastKnownScrollTop=0;
-        var lastKnownScrollHeight=0;
-        var lastKnownClientHeight=0;
-        var lastSnapshotAt=0;
-        var scrollIdleTimer=null;
-
-        var isApplyingScroll=false;
-        var isTouching=false;
-        var lastTouchY=0;
-        var suppressUntil=0;
-        var bootUntil=Date.now()+1800;
-        var lastHref=location.href;
-
-        var prependGuardStartedAt=0;
-        var prependGuardUntil=0;
-        var lockedRelTop=0;
-        var guardRafId=0;
-        var postMutateRafId=0;
-
-        var resizeObs=null;
-        var observedResizeNodes=new WeakSet();
-
-        function normText(s){
-          return String(s||'').replace(/\s+/g,' ').trim();
-        }
-
-        function isRootScroller(sc){
-          return !sc||sc===document.scrollingElement||sc===document.documentElement||sc===document.body;
-        }
-
-        function getViewportRect(sc){
-          if(isRootScroller(sc)){
-            return{
-              top:0,
-              left:0,
-              width:window.innerWidth||(document.documentElement?document.documentElement.clientWidth:375)||375,
-              height:window.innerHeight||(document.documentElement?document.documentElement.clientHeight:667)||667
-            };
-          }
-          return sc.getBoundingClientRect();
-        }
-
-        function getScrollTop(sc){
-          if(isRootScroller(sc)){
-            return window.pageYOffset||(document.documentElement?document.documentElement.scrollTop:0)||(document.body?document.body.scrollTop:0)||0;
-          }
-          return sc.scrollTop;
-        }
-
-        function getClientHeight(sc,vp){
-          if(isRootScroller(sc))return vp.height;
-          return sc.clientHeight||vp.height;
-        }
-
-        function isVerticallyScrollable(el){
-          if(!el||el.nodeType!==1)return false;
-          if(el===document.documentElement||el===document.body){
-            var se=document.scrollingElement||document.documentElement;
-            return !!(se&&se.scrollHeight>window.innerHeight+16);
-          }
-          if(el.clientHeight<80||el.scrollHeight<=el.clientHeight+12)return false;
-          var cs=getComputedStyle(el);
-          if(!cs)return false;
-          var oy=cs.overflowY;
-          return oy==='auto'||oy==='scroll'||oy==='overlay';
-        }
-
-        function findScrollableAncestor(start){
-          var cur=start,depth=0;
-          while(cur&&depth<28){
-            if(cur.nodeType===1&&isVerticallyScrollable(cur)){
-              if(cur===document.body||cur===document.documentElement){
-                return document.scrollingElement||document.documentElement;
-              }
-              return cur;
-            }
-            var next=cur.parentElement;
-            if(!next&&cur.getRootNode){
-              var rn=cur.getRootNode();
-              if(rn&&rn.host)next=rn.host;
-            }
-            cur=next;
-            depth++;
-          }
-          var se=document.scrollingElement||document.documentElement;
-          if(se&&se.scrollHeight>(window.innerHeight+16))return se;
-          return null;
-        }
-
-        function ensureScrollerOverscrollContained(sc){
-          if(!sc||isRootScroller(sc)||!sc.style)return;
-          try{
-            if(!sc.style.overscrollBehaviorY){
-              sc.style.overscrollBehaviorY='contain';
-            }
-          }catch(_){}
-        }
-
-        function observeScrollerResizes(sc){
-          if(!sc||typeof ResizeObserver!=='function')return;
-          if(!resizeObs){
-            resizeObs=new ResizeObserver(function(){
-              if(!activeScroller||isApplyingScroll||document.visibilityState==='hidden')return;
-              stabilizeIfNeeded('resize');
-            });
-          }
-          try{
-            if(!isRootScroller(sc)&&!observedResizeNodes.has(sc)){
-              observedResizeNodes.add(sc);
-              resizeObs.observe(sc);
-            }
-            var kids=sc.children;
-            if(kids){
-              var n=Math.min(kids.length,4);
-              for(var i=0;i<n;i++){
-                var c=kids[i];
-                if(c&&c.nodeType===1&&!observedResizeNodes.has(c)){
-                  observedResizeNodes.add(c);
-                  resizeObs.observe(c);
-                }
-              }
-            }
-          }catch(_){}
-        }
-
-        function isSpinnerOrFloatingOverlay(el,sc,vp){
-          var cur=el,d=0;
-          while(cur&&cur!==sc&&cur.nodeType===1&&d<14){
-            var role=(cur.getAttribute('role')||'').toLowerCase();
-            if(role==='progressbar'||role==='status'||cur.getAttribute('aria-busy')==='true')return true;
-            var cs=getComputedStyle(cur);
-            if(cs){
-              if(cs.position==='fixed'||cs.position==='sticky')return true;
-              if(cs.position==='absolute'){
-                var ar=cur.getBoundingClientRect();
-                if(ar.width<vp.width*0.62)return true;
-              }
-            }
-            cur=cur.parentElement;
-            d++;
-          }
-          var txt=normText(el.textContent||'');
-          if(txt.length<4)return true;
-          if(/^(loading|正在加载|加载中|fetching|please wait)\b/i.test(txt)&&txt.length<64)return true;
-          return false;
-        }
-
-        function resolveBlockAnchorFromHit(hit,sc,vp){
-          if(!hit||hit===sc||!sc.contains(hit))return null;
-          var cur=hit,d=0;
-          while(cur&&cur!==sc&&cur.nodeType===1&&INLINE_TAGS[cur.tagName]&&d<10){
-            cur=cur.parentElement;
-            d++;
-          }
-          if(!cur||cur===sc||cur.nodeType!==1)return null;
-
-          /* If hit landed on a tall multi-message wrapper gap, drill down to the visible child block */
-          var downDepth=0;
-          while(cur&&cur.children&&cur.children.length>=2&&downDepth<10){
-            var cr0=cur.getBoundingClientRect();
-            if(cr0.height<=vp.height*0.72)break;
-            var bestChild=null;
-            var lim=Math.min(cur.children.length,80);
-            for(var i=0;i<lim;i++){
-              var ch=cur.children[i];
-              var chr=ch.getBoundingClientRect();
-              if(chr.height>=14&&chr.bottom>(vp.top+44)&&chr.top<(vp.top+vp.height*0.65)){
-                if(!isSpinnerOrFloatingOverlay(ch,sc,vp)){
-                  bestChild=ch;
-                  break;
-                }
-              }
-            }
-            if(bestChild)cur=bestChild;
-            else break;
-            downDepth++;
-          }
-
-          /* Climb if block is still too tiny (< 14px) */
-          var upDepth=0;
-          while(cur&&cur!==sc&&cur.nodeType===1&&upDepth<6){
-            var r=cur.getBoundingClientRect();
-            if(r.height>=14&&r.width>=48)break;
-            cur=cur.parentElement;
-            upDepth++;
-          }
-          if(!cur||cur===sc||cur.nodeType!==1)return null;
-
-          var rect=cur.getBoundingClientRect();
-          if(rect.height<14||rect.width<48)return null;
-          /* Reject giant list wrapper containing >= 6 children so we never anchor to the whole scroll list */
-          if(rect.height>vp.height*1.55&&cur.children&&cur.children.length>=6&&cur.tagName!=='PRE'&&cur.tagName!=='P'){
-            return null;
-          }
-          if(isSpinnerOrFloatingOverlay(cur,sc,vp))return null;
-
-          var txt=normText(cur.textContent||'');
-          if(txt.length<4)return null;
-          return{
-            el:cur,
-            relTop:rect.top-vp.top,
-            textKey:txt.slice(0,48)
-          };
-        }
-
-        function pickAnchor(sc,vp){
-          var xs=[
-            vp.left+Math.round(vp.width*0.36),
-            vp.left+Math.round(vp.width*0.52)
-          ];
-          var ys=[
-            vp.top+Math.min(104,Math.round(vp.height*0.20)),
-            vp.top+Math.min(164,Math.round(vp.height*0.31)),
-            vp.top+Math.min(228,Math.round(vp.height*0.44))
-          ];
-          for(var yi=0;yi<ys.length;yi++){
-            var py=ys[yi];
-            if(py<=2||py>=window.innerHeight-4)continue;
-            for(var xi=0;xi<xs.length;xi++){
-              var px=xs[xi];
-              var hit=null;
-              try{hit=document.elementFromPoint(px,py);}catch(_){}
-              if(!hit)continue;
-              var cand=resolveBlockAnchorFromHit(hit,sc,vp);
-              if(cand)return cand;
-            }
-          }
-          return null;
-        }
-
-        function reacquireAnchorByText(sc,textKey){
-          if(!sc||!textKey||textKey.length<6)return null;
-          try{
-            var nodes=sc.querySelectorAll('p,li,pre,h1,h2,h3,h4,blockquote,div');
-            var lim=Math.min(nodes.length,450);
-            var best=null;
-            var bestH=1e9;
-            for(var i=0;i<lim;i++){
-              var el=nodes[i];
-              if(el.children&&el.children.length>8)continue;
-              var t=normText(el.textContent||'');
-              if(t.length>=textKey.length&&t.slice(0,textKey.length)===textKey){
-                var r=el.getBoundingClientRect();
-                if(r.height>=12&&r.height<bestH){
-                  best=el;
-                  bestH=r.height;
-                }
-              }
-            }
-            return best;
-          }catch(_){
-            return null;
-          }
-        }
-
-        function refreshAnchorSnapshot(sc,forceRepick){
-          if(!sc||!sc.isConnected)return;
-          var vp=getViewportRect(sc);
-          if(vp.height<80||vp.width<80)return;
-          var st=getScrollTop(sc);
-          var sh=sc.scrollHeight;
-          var ch=getClientHeight(sc,vp);
-
-          lastKnownScrollTop=st;
-          lastKnownScrollHeight=sh;
-          lastKnownClientHeight=ch;
-          lastSnapshotAt=Date.now();
-
-          if(!forceRepick&&anchorEl&&anchorEl.isConnected){
-            var r=anchorEl.getBoundingClientRect();
-            var rel=r.top-vp.top;
-            if(r.height>=14&&rel>=28&&rel<=vp.height*0.54){
-              anchorContentY=rel+st;
-              return;
-            }
-          }
-
-          var picked=pickAnchor(sc,vp);
-          if(picked){
-            anchorEl=picked.el;
-            anchorContentY=picked.relTop+st;
-            anchorTextKey=picked.textKey;
-          }else{
-            anchorEl=null;
-            anchorTextKey='';
-          }
-        }
-
-        function applyScrollDeltaInstant(sc,delta){
-          if(!sc||Math.abs(delta)<1)return;
-          isApplyingScroll=true;
-          var targetNode=isRootScroller(sc)?(document.scrollingElement||document.documentElement):sc;
-          var prevBehavior=(targetNode&&targetNode.style)?targetNode.style.scrollBehavior:'';
-          try{
-            if(targetNode&&targetNode.style){
-              targetNode.style.setProperty('scroll-behavior','auto','important');
-            }
-            var curTop=getScrollTop(sc);
-            var nextTop=Math.max(0,curTop+delta);
-            if(isRootScroller(sc)){
-              window.scrollTo(0,nextTop);
-            }else{
-              sc.scrollTop=nextTop;
-            }
-          }catch(_){}
-          finally{
-            if(targetNode&&targetNode.style){
-              if(prevBehavior)targetNode.style.scrollBehavior=prevBehavior;
-              else targetNode.style.removeProperty('scroll-behavior');
-            }
-            isApplyingScroll=false;
-          }
-        }
-
-        function armPrependGuard(sc,relTopNow){
-          prependGuardStartedAt=Date.now();
-          prependGuardUntil=prependGuardStartedAt+420;
-          lockedRelTop=relTopNow;
-          if(guardRafId)cancelAnimationFrame(guardRafId);
-          var tick=function(){
-            guardRafId=0;
-            if(!activeScroller||activeScroller!==sc||!sc.isConnected)return;
-            if(Date.now()>=prependGuardUntil||Date.now()<suppressUntil)return;
-            if(anchorEl&&anchorEl.isConnected){
-              var vp=getViewportRect(sc);
-              var curRel=anchorEl.getBoundingClientRect().top-vp.top;
-              var curSt=getScrollTop(sc);
-              var curContentY=curRel+curSt;
-              var dContentY=curContentY-anchorContentY;
-              if(Math.abs(dContentY)>=2){
-                var fix=curRel-lockedRelTop;
-                if(Math.abs(fix)>=1.5){
-                  applyScrollDeltaInstant(sc,fix);
-                }
-                var fixedRel=anchorEl.getBoundingClientRect().top-vp.top;
-                lastKnownScrollTop=getScrollTop(sc);
-                lastKnownScrollHeight=sc.scrollHeight;
-                anchorContentY=fixedRel+lastKnownScrollTop;
-              }else{
-                var elapsed=Date.now()-prependGuardStartedAt;
-                var clobberLimit=(!isTouching&&elapsed<95)?48:140;
-                var jump=curRel-lockedRelTop;
-                if(Math.abs(jump)>=clobberLimit){
-                  applyScrollDeltaInstant(sc,jump);
-                  var restoredRel=anchorEl.getBoundingClientRect().top-vp.top;
-                  lastKnownScrollTop=getScrollTop(sc);
-                  anchorContentY=restoredRel+lastKnownScrollTop;
-                }else{
-                  lockedRelTop=curRel;
-                  lastKnownScrollTop=curSt;
-                  anchorContentY=curRel+curSt;
-                }
-              }
-            }
-            guardRafId=requestAnimationFrame(tick);
-          };
-          guardRafId=requestAnimationFrame(tick);
-        }
-
-        function stabilizeIfNeeded(reason){
-          var sc=activeScroller;
-          if(!sc||!sc.isConnected||isApplyingScroll)return;
-          if(location.href!==lastHref){
-            lastHref=location.href;
-            anchorEl=null;
-            prependGuardUntil=0;
-            bootUntil=Date.now()+1600;
-            return;
-          }
-          var now=Date.now();
-          if(now<bootUntil||now<suppressUntil){
-            refreshAnchorSnapshot(sc,false);
-            return;
-          }
-
-          var vp=getViewportRect(sc);
-          var ch=getClientHeight(sc,vp);
-          if(ch<80)return;
-
-          /* Keyboard / viewport resize (> 44px): refresh anchor without fighting iOS keyboard scroll */
-          if(lastKnownClientHeight>0&&Math.abs(ch-lastKnownClientHeight)>44){
-            observeScrollerResizes(sc);
-            refreshAnchorSnapshot(sc,false);
-            return;
-          }
-
-          /* Page wasn't scrollable yet before this mutation (initial hydration) */
-          if(lastKnownScrollHeight<=ch+20){
-            observeScrollerResizes(sc);
-            refreshAnchorSnapshot(sc,true);
-            return;
-          }
-
-          /* Do not hold back bottom auto-follow when user was pinned at the bottom of a long chat */
-          var prevMaxScroll=lastKnownScrollHeight-lastKnownClientHeight;
-          if(prevMaxScroll>60&&lastKnownScrollTop>160&&(prevMaxScroll-lastKnownScrollTop)<110){
-            refreshAnchorSnapshot(sc,false);
-            return;
-          }
-
-          var expectedRelTop=(now<prependGuardUntil)?lockedRelTop:(anchorContentY-lastKnownScrollTop);
-          /* Ensure anchor was actually near the user's viewport right before mutation */
-          if(expectedRelTop<-ch*0.5||expectedRelTop>ch*1.15){
-            refreshAnchorSnapshot(sc,true);
-            return;
-          }
-
-          if(!anchorEl||!anchorEl.isConnected){
-            var reacquired=reacquireAnchorByText(sc,anchorTextKey);
-            if(reacquired){
-              anchorEl=reacquired;
-            }else{
-              var dH=sc.scrollHeight-lastKnownScrollHeight;
-              if(dH>80&&lastKnownScrollTop<420&&anchorTextKey.length>=6){
-                var savedTargetRel=expectedRelTop;
-                var savedKey=anchorTextKey;
-                applyScrollDeltaInstant(sc,dH);
-                lastKnownScrollTop=getScrollTop(sc);
-                lastKnownScrollHeight=sc.scrollHeight;
-                requestAnimationFrame(function(){
-                  if(!sc.isConnected)return;
-                  var vp2=getViewportRect(sc);
-                  var found2=reacquireAnchorByText(sc,savedKey);
-                  if(found2){
-                    anchorEl=found2;
-                    var r2=found2.getBoundingClientRect();
-                    var curRel2=r2.top-vp2.top;
-                    var fix2=curRel2-savedTargetRel;
-                    if(Math.abs(fix2)>=2){
-                      applyScrollDeltaInstant(sc,fix2);
-                    }
-                    var finalRel=found2.getBoundingClientRect().top-vp2.top;
-                    lastKnownScrollTop=getScrollTop(sc);
-                    lastKnownScrollHeight=sc.scrollHeight;
-                    anchorContentY=finalRel+lastKnownScrollTop;
-                    armPrependGuard(sc,finalRel);
-                  }else{
-                    refreshAnchorSnapshot(sc,true);
-                  }
-                });
-                return;
-              }
-              refreshAnchorSnapshot(sc,true);
-              return;
-            }
-          }
-
-          var rNow=anchorEl.getBoundingClientRect();
-          if(rNow.height<4){
-            refreshAnchorSnapshot(sc,true);
-            return;
-          }
-          var curRelTop=rNow.top-vp.top;
-          var curSt=getScrollTop(sc);
-          var curContentY=curRelTop+curSt;
-          var dContentY=curContentY-anchorContentY;
-
-          if(Math.abs(dContentY)<2){
-            lastKnownScrollHeight=sc.scrollHeight;
-            return;
-          }
-
-          var visualDelta=curRelTop-expectedRelTop;
-          if(Math.abs(visualDelta)>=1.5){
-            applyScrollDeltaInstant(sc,visualDelta);
-          }
-
-          var afterRect=anchorEl.getBoundingClientRect();
-          var afterRelTop=afterRect.top-vp.top;
-          lastKnownScrollTop=getScrollTop(sc);
-          lastKnownScrollHeight=sc.scrollHeight;
-          lastKnownClientHeight=ch;
-          anchorContentY=afterRelTop+lastKnownScrollTop;
-
-          if(Math.abs(dContentY)>=40){
-            observeScrollerResizes(sc);
-            armPrependGuard(sc,expectedRelTop);
-          }
-        }
-
-        /* Passive touch & scroll tracking */
-        var touchStartY=0;
-        document.addEventListener('touchstart',function(ev){
-          if(!ev.touches||ev.touches.length!==1)return;
-          isTouching=true;
-          touchStartY=ev.touches[0].clientY;
-          lastTouchY=touchStartY;
-          var sc=findScrollableAncestor(ev.target);
-          if(sc){
-            ensureScrollerOverscrollContained(sc);
-            observeScrollerResizes(sc);
-            if(sc!==activeScroller){
-              activeScroller=sc;
-              prependGuardUntil=0;
-              refreshAnchorSnapshot(sc,true);
-            }else if(!anchorEl||!anchorEl.isConnected){
-              refreshAnchorSnapshot(sc,true);
-            }
-          }
-        },{capture:true,passive:true});
-
-        document.addEventListener('touchmove',function(ev){
-          if(!isTouching||!ev.touches||ev.touches.length!==1)return;
-          var y=ev.touches[0].clientY;
-          var dy=y-lastTouchY;
-          lastTouchY=y;
-          if(Math.abs(y-touchStartY)>10&&(bootUntil>0||suppressUntil>0)){
-            bootUntil=0;
-            suppressUntil=0;
-            if(activeScroller&&(!anchorEl||!anchorEl.isConnected)){
-              refreshAnchorSnapshot(activeScroller,true);
-            }
-          }
-          if(Date.now()<prependGuardUntil){
-            lockedRelTop+=dy;
-          }
-        },{capture:true,passive:true});
-
-        function onTouchEnd(){
-          isTouching=false;
-          if(activeScroller&&Date.now()>=prependGuardUntil){
-            refreshAnchorSnapshot(activeScroller,false);
-          }
-        }
-        document.addEventListener('touchend',onTouchEnd,{capture:true,passive:true});
-        document.addEventListener('touchcancel',onTouchEnd,{capture:true,passive:true});
-
-        /* Suppress anchoring on intentional navigation / scroll-to-bottom / disclosure clicks */
-        document.addEventListener('click',function(ev){
-          var cur=ev&&ev.target,d=0;
-          while(cur&&cur.nodeType===1&&d<7){
-            var tag=cur.tagName;
-            var role=(cur.getAttribute('role')||'').toLowerCase();
-            if(tag==='BUTTON'||tag==='A'||tag==='SUMMARY'||role==='button'||role==='tab'||role==='menuitem'||role==='option'){
-              var label=normText((cur.getAttribute('aria-label')||'')+' '+(cur.getAttribute('title')||'')+' '+(cur.textContent||''));
-              if(/load\s*(older|more|previous|earlier)|加载(更多|更早|历史)|历史消息|查看更多/i.test(label)){
-                if(activeScroller)refreshAnchorSnapshot(activeScroller,false);
-              }else{
-                suppressUntil=Date.now()+650;
-                prependGuardUntil=0;
-                anchorEl=null;
-              }
-              break;
-            }
-            cur=cur.parentElement;
-            d++;
-          }
-        },true);
-
-        document.addEventListener('keydown',function(ev){
-          if(ev&&ev.key==='Enter'&&!ev.shiftKey&&!ev.isComposing){
-            var t=ev.target;
-            if(t&&(t.tagName==='TEXTAREA'||t.tagName==='INPUT'||t.isContentEditable)){
-              suppressUntil=Date.now()+900;
-              prependGuardUntil=0;
-              anchorEl=null;
-            }
-          }
-        },true);
-
-        document.addEventListener('scroll',function(ev){
-          if(isApplyingScroll)return;
-          var target=ev.target;
-          var sc=null;
-          if(target===document||target===document.documentElement||target===document.body){
-            sc=document.scrollingElement||document.documentElement;
-          }else if(target&&target.nodeType===1){
-            if(target.clientHeight<80||target.scrollHeight<=target.clientHeight+12)return;
-            sc=target;
-          }
-          if(!sc)return;
-
-          if(sc!==activeScroller){
-            activeScroller=sc;
-            prependGuardUntil=0;
-            ensureScrollerOverscrollContained(sc);
-            observeScrollerResizes(sc);
-            refreshAnchorSnapshot(sc,true);
-            return;
-          }
-
-          if(Math.abs(sc.scrollHeight-lastKnownScrollHeight)>=2){
-            stabilizeIfNeeded('scroll-sh');
-            return;
-          }
-
-          var now=Date.now();
-          if(now<prependGuardUntil&&anchorEl&&anchorEl.isConnected){
-            var vp=getViewportRect(sc);
-            var curRel=anchorEl.getBoundingClientRect().top-vp.top;
-            var curSt=getScrollTop(sc);
-            var curContentY=curRel+curSt;
-            if(Math.abs(curContentY-anchorContentY)>=2){
-              stabilizeIfNeeded('scroll-guard-layout');
-              return;
-            }
-            var elapsed=now-prependGuardStartedAt;
-            var clobberLimit=(!isTouching&&elapsed<95)?48:140;
-            var diff=curRel-lockedRelTop;
-            if(Math.abs(diff)>=clobberLimit){
-              applyScrollDeltaInstant(sc,diff);
-              var fixedRel=anchorEl.getBoundingClientRect().top-vp.top;
-              lastKnownScrollTop=getScrollTop(sc);
-              anchorContentY=fixedRel+lastKnownScrollTop;
-              return;
-            }
-            lockedRelTop=curRel;
-            lastKnownScrollTop=curSt;
-            anchorContentY=curRel+curSt;
-            return;
-          }
-
-          lastKnownScrollTop=getScrollTop(sc);
-          if(now-lastSnapshotAt>=90){
-            refreshAnchorSnapshot(sc,false);
-          }
-          if(scrollIdleTimer)clearTimeout(scrollIdleTimer);
-          scrollIdleTimer=setTimeout(function(){
-            scrollIdleTimer=null;
-            if(activeScroller&&Date.now()>=prependGuardUntil){
-              refreshAnchorSnapshot(activeScroller,false);
-            }
-          },130);
-        },{capture:true,passive:true});
-
-        function installMutationHook(){
-          if(!document.documentElement)return;
-          var mo=new MutationObserver(function(mutations){
-            if(!activeScroller||isApplyingScroll||document.visibilityState==='hidden')return;
-            if(location.href!==lastHref){
-              stabilizeIfNeeded('href');
-              return;
-            }
-            var relevant=false;
-            var rootSc=isRootScroller(activeScroller);
-            for(var i=0;i<mutations.length;i++){
-              var m=mutations[i];
-              if(!m.target)continue;
-              if(rootSc||m.target===activeScroller||activeScroller.contains(m.target)){
-                relevant=true;
-                break;
-              }
-            }
-            if(!relevant)return;
-            stabilizeIfNeeded('mutation');
-            if(!postMutateRafId){
-              postMutateRafId=requestAnimationFrame(function(){
-                postMutateRafId=0;
-                stabilizeIfNeeded('post-mutation-raf');
-              });
-            }
-          });
-          mo.observe(document.documentElement,{childList:true,subtree:true});
-        }
-
-        if(document.documentElement){
-          installMutationHook();
-        }else{
-          window.addEventListener('DOMContentLoaded',installMutationHook,{once:true});
-        }
-        })();
-        """#
-        return WKUserScript(
-            source: js,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: false,
-            in: .defaultClient
-        )
-    }
-
     /// SPA-safe page-level JS retention cleanup invoked right before WebKit/JSC memory pressure GC.
-    /// Clears PerformanceObserver/ResourceTiming/UserTiming buffers and retained console object graphs
-    /// without mutating virtual-DOM trees, scroll positions, draft inputs, or live WebSockets.
     static func memoryReliefHelperScript() -> WKUserScript {
         let js = #"""
         (function(){
@@ -1681,9 +898,8 @@ enum WebScripts {
         return WKUserScript(
             source: js,
             injectionTime: .atDocumentStart,
-            forMainFrameOnly: false,
+            forMainFrameOnly: true,
             in: .page
         )
     }
 }
-
